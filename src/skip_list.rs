@@ -7,22 +7,22 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use rand::prelude::*;
 
 use crate::arena::Arena;
-use crate::comparator::{Comparator, Comparing};
+use crate::comparator::{Comparing};
 
 //type Comparator = Box<dyn for<'a> Comparing<&'a [u8]>>;
 
 const MAX_HEIGHT: usize = 12usize;
 const BRANCHING: usize = 4usize;
 
-pub struct SkipList<'a, Key> {
+pub struct SkipList<'a, Key, Cmp> {
     arena: &'a mut Arena,
-    comparator: Comparator,
+    comparator: Cmp,
     max_height: AtomicU32,
     head: NonNull<Node<Key>>,
 }
 
-impl<Key: Default + 'static> SkipList<'_, Key> {
-    pub fn new(arena: &mut Arena, comparator: Comparator) -> SkipList<'_, Key> {
+impl<Key: Default + 'static, Cmp: Comparing<&'static Key>> SkipList<'_, Key, Cmp> {
+    pub fn new(arena: &mut Arena, comparator: Cmp) -> SkipList<'_, Key, Cmp> {
         let head = Node::new(arena, Key::default(), MAX_HEIGHT).unwrap();
         SkipList {
             arena,
@@ -95,8 +95,8 @@ impl<Key: Default + 'static> SkipList<'_, Key> {
 
     fn key_is_after_node(&self, key: &Key, n: Option<NonNull<Node<Key>>>) -> bool {
         match n {
-            Some(&node_ptr) => {
-                self.comparator.lt(node_ptr.as_ref().key, key)
+            Some(node_ptr) => unsafe {
+                self.comparator.lt(&node_ptr.as_ref().key, key)
             }
             None => false
         }
