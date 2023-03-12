@@ -132,13 +132,13 @@ impl KeyBundle {
 
 impl Default for KeyBundle {
     fn default() -> Self {
-        KeyBundle{ bundle: 0 as *const KeyHeader }
+        KeyBundle { bundle: 0 as *const KeyHeader }
     }
 }
 
 impl Clone for KeyBundle {
     fn clone(&self) -> Self {
-        KeyBundle{bundle: self.bundle}
+        KeyBundle { bundle: self.bundle }
     }
 }
 

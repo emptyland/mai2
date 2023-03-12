@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use rand::prelude::*;
 
 use crate::arena::Arena;
-use crate::comparator::{Comparing};
+use crate::comparator::Comparing;
 
 //type Comparator = Box<dyn for<'a> Comparing<&'a [u8]>>;
 
@@ -86,7 +86,7 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<'_,
         x = Node::new(self.arena, *key, height);
         for i in 0..height {
             Node::no_barrier_set_next(x.unwrap().as_ptr(), i,
-                Node::no_barrier_next(prev[i].unwrap().as_ptr(), i));
+                                      Node::no_barrier_next(prev[i].unwrap().as_ptr(), i));
             Node::set_next(prev[i].unwrap().as_ptr(), i, x);
         }
     }
@@ -237,9 +237,10 @@ impl<Key> Node<Key> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::key::KeyBundle;
     use crate::arena::Arena;
+    use crate::key::KeyBundle;
+
+    use super::*;
 
     struct KeyComparator;
 
@@ -253,8 +254,8 @@ mod tests {
     fn sanity() {
         let mut arena = Arena::new();
         let key = KeyBundle::for_key_value(&mut arena, 1,
-        "111".as_bytes(), "a".as_bytes());
-        let cmp = KeyComparator{};
+                                           "111".as_bytes(), "a".as_bytes());
+        let cmp = KeyComparator {};
         let mut map = SkipList::new(&mut arena, cmp);
         map.put(&key);
     }
