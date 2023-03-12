@@ -8,6 +8,7 @@ use std::slice;
 
 use crate::arena::Arena;
 
+#[derive(Copy)]
 pub struct KeyBundle {
     bundle: *const KeyHeader,
 }
@@ -126,6 +127,18 @@ impl KeyBundle {
         let layout = Layout::new::<KeyHeader>();
         Layout::from_size_align(layout.size() + payload_size, layout.align())
             .expect("ok")
+    }
+}
+
+impl Default for KeyBundle {
+    fn default() -> Self {
+        KeyBundle{ bundle: 0 as *const KeyHeader }
+    }
+}
+
+impl Clone for KeyBundle {
+    fn clone(&self) -> Self {
+        KeyBundle{bundle: self.bundle}
     }
 }
 
