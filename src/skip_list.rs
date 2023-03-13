@@ -33,6 +33,10 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<'_,
         }
     }
 
+    pub fn arena_mut(&'a mut self) -> &'a mut Arena {
+        self.arena
+    }
+
     // void Put(Key key) {
     //     // TODO(opt): We can use a barrier-free variant of FindGreaterOrEqual()
     //     // here since Insert() is externally synchronized.
@@ -68,7 +72,7 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<'_,
     //     }
     // }
 
-    pub fn put(&mut self, key: &'a Key) {
+    pub fn insert(&mut self, key: &'a Key) {
         let mut prev: [Option<NonNull<Node<Key>>>; MAX_HEIGHT] = [None; MAX_HEIGHT];
         let mut x = self.find_greater_or_equal(key, &mut prev);
 
@@ -89,6 +93,12 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<'_,
                                       Node::no_barrier_next(prev[i].unwrap().as_ptr(), i));
             Node::set_next(prev[i].unwrap().as_ptr(), i, x);
         }
+    }
+
+    pub fn iter(&'a mut self) -> IteratorImpl<Key, Cmp> {
+        let mut it = IteratorImpl::new(self);
+        it.seek_to_first();
+        it
     }
 
     // Node *FindGreaterOrEqual(Key key, Node** prev) const {
@@ -239,7 +249,7 @@ impl<Key> Node<Key> {
     }
 }
 
-struct IteratorImpl<'a, Key: 'a, Cmp> {
+pub struct IteratorImpl<'a, Key: 'a, Cmp> {
     own: &'a SkipList<'a, Key, Cmp>,
     node: Option<NonNull<Node<Key>>>
 }
@@ -280,13 +290,14 @@ impl <'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> IteratorImp
     }
 }
 
-impl <Key: Clone, Cmp> Iterator for IteratorImpl<'_, Key, Cmp> {
+impl <'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> Iterator for IteratorImpl<'_, Key, Cmp> {
     type Item = Key;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.node {
             Some(node_ptr) => unsafe {
-                Some(node_ptr.as_ref().key.clone())
+                IteratorImpl::next(self);
+                Some(node_ptr.as_ref().key)
             }
             None => None
         }
@@ -295,8 +306,12 @@ impl <Key: Clone, Cmp> Iterator for IteratorImpl<'_, Key, Cmp> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::fmt::format;
+    use std::ops::{Deref, DerefMut};
+    use std::rc::Rc;
     use crate::arena::Arena;
-    use crate::key::KeyBundle;
+    use crate::key::{KeyBundle, Tag};
 
     use super::*;
 
@@ -322,7 +337,40 @@ mod tests {
                                            "111".as_bytes(), "a".as_bytes());
         let cmp = KeyComparator {};
         let mut map = SkipList::new(&mut arena, cmp);
-        map.put(&key);
+        map.insert(&key);
+    }
+
+    #[test]
+    fn insert_keys() {
+        let mut arena = Arena::new();
+        let cmp = KeyComparator{};
+        let mut map = SkipList::new(&mut arena, cmp);
+
+        for i in 0..100 {
+            let s = format!("{:03}", i);
+            let key = KeyBundle::for_key_value(map.arena_mut(), 1, s.as_bytes(), "a".as_bytes());
+            map.insert(&key);
+        }
+
+        let mut i = 0;
+        for bundle in map.iter() {
+            assert_eq!(1, bundle.sequence_number());
+            assert_eq!(Tag::KEY, bundle.tag());
+
+            let s = std::str::from_utf8(bundle.key()).unwrap();
+            let z = format!("{:03}", i);
+            assert_eq!(z.as_str(), s);
+
+            let value = std::str::from_utf8(bundle.value()).unwrap();
+            assert_eq!("a", value);
+
+            i += 1;
+        }
+
+        let mut iter = IteratorImpl::new(&map);
+        iter.seek_to_first();
+        assert!(iter.valid());
+        assert_eq!("000", std::str::from_utf8(iter.key().unwrap().key()).unwrap());
     }
 
     #[test]
@@ -330,7 +378,7 @@ mod tests {
         let mut arena = Arena::new();
         let cmp = IntComparator {};
         let mut map = SkipList::new(&mut arena, cmp);
-        map.put(&1);
+        map.insert(&1);
 
         let mut iter = IteratorImpl::new(&map);
         assert!(matches!(iter.key(), None));
@@ -349,7 +397,7 @@ mod tests {
         let cmp = IntComparator {};
         let mut map = SkipList::new(&mut arena, cmp);
         for i in 0..100 {
-            map.put(&i);
+            map.insert(&i);
         }
 
         let mut iter = IteratorImpl::new(&map);
@@ -361,5 +409,22 @@ mod tests {
             i += 1;
         }
         assert_eq!(100, i);
+    }
+
+    #[test]
+    fn rust_iter() {
+        let mut arena = Arena::new();
+        let cmp = IntComparator {};
+        let mut map = SkipList::new(&mut arena, cmp);
+        for i in 0..100 {
+            map.insert(&i);
+        }
+
+        let mut n = 0;
+        for i in map.iter() {
+            assert_eq!(n, i);
+            n += 1;
+        }
+        assert_eq!(100, n);
     }
 }

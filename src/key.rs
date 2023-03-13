@@ -4,13 +4,14 @@ use std::cmp::Ordering;
 use std::fmt::{Debug, Formatter};
 use std::io::Write;
 use std::mem::size_of;
+use std::ptr::NonNull;
 use std::slice;
 
 use crate::arena::Arena;
 
 #[derive(Copy)]
 pub struct KeyBundle {
-    bundle: *const KeyHeader,
+    bundle: NonNull<KeyHeader>
 }
 
 struct KeyHeader {
@@ -21,6 +22,7 @@ struct KeyHeader {
 }
 
 #[derive(Debug)]
+#[derive(PartialEq)]
 pub enum Tag {
     KEY,
     DELETION,
@@ -28,7 +30,7 @@ pub enum Tag {
 
 impl KeyBundle {
     pub fn for_key_value(arena: &mut Arena, sequence_number: u64, key: &[u8], value: &[u8]) -> KeyBundle {
-        let mut kb = Self::for_uninitialized(arena, sequence_number, 0,
+        let kb = Self::for_uninitialized(arena, sequence_number, 0,
                                              key.len(), value.len());
         kb.key_mut().write(key).unwrap();
         kb.value_mut().write(value).unwrap();
@@ -36,7 +38,7 @@ impl KeyBundle {
     }
 
     pub fn for_deletion(arena: &mut Arena, sequence_number: u64, key: &[u8]) -> KeyBundle {
-        let mut kb = Self::for_uninitialized(arena, sequence_number, 1,
+        let kb = Self::for_uninitialized(arena, sequence_number, 1,
                                              key.len(), 0);
         kb.key_mut().write(key).unwrap();
         kb
@@ -52,19 +54,19 @@ impl KeyBundle {
             (*header).key_len = key_size as u32;
             (*header).value_len = value_size as u32;
         }
-        KeyBundle { bundle: header }
+        KeyBundle { bundle: NonNull::new(header).unwrap() }
     }
 
-    pub const fn sequence_number(&self) -> u64 {
+    pub fn sequence_number(&self) -> u64 {
         unsafe {
-            (*self.bundle).sequence_number
+            self.bundle.as_ref().sequence_number
         }
     }
 
-    pub const fn tag(&self) -> Tag {
+    pub fn tag(&self) -> Tag {
         let tag_num;
         unsafe {
-            tag_num = (*self.bundle).tag;
+            tag_num = self.bundle.as_ref().tag;
         }
         match tag_num {
             0 => Tag::KEY,
@@ -73,7 +75,7 @@ impl KeyBundle {
         }
     }
 
-    pub const fn key(&self) -> &[u8] {
+    pub fn key(&self) -> &[u8] {
         unsafe {
             slice::from_raw_parts(self.payload_addr(self.key_offset()), self.key_len())
         }
@@ -85,15 +87,15 @@ impl KeyBundle {
         }
     }
 
-    pub const fn key_len(&self) -> usize {
+    pub fn key_len(&self) -> usize {
         unsafe {
-            (*self.bundle).key_len as usize
+            self.bundle.as_ref().key_len as usize
         }
     }
 
     const fn key_offset(&self) -> usize { 0 }
 
-    pub const fn value(&self) -> &[u8] {
+    pub fn value(&self) -> &[u8] {
         unsafe {
             slice::from_raw_parts(self.payload_addr(self.value_offset()), self.value_len())
         }
@@ -105,22 +107,22 @@ impl KeyBundle {
         }
     }
 
-    pub const fn value_len(&self) -> usize {
+    pub fn value_len(&self) -> usize {
         unsafe {
-            (*self.bundle).value_len as usize
+            self.bundle.as_ref().value_len as usize
         }
     }
 
-    const fn value_offset(&self) -> usize {
+    fn value_offset(&self) -> usize {
         self.key_offset() + self.key_len()
     }
 
     const unsafe fn payload_addr(&self, offset: usize) -> *const u8 {
-        (self.bundle as *const u8).add(size_of::<KeyHeader>() + offset)
+        (self.bundle.as_ptr() as *const u8).add(size_of::<KeyHeader>() + offset)
     }
 
     const unsafe fn payload_addr_mut(&self, offset: usize) -> *mut u8 {
-        (self.bundle as *mut u8).add(size_of::<KeyHeader>() + offset)
+        (self.bundle.as_ptr() as *mut u8).add(size_of::<KeyHeader>() + offset)
     }
 
     fn build_layout(payload_size: usize) -> Layout {
@@ -132,7 +134,7 @@ impl KeyBundle {
 
 impl Default for KeyBundle {
     fn default() -> Self {
-        KeyBundle { bundle: 0 as *const KeyHeader }
+        KeyBundle { bundle: NonNull::new(1 as *mut KeyHeader).unwrap() }
     }
 }
 
@@ -205,6 +207,7 @@ mod tests {
                                           "".as_bytes());
         let b4 = KeyBundle::for_key_value(&mut arena, 2, "222".as_bytes(),
                                           "1".as_bytes());
+        assert!(b3 > b4);
     }
 }
 
