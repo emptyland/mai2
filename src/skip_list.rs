@@ -179,12 +179,16 @@ struct Node<Key> {
 
 impl<Key> Node<Key> {
     fn new(arena: &mut Arena, key: Key, height: usize) -> Option<NonNull<Node<Key>>> {
-        let size_in_bytes = size_of::<Node<Key>>() + size_of::<AtomicPtr<Node<Key>>>() * height;
-        let layout = Layout::from_size_align(size_in_bytes, align_of::<Node<Key>>()).unwrap();
+        let size_in_bytes = size_of::<Self>() + size_of::<AtomicPtr<Self>>() * height + size_of::<usize>();
+        //dbg!(size_in_bytes);
+        let layout = Layout::from_size_align(size_in_bytes, align_of::<Self>()).unwrap();
         let node_ptr = unsafe {
-            let node = arena.allocate(layout).unwrap().as_ptr() as *mut Node<Key>;
+            let node = arena.allocate(layout).unwrap().as_ptr() as *mut Self;
             (*node).key = key;
             (*node).height = height;
+            for i in 0..height {
+                Self::next_slice_mut(node)[i].store(0 as *mut Self, Ordering::Relaxed);
+            }
             node
         };
         NonNull::new(node_ptr)
@@ -235,6 +239,60 @@ impl<Key> Node<Key> {
     }
 }
 
+struct IteratorImpl<'a, Key: 'a, Cmp> {
+    own: &'a SkipList<'a, Key, Cmp>,
+    node: Option<NonNull<Node<Key>>>
+}
+
+impl <'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> IteratorImpl<'_, Key, Cmp> {
+    pub fn new(own: &'a SkipList<'a, Key, Cmp>) -> IteratorImpl<'_, Key, Cmp> {
+        IteratorImpl {
+            own,
+            node: None
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        !matches!(self.node, None)
+    }
+
+    pub fn key(&self) -> Option<&'a Key> {
+        match self.node {
+            Some(node_ptr) => unsafe {
+                Some(&node_ptr.as_ref().key)
+            }
+            None => None
+        }
+    }
+
+    pub fn next(&mut self) {
+        self.node = Node::next(self.node.unwrap().as_ptr(), 0);
+        //dbg!(self.node);
+    }
+
+    pub fn seek(&mut self, key: &'a Key) {
+        self.node = self.own.find_greater_or_equal(key, &mut [None; 0]);
+    }
+
+    pub fn seek_to_first(&mut self) {
+        self.node = Node::next(self.own.head.as_ptr(), 0);
+        //dbg!(self.node);
+    }
+}
+
+impl <Key: Clone, Cmp> Iterator for IteratorImpl<'_, Key, Cmp> {
+    type Item = Key;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.node {
+            Some(node_ptr) => unsafe {
+                Some(node_ptr.as_ref().key.clone())
+            }
+            None => None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::arena::Arena;
@@ -246,7 +304,14 @@ mod tests {
 
     impl Comparing<&KeyBundle> for KeyComparator {
         fn compare(&self, lhs: &KeyBundle, rhs: &KeyBundle) -> cmp::Ordering {
-            rhs.key().cmp(rhs.key())
+            lhs.key().cmp(rhs.key())
+        }
+    }
+
+    struct IntComparator;
+    impl Comparing<&i32> for IntComparator {
+        fn compare(&self, lhs: &i32, rhs: &i32) -> cmp::Ordering {
+            lhs.cmp(rhs)
         }
     }
 
@@ -258,5 +323,43 @@ mod tests {
         let cmp = KeyComparator {};
         let mut map = SkipList::new(&mut arena, cmp);
         map.put(&key);
+    }
+
+    #[test]
+    fn iterate() {
+        let mut arena = Arena::new();
+        let cmp = IntComparator {};
+        let mut map = SkipList::new(&mut arena, cmp);
+        map.put(&1);
+
+        let mut iter = IteratorImpl::new(&map);
+        assert!(matches!(iter.key(), None));
+
+        iter.seek_to_first();
+        assert!(iter.valid());
+        assert_eq!(Some(&1), iter.key());
+
+        iter.next();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn iterate_more() {
+        let mut arena = Arena::new();
+        let cmp = IntComparator {};
+        let mut map = SkipList::new(&mut arena, cmp);
+        for i in 0..100 {
+            map.put(&i);
+        }
+
+        let mut iter = IteratorImpl::new(&map);
+        iter.seek_to_first();
+        let mut i = 0;
+        while iter.valid() {
+            assert_eq!(Some(&i), iter.key());
+            iter.next();
+            i += 1;
+        }
+        assert_eq!(100, i);
     }
 }
