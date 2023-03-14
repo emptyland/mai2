@@ -1,38 +1,44 @@
 use std::cmp::Ordering;
 
-use crate::key::KeyBundle;
+pub trait Comparator {
+    fn compare(&self, lhs: &[u8], rhs: &[u8]) -> Ordering;
 
-pub trait Comparing<T> {
-    fn compare(&self, lhs: T, rhs: T) -> Ordering;
-
-    fn lt(&self, lhs: T, rhs: T) -> bool {
+    fn lt(&self, lhs: &[u8], rhs: &[u8]) -> bool {
         matches!(self.compare(lhs, rhs), Ordering::Less)
     }
 
-    fn le(&self, lhs: T, rhs: T) -> bool {
+    fn le(&self, lhs: &[u8], rhs: &[u8]) -> bool {
         !matches!(self.compare(lhs, rhs), Ordering::Greater)
     }
 
-    fn gt(&self, lhs: T, rhs: T) -> bool {
+    fn gt(&self, lhs: &[u8], rhs: &[u8]) -> bool {
         matches!(self.compare(lhs, rhs), Ordering::Greater)
     }
 
-    fn ge(&self, lhs: T, rhs: T) -> bool {
+    fn ge(&self, lhs: &[u8], rhs: &[u8]) -> bool {
         !matches!(self.compare(lhs, rhs), Ordering::Less)
+    }
+
+    fn name(&self) -> String;
+
+    fn find_shortest_separator(&self, limit: &[u8]) -> Vec<u8> {
+        todo!()
+    }
+
+    fn find_short_successor(&self) -> Vec<u8> {
+        todo!()
     }
 }
 
-pub fn new_bitwise_comparator<'a>() -> Box<dyn Comparing<&'a [u8]>> {
-    Box::new(BitwiseComparator {})
-}
-
-pub type Comparator = Box<dyn for<'a> Comparing<&'a [u8]>>;
-
 struct BitwiseComparator;
 
-impl Comparing<&[u8]> for BitwiseComparator {
+impl Comparator for BitwiseComparator {
     fn compare(&self, lhs: &[u8], rhs: &[u8]) -> Ordering {
         lhs.cmp(rhs)
+    }
+
+    fn name(&self) -> String {
+        String::from("bitwise")
     }
 }
 
@@ -42,7 +48,7 @@ mod tests {
 
     #[test]
     fn sanity() {
-        let cmp = new_bitwise_comparator();
+        let cmp: Box<dyn Comparator> = Box::new(BitwiseComparator{});
         let ord = cmp.compare("111".as_bytes(), "222".as_bytes());
         assert!(matches!(ord, Ordering::Less));
     }

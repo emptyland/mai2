@@ -1,6 +1,5 @@
 use std::alloc::{alloc, Layout};
 use std::cmp;
-use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 use std::ptr::{addr_of, NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
@@ -8,7 +7,6 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use rand::prelude::*;
 
 use crate::arena::Arena;
-use crate::comparator::Comparing;
 
 //type Comparator = Box<dyn for<'a> Comparing<&'a [u8]>>;
 
@@ -20,6 +18,27 @@ pub struct SkipList<'a, Key: 'a, Cmp> {
     comparator: Cmp,
     max_height: AtomicU32,
     head: NonNull<Node<Key>>,
+}
+
+
+pub trait Comparing<T> {
+    fn cmp(&self, lhs: T, rhs: T) -> Option<cmp::Ordering>;
+
+    fn lt(&self, lhs: T, rhs: T) -> bool {
+        matches!(self.cmp(lhs, rhs), Some(cmp::Ordering::Less))
+    }
+
+    fn le(&self, lhs: T, rhs: T) -> bool {
+        !matches!(self.cmp(lhs, rhs), Some(cmp::Ordering::Greater))
+    }
+
+    fn gt(&self, lhs: T, rhs: T) -> bool {
+        matches!(self.cmp(lhs, rhs), Some(cmp::Ordering::Greater))
+    }
+
+    fn ge(&self, lhs: T, rhs: T) -> bool {
+        !matches!(self.cmp(lhs, rhs), Some(cmp::Ordering::Less))
+    }
 }
 
 impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<'_, Key, Cmp> {
@@ -173,7 +192,7 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<'_,
     }
 
     fn equal(&self, a: &'a Key, b: &'a Key) -> bool {
-        matches!(self.comparator.compare(a, b), cmp::Ordering::Equal)
+        matches!(self.comparator.cmp(a, b), Some(cmp::Ordering::Equal))
     }
 
     fn max_height(&self) -> usize {
@@ -310,23 +329,24 @@ mod tests {
     use std::fmt::format;
     use std::ops::{Deref, DerefMut};
     use std::rc::Rc;
+
     use crate::arena::Arena;
     use crate::key::{KeyBundle, Tag};
 
     use super::*;
 
     struct KeyComparator;
-
     impl Comparing<&KeyBundle> for KeyComparator {
-        fn compare(&self, lhs: &KeyBundle, rhs: &KeyBundle) -> cmp::Ordering {
-            lhs.key().cmp(rhs.key())
+        fn cmp(&self, lhs: &KeyBundle, rhs: &KeyBundle) -> Option<cmp::Ordering> {
+            lhs.key().partial_cmp(rhs.key())
         }
     }
 
     struct IntComparator;
     impl Comparing<&i32> for IntComparator {
-        fn compare(&self, lhs: &i32, rhs: &i32) -> cmp::Ordering {
-            lhs.cmp(rhs)
+
+        fn cmp(&self, lhs: &i32, rhs: &i32) -> Option<cmp::Ordering> {
+            lhs.partial_cmp(rhs)
         }
     }
 

@@ -18,6 +18,9 @@ mod arena;
 mod status;
 mod skip_list;
 mod comparator;
+mod mai2;
+mod db_impl;
+mod column_family;
 
 fn main() {
     issue4();
