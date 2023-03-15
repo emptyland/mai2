@@ -1,3 +1,5 @@
+extern crate core;
+
 use std::alloc::Layout;
 use std::cell::RefCell;
 use std::cmp;
@@ -21,6 +23,7 @@ mod comparator;
 mod mai2;
 mod db_impl;
 mod column_family;
+mod version;
 
 fn main() {
     issue4();

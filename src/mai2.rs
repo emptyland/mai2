@@ -4,12 +4,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 //use traitcast::{TraitcastFrom, Traitcast};
-use crate::comparator::Comparator;
+use crate::comparator::{BitwiseComparator, Comparator};
 use crate::status::Status;
 
 pub struct ColumnFamilyDescriptor {
-    name: String,
-    options: ColumnFamilyOptions
+    pub(crate) name: String,
+    pub(crate) options: ColumnFamilyOptions
 }
 
 impl Default for ColumnFamilyDescriptor {
@@ -21,16 +21,35 @@ impl Default for ColumnFamilyDescriptor {
     }
 }
 
-#[derive(Default)]
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct ColumnFamilyOptions {
-
+    pub user_comparator: Rc<dyn Comparator>,
+    pub block_size: u64,
 }
 
-#[derive(Default)]
-#[derive(Debug)]
-pub struct Options {
+impl Default for ColumnFamilyOptions {
+    fn default() -> Self {
+        Self {
+            user_comparator: Rc::new(BitwiseComparator{}),
+            block_size: 4096,
+        }
+    }
+}
 
+
+#[derive(Clone)]
+pub struct Options {
+    pub user_comparator: Rc<dyn Comparator>,
+    pub block_size: u64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            user_comparator: Rc::new(BitwiseComparator{}),
+            block_size: 4096
+        }
+    }
 }
 
 pub trait ColumnFamily  {
@@ -39,7 +58,7 @@ pub trait ColumnFamily  {
     fn name(&self) -> String;
     fn id(&self) -> u32;
     fn comparator(&self) -> Rc<dyn Comparator>;
-    fn get_descriptor<'a>(&self) -> Result<&'a ColumnFamilyDescriptor, Status>;
+    fn get_descriptor(&self) -> Result<ColumnFamilyDescriptor, Status>;
 }
 
 pub trait Snapshot {

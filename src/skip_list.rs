@@ -338,7 +338,7 @@ mod tests {
     struct KeyComparator;
     impl Comparing<&KeyBundle> for KeyComparator {
         fn cmp(&self, lhs: &KeyBundle, rhs: &KeyBundle) -> Option<cmp::Ordering> {
-            lhs.key().partial_cmp(rhs.key())
+            lhs.user_key().partial_cmp(rhs.user_key())
         }
     }
 
@@ -377,7 +377,7 @@ mod tests {
             assert_eq!(1, bundle.sequence_number());
             assert_eq!(Tag::KEY, bundle.tag());
 
-            let s = std::str::from_utf8(bundle.key()).unwrap();
+            let s = std::str::from_utf8(bundle.user_key()).unwrap();
             let z = format!("{:03}", i);
             assert_eq!(z.as_str(), s);
 
@@ -390,7 +390,7 @@ mod tests {
         let mut iter = IteratorImpl::new(&map);
         iter.seek_to_first();
         assert!(iter.valid());
-        assert_eq!("000", std::str::from_utf8(iter.key().unwrap().key()).unwrap());
+        assert_eq!("000", std::str::from_utf8(iter.key().unwrap().user_key()).unwrap());
     }
 
     #[test]

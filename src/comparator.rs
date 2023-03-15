@@ -30,7 +30,7 @@ pub trait Comparator {
     }
 }
 
-struct BitwiseComparator;
+pub struct BitwiseComparator;
 
 impl Comparator for BitwiseComparator {
     fn compare(&self, lhs: &[u8], rhs: &[u8]) -> Ordering {

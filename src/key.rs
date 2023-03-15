@@ -1,24 +1,23 @@
-use std::alloc;
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{dealloc, Layout};
 use std::cmp::Ordering;
 use std::fmt::{Debug, Formatter};
 use std::io::Write;
 use std::mem::size_of;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::slice;
 
 use crate::arena::Arena;
+use crate::comparator::{BitwiseComparator, Comparator};
 
 #[derive(Copy)]
 pub struct KeyBundle {
-    bundle: NonNull<KeyHeader>
+    bundle: NonNull<KeyHeader>,
 }
 
 struct KeyHeader {
-    sequence_number: u64,
-    tag: u16,
+    len: u32,
     key_len: u32,
-    value_len: u32,
 }
 
 #[derive(Debug)]
@@ -28,52 +27,66 @@ pub enum Tag {
     DELETION,
 }
 
+impl Tag {
+    fn flag(&self) -> u64 {
+        match self {
+            Tag::KEY => 0,
+            Tag::DELETION => 1u64 << 63
+        }
+    }
+}
+
 impl KeyBundle {
     pub fn for_key_value(arena: &mut Arena, sequence_number: u64, key: &[u8], value: &[u8]) -> KeyBundle {
-        let kb = Self::for_uninitialized(arena, sequence_number, 0,
-                                             key.len(), value.len());
-        kb.key_mut().write(key).unwrap();
+        let kb = Self::for_uninitialized(arena, sequence_number, Tag::KEY,
+                                         key.len(), value.len());
+        kb.user_key_mut().write(key).unwrap();
         kb.value_mut().write(value).unwrap();
         kb
     }
 
     pub fn for_deletion(arena: &mut Arena, sequence_number: u64, key: &[u8]) -> KeyBundle {
-        let kb = Self::for_uninitialized(arena, sequence_number, 1,
-                                             key.len(), 0);
-        kb.key_mut().write(key).unwrap();
+        let kb = Self::for_uninitialized(arena, sequence_number, Tag::DELETION,
+                                         key.len(), 0);
+        kb.user_key_mut().write(key).unwrap();
         kb
     }
 
-    fn for_uninitialized(arena: &mut Arena, sequence_number: u64, tag: u16, key_size: usize, value_size: usize) -> KeyBundle {
+    fn for_uninitialized(arena: &mut Arena, sequence_number: u64, tag: Tag, user_key_size: usize, value_size: usize) -> KeyBundle {
         let mut header;
         unsafe {
-            let chunk = arena.allocate(Self::build_layout(key_size + value_size));
-            header = chunk.unwrap().as_ptr() as *mut KeyHeader;
-            (*header).tag = tag;
-            (*header).sequence_number = sequence_number;
-            (*header).key_len = key_size as u32;
-            (*header).value_len = value_size as u32;
+            let chunk = arena.allocate(Self::build_layout(user_key_size + TAG_SIZE + value_size));
+            let base_ptr = chunk.unwrap().as_ptr() as *mut u8;
+            header = base_ptr as *mut KeyHeader;
+            (*header).key_len = (user_key_size + TAG_SIZE) as u32;
+            (*header).len = (user_key_size + TAG_SIZE + value_size) as u32;
+
+            *(base_ptr.add(size_of::<KeyHeader>() + user_key_size) as *mut u64) = sequence_number | tag.flag()
         }
         KeyBundle { bundle: NonNull::new(header).unwrap() }
     }
 
     pub fn sequence_number(&self) -> u64 {
-        unsafe {
-            self.bundle.as_ref().sequence_number
-        }
+        InternalKey::parse(self.key()).sequence_number
     }
 
     pub fn tag(&self) -> Tag {
-        let tag_num;
+        InternalKey::parse(self.key()).tag
+    }
+
+    pub fn user_key(&self) -> &[u8] {
         unsafe {
-            tag_num = self.bundle.as_ref().tag;
-        }
-        match tag_num {
-            0 => Tag::KEY,
-            1 => Tag::DELETION,
-            _ => panic!("Bad key tag number")
+            slice::from_raw_parts(self.payload_addr(self.key_offset()), self.user_key_len())
         }
     }
+
+    fn user_key_mut(&self) -> &mut [u8] {
+        unsafe {
+            slice::from_raw_parts_mut(self.payload_addr_mut(self.key_offset()), self.user_key_len())
+        }
+    }
+
+    pub fn user_key_len(&self) -> usize { self.key_len() - TAG_SIZE }
 
     pub fn key(&self) -> &[u8] {
         unsafe {
@@ -109,7 +122,7 @@ impl KeyBundle {
 
     pub fn value_len(&self) -> usize {
         unsafe {
-            self.bundle.as_ref().value_len as usize
+            self.bundle.as_ref().len as usize - self.key_len()
         }
     }
 
@@ -127,8 +140,7 @@ impl KeyBundle {
 
     fn build_layout(payload_size: usize) -> Layout {
         let layout = Layout::new::<KeyHeader>();
-        Layout::from_size_align(layout.size() + payload_size, layout.align())
-            .expect("ok")
+        Layout::from_size_align(layout.size() + payload_size, layout.align()).unwrap()
     }
 }
 
@@ -149,7 +161,7 @@ impl Debug for KeyBundle {
         f.debug_struct("KeyBundle")
             .field("sequence_number", &self.sequence_number())
             .field("tag", &self.tag())
-            .field("key", &self.key())
+            .field("key", &self.user_key())
             .field("value", &self.value())
             .finish()
     }
@@ -163,7 +175,7 @@ impl PartialEq<Self> for KeyBundle {
 
 impl PartialOrd for KeyBundle {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        let rs = self.key().partial_cmp(other.key());
+        let rs = self.user_key().partial_cmp(other.user_key());
         if matches!(rs, Some(Ordering::Equal)) {
             if self.sequence_number() > other.sequence_number() {
                 Some(Ordering::Less)
@@ -174,6 +186,72 @@ impl PartialOrd for KeyBundle {
             rs
         }
     }
+}
+
+const TAG_SIZE: usize = size_of::<u64>();
+
+struct InternalKey<'a> {
+    sequence_number: u64,
+    tag: Tag,
+    user_key: &'a [u8],
+}
+
+impl InternalKey<'_> {
+    pub fn parse(key: &[u8]) -> Self {
+        assert!(key.len() >= TAG_SIZE);
+
+        let base_ptr = &key[0] as *const u8;
+        let user_key = unsafe { slice::from_raw_parts(base_ptr, key.len() - TAG_SIZE) };
+        let tail = unsafe {
+            *(base_ptr.add(user_key.len()) as *const u64)
+        };
+        Self {
+            sequence_number: tail & ((1u64 << 63) - 1),
+            tag: if (tail & (1u64 << 63)) != 0 {
+                Tag::DELETION
+            } else {
+                Tag::KEY
+            },
+            user_key,
+        }
+    }
+}
+
+pub struct InternalKeyComparator {
+    user_cmp: Rc<dyn Comparator>,
+}
+
+impl InternalKeyComparator {
+    pub fn new(user_cmp: Rc<dyn Comparator>) -> InternalKeyComparator {
+        Self {
+            user_cmp
+        }
+    }
+
+    pub fn user_cmp(&self) -> Rc<dyn Comparator> {
+        self.user_cmp.clone()
+    }
+}
+
+impl Comparator for InternalKeyComparator {
+    fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+        let lhs = InternalKey::parse(a);
+        let rhs = InternalKey::parse(b);
+        let ord = self.user_cmp.compare(lhs.user_key, rhs.user_key);
+        if Ordering::Equal != ord {
+            return ord;
+        }
+        assert_eq!(Ordering::Equal, ord);
+        if lhs.sequence_number < rhs.sequence_number {
+            Ordering::Greater
+        } else if lhs.sequence_number > rhs.sequence_number {
+            Ordering::Less
+        } else {
+            Ordering::Equal
+        }
+    }
+
+    fn name(&self) -> String { String::from("internal-key-comparator") }
 }
 
 #[cfg(test)]
@@ -189,7 +267,7 @@ mod tests {
                                               v.as_bytes());
         assert!(matches!(bundle.tag(), Tag::KEY));
         assert_eq!(1, bundle.sequence_number());
-        assert_eq!(k.as_bytes(), bundle.key());
+        assert_eq!(k.as_bytes(), bundle.user_key());
         assert_eq!(v.as_bytes(), bundle.value());
     }
 
@@ -208,6 +286,18 @@ mod tests {
         let b4 = KeyBundle::for_key_value(&mut arena, 2, "222".as_bytes(),
                                           "1".as_bytes());
         assert!(b3 > b4);
+    }
+
+    #[test]
+    fn internal_key_compare() {
+        let mut arena = Arena::new();
+        let b1 = KeyBundle::for_key_value(&mut arena, 1, "111".as_bytes(),
+                                          "1".as_bytes());
+        let b2 = KeyBundle::for_key_value(&mut arena, 2, "111".as_bytes(),
+                                          "2".as_bytes());
+        let user_cmp = Rc::new(BitwiseComparator{});
+        let cmp = InternalKeyComparator::new(user_cmp);
+        assert_eq!(Ordering::Greater, cmp.compare(b1.key(), b2.key()));
     }
 }
 
