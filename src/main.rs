@@ -24,6 +24,8 @@ mod mai2;
 mod db_impl;
 mod column_family;
 mod version;
+mod env;
+mod files;
 
 fn main() {
     issue4();

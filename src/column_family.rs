@@ -2,13 +2,13 @@ use std::any::Any;
 use std::cell::{Ref, RefCell};
 use std::cmp::max;
 use std::collections::{HashMap, LinkedList};
+use std::fmt::{Debug, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::comparator::Comparator;
-use crate::db_impl::DBImpl;
 use crate::key::InternalKeyComparator;
 use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions};
 use crate::status::Status;
@@ -21,6 +21,16 @@ pub struct ColumnFamilyImpl {
     dropped: AtomicBool,
     internal_key_cmp: InternalKeyComparator,
     // TODO:
+}
+
+impl Debug for ColumnFamilyImpl {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColumnFamilyImpl")
+            .field("name", &self.name)
+            .field("id", &self.id)
+            .field("user_key", &self.internal_key_cmp.user_cmp().name())
+            .finish()
+    }
 }
 
 impl ColumnFamilyImpl {
@@ -36,6 +46,13 @@ impl ColumnFamilyImpl {
             internal_key_cmp: InternalKeyComparator::new(ikc)
         };
         Arc::new(RefCell::new(cfi))
+    }
+
+    #[inline]
+    pub fn from(cf: &Arc<RefCell<dyn ColumnFamily>>) -> Arc<RefCell<Self>> {
+        let mut borrowed = cf.borrow_mut();
+        let handle = borrowed.as_any_mut().downcast_mut::<ColumnFamilyHandle>().unwrap();
+        handle.core().clone()
     }
 
     pub const fn id(&self) -> u32 { self.id }
@@ -77,9 +94,9 @@ pub struct ColumnFamilyHandle {
 }
 
 impl ColumnFamilyHandle {
-    pub fn new(db: *const DBImpl, core: Arc<RefCell<ColumnFamilyImpl>>) -> Arc<RefCell<dyn ColumnFamily>> {
-        Arc::new(RefCell::new(ColumnFamilyHandle {
-            db: db as *const u8,
+    pub fn new(core: Arc<RefCell<ColumnFamilyImpl>>) -> Arc<RefCell<dyn ColumnFamily>> {
+        Arc::new( RefCell::new(ColumnFamilyHandle {
+            db: 0 as *const u8,
             core,
         }))
     }
@@ -152,6 +169,19 @@ impl ColumnFamilySet {
         cf
     }
 
+    pub fn new_column_family(this: &Arc<RefCell<Self>>, id: u32, name: String, options: ColumnFamilyOptions)
+        -> Arc<RefCell<ColumnFamilyImpl>> {
+        // TODO:
+        let cf = ColumnFamilyImpl::new_dummy(name, id, options, this);
+        this.borrow_mut().column_families.insert(cf.borrow().id(), cf.clone());
+        this.borrow_mut().column_family_names.insert(cf.borrow().name().clone(), cf.clone());
+        this.borrow_mut().update_max_column_family_id(id);
+        if id == 0 {
+            this.borrow_mut().default_column_family = Some(cf.clone());
+        }
+        cf
+    }
+
     pub fn default_column_family(&self) -> Arc<RefCell<ColumnFamilyImpl>> {
         self.default_column_family.clone().unwrap().clone()
     }
@@ -174,8 +204,8 @@ impl ColumnFamilySet {
         self.column_families.get(&id)
     }
 
-    pub fn get_column_family_by_name(&self, name: String) -> Option<&Arc<RefCell<ColumnFamilyImpl>>> {
-        self.column_family_names.get(&name)
+    pub fn get_column_family_by_name(&self, name: &String) -> Option<&Arc<RefCell<ColumnFamilyImpl>>> {
+        self.column_family_names.get(name)
     }
 
     pub fn update_max_column_family_id(&mut self, new_id: u32) {

@@ -3,9 +3,11 @@ use std::cmp::max;
 use std::sync::Arc;
 
 use crate::column_family::ColumnFamilySet;
+use crate::env::Env;
 use crate::mai2::Options;
 
 pub struct VersionSet {
+    env: Arc<dyn Env>,
 
     abs_db_path: String,
     block_size: u64,
@@ -19,8 +21,9 @@ pub struct VersionSet {
 }
 
 impl VersionSet {
-    pub fn new_dummy(abs_db_path: String, options: Options) -> VersionSet {
+    pub fn new_dummy(abs_db_path: String, options: &Options) -> VersionSet {
         Self {
+            env: options.env.clone(),
             abs_db_path,
             block_size: options.block_size,
 
@@ -78,7 +81,8 @@ mod tests {
 
     #[test]
     fn sanity() {
-        let mutex = Arc::new(Mutex::new(VersionSet::new_dummy(String::from("/db/demo"), Options::default())));
+        let opts = Options::default();
+        let mutex = Arc::new(Mutex::new(VersionSet::new_dummy(String::from("/db/demo"), &opts)));
         let mut ver = mutex.lock().unwrap();
 
         assert_eq!(0, ver.last_sequence_number());
