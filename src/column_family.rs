@@ -3,15 +3,19 @@ use std::cell::{Ref, RefCell};
 use std::cmp::max;
 use std::collections::{HashMap, LinkedList};
 use std::fmt::{Debug, Formatter};
+use std::io;
 use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::comparator::Comparator;
+use crate::env::Env;
 use crate::key::InternalKeyComparator;
-use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions};
+use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME};
 use crate::status::Status;
+use crate::version::VersionSet;
 
 pub struct ColumnFamilyImpl {
     name: String,
@@ -20,6 +24,9 @@ pub struct ColumnFamilyImpl {
     owns: Weak<RefCell<ColumnFamilySet>>,
     dropped: AtomicBool,
     internal_key_cmp: InternalKeyComparator,
+    initialized: bool,
+    background_progress: AtomicBool,
+    redo_log_number: u64,
     // TODO:
 }
 
@@ -34,16 +41,19 @@ impl Debug for ColumnFamilyImpl {
 }
 
 impl ColumnFamilyImpl {
-    fn new_dummy(name: String, id: u32, options: ColumnFamilyOptions, owns: &Arc<RefCell<ColumnFamilySet>>)
+    fn new_dummy(name: String, id: u32, options: ColumnFamilyOptions, owns: Weak<RefCell<ColumnFamilySet>>)
                  -> Arc<RefCell<ColumnFamilyImpl>> {
         let ikc = options.user_comparator.clone();
         let cfi = ColumnFamilyImpl {
             name,
             id,
             options,
-            owns: Arc::downgrade(owns),
+            owns,
             dropped: AtomicBool::from(false),
-            internal_key_cmp: InternalKeyComparator::new(ikc)
+            internal_key_cmp: InternalKeyComparator::new(ikc),
+            initialized: false,
+            background_progress: AtomicBool::new(false),
+            redo_log_number: 0,
         };
         Arc::new(RefCell::new(cfi))
     }
@@ -55,6 +65,41 @@ impl ColumnFamilyImpl {
         handle.core().clone()
     }
 
+    pub fn install(&mut self) -> io::Result<()> {
+        assert!(!self.initialized());
+
+        // TODO: memory-table
+        let cf_path = self.get_work_path();
+        let owns = self.owns.upgrade().unwrap();
+        owns.borrow().env().make_dir(cf_path.as_path())?;
+
+        self.initialized = true;
+        Ok(())
+    }
+
+    pub fn uninstall(&mut self) -> io::Result<()> {
+        assert!(self.initialized());
+        assert!(!self.background_progress());
+        assert!(self.dropped());
+
+        let work_path = self.get_work_path();
+        let owns = self.owns.upgrade().unwrap();
+        owns.borrow().env().delete_file(work_path.as_path(), true)?;
+        self.initialized = false;
+        Ok(())
+    }
+
+    pub fn get_work_path(&self) -> PathBuf {
+        let owns = self.owns.upgrade().unwrap();
+        let mut path = PathBuf::new();
+        if self.options.dir.is_empty() {
+            path.join(owns.borrow().abs_db_path()).join(self.name())
+        } else {
+            path.join(owns.borrow().env().get_absolute_path(Path::new(&self.options.dir)).unwrap())
+                .join(self.name())
+        }
+    }
+
     pub const fn id(&self) -> u32 { self.id }
 
     pub const fn name(&self) -> &String { &self.name }
@@ -62,6 +107,14 @@ impl ColumnFamilyImpl {
     pub const fn options(&self) -> &ColumnFamilyOptions { &self.options }
 
     pub fn dropped(&self) -> bool { self.dropped.load(Ordering::Acquire) }
+
+    pub fn initialized(&self) -> bool { self.initialized }
+
+    pub fn background_progress(&self) -> bool { self.background_progress.load(Ordering::Relaxed) }
+
+    pub fn redo_log_number(&self) -> u64 { self.redo_log_number }
+
+    pub fn set_redo_log_number(&mut self, number: u64) { self.redo_log_number = number; }
 
     pub fn internal_key_cmp(&self) -> &dyn Comparator { &self.internal_key_cmp }
 
@@ -141,6 +194,7 @@ impl ColumnFamily for ColumnFamilyHandle {
 
 
 pub struct ColumnFamilySet {
+    owns: Weak<RefCell<VersionSet>>,
     max_column_family_id: u32,
     default_column_family: Option<Arc<RefCell<ColumnFamilyImpl>>>,
     column_families: HashMap<u32, Arc<RefCell<ColumnFamilyImpl>>>,
@@ -149,22 +203,25 @@ pub struct ColumnFamilySet {
 }
 
 impl ColumnFamilySet {
-    pub fn new_dummy() -> Arc<RefCell<Self>> {
+    pub fn new_dummy(owns: Weak<RefCell<VersionSet>>) -> Arc<RefCell<Self>> {
         let mut cfs = Self {
+            owns,
             max_column_family_id: 0,
             default_column_family: None,
             column_families: HashMap::new(),
             column_family_names: HashMap::new(),
         };
         let owns = Arc::new(RefCell::new(cfs));
-        let cf = Self::new_column_family_dummy(&owns, String::from("default"), ColumnFamilyOptions::default());
+        let cf = Self::new_column_family_dummy(&owns, String::from(DEFAULT_COLUMN_FAMILY_NAME), ColumnFamilyOptions::default());
         owns.borrow_mut().default_column_family = Some(cf);
         owns
     }
 
     fn new_column_family_dummy(this: &Arc<RefCell<Self>>, name: String, options: ColumnFamilyOptions)
         -> Arc<RefCell<ColumnFamilyImpl>> {
-        let cf = ColumnFamilyImpl::new_dummy(name, this.borrow_mut().next_column_family_id(), options, this);
+        let cf = ColumnFamilyImpl::new_dummy(name,
+                                             this.borrow_mut().next_column_family_id(),
+                                             options, Arc::downgrade(this));
         this.borrow_mut().column_families.insert(cf.borrow().id(), cf.clone());
         cf
     }
@@ -172,7 +229,7 @@ impl ColumnFamilySet {
     pub fn new_column_family(this: &Arc<RefCell<Self>>, id: u32, name: String, options: ColumnFamilyOptions)
         -> Arc<RefCell<ColumnFamilyImpl>> {
         // TODO:
-        let cf = ColumnFamilyImpl::new_dummy(name, id, options, this);
+        let cf = ColumnFamilyImpl::new_dummy(name, id, options, Arc::downgrade(this));
         this.borrow_mut().column_families.insert(cf.borrow().id(), cf.clone());
         this.borrow_mut().column_family_names.insert(cf.borrow().name().clone(), cf.clone());
         this.borrow_mut().update_max_column_family_id(id);
@@ -186,7 +243,7 @@ impl ColumnFamilySet {
         self.default_column_family.clone().unwrap().clone()
     }
 
-    fn next_column_family_id(&mut self) -> u32 {
+    pub fn next_column_family_id(&mut self) -> u32 {
         self.max_column_family_id += 1;
         self.max_column_family_id
     }
@@ -211,15 +268,36 @@ impl ColumnFamilySet {
     pub fn update_max_column_family_id(&mut self, new_id: u32) {
         self.max_column_family_id = max(self.max_column_family_id, new_id);
     }
+
+    pub fn column_family_impls(&self) -> Vec<&Arc<RefCell<ColumnFamilyImpl>>> {
+        self.column_families.values()
+            .enumerate()
+            .map(|x| x.1)
+            .collect()
+    }
+
+    pub fn abs_db_path(&self) -> PathBuf {
+        let owns = self.owns.upgrade().unwrap();
+        let borrowed = owns.borrow();
+        borrowed.abs_db_path().to_path_buf()
+    }
+
+    pub fn env(&self) -> Arc<dyn Env> {
+        self.owns.upgrade().unwrap().borrow().env().clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::column_family::ColumnFamilySet;
+    use super::*;
+    use std::path::PathBuf;
+    use crate::mai2::Options;
 
     #[test]
     fn sanity() {
-        let cfs = ColumnFamilySet::new_dummy();
+        let vss = VersionSet::new_dummy(PathBuf::from("db"), &Options::default());
+        let vs = vss.borrow();
+        let cfs = vs.column_families();
         assert_eq!(1, cfs.borrow().max_column_family_id());
         let dcf = cfs.borrow().default_column_family();
         assert_eq!(1, dcf.borrow().id());

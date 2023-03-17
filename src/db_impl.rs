@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize};
 
-use crate::column_family::{ColumnFamilyHandle, ColumnFamilyImpl};
+use crate::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
 use crate::env::{Env, WritableFile};
 use crate::{files, mai2};
 use crate::files::paths;
@@ -42,7 +42,7 @@ impl DBImpl {
     pub fn open(options: Options, name: String, column_family_descriptors: &[ColumnFamilyDescriptor])
                 -> mai2::Result<(Arc<RefCell<dyn DB>>, Vec<Arc<RefCell<dyn ColumnFamily>>>)> {
         let env = options.env.clone();
-        let versions = Arc::new(RefCell::new(VersionSet::new_dummy(name.clone(), &options)));
+        let versions = VersionSet::new_dummy(name.clone().into(), &options);
         let mut db = DBImpl {
             db_name: name.clone(),
             abs_db_path: env.get_absolute_path(Path::new(&name)).unwrap(),
@@ -103,13 +103,27 @@ impl DBImpl {
             cfs.insert(item.name.clone(), item.options.clone());
         }
 
-
-        if cfs.contains_key(&String::from(DEFAULT_COLUMN_FAMILY_NAME)) {
-            // TODO:
+        let column_families = self.versions.borrow().column_families().clone();
+        let default_cf_name = String::from(DEFAULT_COLUMN_FAMILY_NAME);
+        if let Some(opts) = cfs.get(&default_cf_name) {
+            ColumnFamilySet::new_column_family(&column_families, 0, default_cf_name, opts.clone());
         } else {
-            // TODO:
+            ColumnFamilySet::new_column_family(&column_families, 0, default_cf_name, self.options.core.clone());
         }
 
+        for (name, opts) in cfs {
+            if name == DEFAULT_COLUMN_FAMILY_NAME {
+                continue; //
+            }
+            let mut borrowed_cfs = column_families.borrow_mut();
+            let id = borrowed_cfs.next_column_family_id();
+            ColumnFamilySet::new_column_family(&column_families, id, name, opts.clone());
+        }
+
+        for cfi in column_families.borrow().column_family_impls() {
+            from_io_result(cfi.borrow_mut().install())?;
+            cfi.borrow_mut().set_redo_log_number(self.log_file_number);
+        }
         todo!()
     }
 

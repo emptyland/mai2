@@ -51,12 +51,8 @@ impl Default for ColumnFamilyOptions {
 
 #[derive(Clone)]
 pub struct Options {
-    pub user_comparator: Rc<dyn Comparator>,
+    pub core: ColumnFamilyOptions,
     pub env: Arc<dyn Env>,
-    pub block_size: u64,
-    pub write_buf_size: usize,
-    pub block_restart_interval: u32,
-    pub dir: String,
     pub create_if_missing: bool,
     pub create_missing_column_families: bool,
     pub error_if_exists: bool,
@@ -68,12 +64,8 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            user_comparator: Rc::new(BitwiseComparator{}),
+            core: ColumnFamilyOptions::default(),
             env: EnvImpl::new(),
-            block_size: 4096,
-            write_buf_size: 40 * 1024 * 1024,
-            block_restart_interval: 16,
-            dir: String::new(),
             create_if_missing: false,
             create_missing_column_families: false,
             error_if_exists: true,
