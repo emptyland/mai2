@@ -1,6 +1,3 @@
-extern crate core;
-extern crate core;
-
 use std::alloc::Layout;
 use std::cell::RefCell;
 use std::cmp;
@@ -28,6 +25,7 @@ mod version;
 mod env;
 mod files;
 mod marshal;
+mod varint;
 
 fn main() {
     println!("ok")
