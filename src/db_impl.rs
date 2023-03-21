@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize};
 
+use crate::{files, mai2};
 use crate::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
 use crate::env::{Env, WritableFile};
-use crate::{files, mai2};
 use crate::files::paths;
 use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DB, DEFAULT_COLUMN_FAMILY_NAME, from_io_result, Options};
 use crate::status::{Corrupting, Status};

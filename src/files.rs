@@ -8,6 +8,7 @@ const SST_TABLE_POSTFIX: &str = ".sst";
 
 pub mod paths {
     use std::path::{Path, PathBuf};
+
     use super::*;
 
     pub fn log_file(db_path: &Path, number: u64) -> PathBuf {
@@ -66,6 +67,7 @@ pub fn lock_file_name(db_name: &String) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
     use super::*;
 
     #[test]

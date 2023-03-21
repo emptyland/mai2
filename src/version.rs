@@ -4,11 +4,17 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+
 use num_enum::TryFromPrimitive;
+use patch::CFCreation;
+use patch::FileCreation;
 
 use crate::column_family::ColumnFamilySet;
 use crate::env::{Env, WritableFile};
+use crate::files;
 use crate::mai2::Options;
+use crate::marshal::{Decode, Decoder, Encode};
+use crate::wal::LogWriter;
 
 pub struct VersionSet {
     env: Arc<dyn Env>,
@@ -148,11 +154,13 @@ pub struct FileMetadata {
 }
 
 mod patch {
-    use num_enum::TryFromPrimitive;
     use std::io::Write;
     use std::mem::size_of;
     use std::slice;
     use std::sync::Arc;
+
+    use num_enum::TryFromPrimitive;
+
     use crate::marshal::Encode;
     use crate::version::FileMetadata;
 
@@ -290,12 +298,6 @@ struct VersionPatch {
     file_deletion: Vec<patch::FileDeletion>,
     field_bits: [u32; (patch::MAX_FIELDS + 31) / 32],
 }
-
-use patch::FileCreation;
-use patch::CFCreation;
-use crate::files;
-use crate::marshal::{Decode, Decoder, Encode};
-use crate::wal::LogWriter;
 
 impl VersionPatch {
     pub fn from_unmarshal(bytes: &[u8]) -> io::Result<(usize, VersionPatch)> {

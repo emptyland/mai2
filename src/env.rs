@@ -1,7 +1,7 @@
-use std::cell::{Ref, RefCell};
-use std::fs::{File, remove_dir_all, remove_file};
 use std::{fs, io};
+use std::cell::{Ref, RefCell};
 use std::cmp::min;
+use std::fs::{File, remove_dir_all, remove_file};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -304,7 +304,7 @@ pub struct MemorySequentialFile {
 //     }
 // }
 
-impl SequentialFile for MemorySequentialFile {
+implSequentialFile for MemorySequentialFile {
     fn skip(&mut self, bytes: usize) -> io::Result<u64> {
         todo!()
     }

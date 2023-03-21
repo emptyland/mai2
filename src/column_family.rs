@@ -289,9 +289,11 @@ impl ColumnFamilySet {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
+
     use crate::mai2::Options;
+
+    use super::*;
 
     #[test]
     fn sanity() {
