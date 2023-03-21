@@ -1,6 +1,7 @@
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::fs::{File, remove_dir_all, remove_file};
 use std::{fs, io};
+use std::cmp::min;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -19,6 +20,12 @@ pub trait Env {
 
     fn file_not_exists(&self, path: &Path) -> bool {
         !self.file_exists(path)
+    }
+
+    fn write_all(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        let wf = self.new_writable_file(path, true)?;
+        let mut borrowed_wf = wf.borrow_mut();
+        borrowed_wf.write_all(data)
     }
 }
 
@@ -217,6 +224,95 @@ impl RandomAccessFile for RandomAccessFileImpl {
     }
 }
 
+pub struct MemoryWritableFile {
+    buf: Vec<u8>
+}
+
+impl MemoryWritableFile {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    pub fn new_rc() -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(MemoryWritableFile::new()))
+    }
+
+    pub fn buf(&self) -> &Vec<u8> {
+        &self.buf
+    }
+
+    pub fn buf_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+}
+
+impl Write for MemoryWritableFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl WritableFile for MemoryWritableFile {
+    fn positioned_append(&mut self, position: u64, buf: &[u8]) -> io::Result<usize> {
+        if position as usize + buf.len() > self.buf.len() {
+            let fixup = position as usize + buf.len() - self.buf.len();
+            for _ in 0..fixup {
+                self.buf.push(0);
+            }
+        }
+        let mut placement = &mut self.buf.as_mut_slice()[position as usize..position as usize + buf.len()];
+        placement.write(buf)
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn get_file_size(&self) -> io::Result<usize> {
+        Ok(self.buf.len())
+    }
+}
+
+
+pub struct MemorySequentialFile {
+    buf: Vec<u8>,
+    offset: usize
+}
+
+// impl MemorySequentialFile {
+//
+//     pub fn remaining(&self) -> usize {
+//         self.buf.len() - self.offset
+//     }
+//
+//     pub fn remaining_buf(&self) ->
+// }
+//
+// impl Read for MemorySequentialFile {
+//     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+//         if self.offset >= self.buf.len() {
+//             Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+//         } else {
+//             let reached = min(buf.len(), self.remaining());
+//             buf.write(self.buf.as_slice()[])
+//             Ok(reached)
+//         }
+//     }
+// }
+
+impl SequentialFile for MemorySequentialFile {
+    fn skip(&mut self, bytes: usize) -> io::Result<u64> {
+        todo!()
+    }
+
+    fn get_file_size(&self) -> io::Result<usize> {
+        todo!()
+    }
+}
 
 pub struct JunkFilesCleaner {
     paths: Vec<String>
@@ -306,6 +402,17 @@ mod tests {
             assert!(rs.is_err());
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn memory_writable_file() -> io::Result<()> {
+        let mut wf = MemoryWritableFile::new();
+        wf.write("aaa".as_bytes())?;
+        assert_eq!(3, wf.get_file_size()?);
+        wf.positioned_append(1, "bcd".as_bytes())?;
+        assert_eq!(4, wf.get_file_size()?);
+        assert_eq!("abcd".as_bytes(), wf.buf.as_slice());
         Ok(())
     }
 }

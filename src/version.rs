@@ -1,10 +1,13 @@
 use std::cell::RefCell;
 use std::cmp::max;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
+use num_enum::TryFromPrimitive;
 
 use crate::column_family::ColumnFamilySet;
-use crate::env::Env;
+use crate::env::{Env, WritableFile};
 use crate::mai2::Options;
 
 pub struct VersionSet {
@@ -19,6 +22,8 @@ pub struct VersionSet {
     redo_log_number: u64,
     manifest_file_number: u64,
     column_families: Arc<RefCell<ColumnFamilySet>>,
+    log: Option<LogWriter>,
+    log_file: Option<Rc<RefCell<dyn WritableFile>>>,
 }
 
 
@@ -35,8 +40,63 @@ impl VersionSet {
                 redo_log_number: 0,
                 manifest_file_number: 0,
                 column_families: ColumnFamilySet::new_dummy(weak.clone()),
+                log: None,
+                log_file: None,
             })
         })
+    }
+
+    pub fn create_manifest_file(&mut self) -> io::Result<()> {
+        self.manifest_file_number = self.generate_file_number();
+        let file_path = files::paths::manifest_file(self.abs_db_path(), self.manifest_file_number);
+        let rs = self.env().new_writable_file(file_path.as_path(), true);
+        if let Err(e) = rs {
+            self.reuse_file_number(self.manifest_file_number);
+            return Err(e);
+        }
+        let file = rs.unwrap();
+        self.log_file = Some(file.clone());
+        self.log = Some(LogWriter::new(file.clone(), self.block_size as usize));
+        self.write_current_snapshot()
+    }
+
+    pub fn write_current_snapshot(&mut self) -> io::Result<()> {
+        let cfs = self.column_families().clone();
+        let borrowed_cfs = cfs.borrow_mut();
+
+        for cfi in borrowed_cfs.column_family_impls() {
+            let mut patch = VersionPatch::default();
+            let borrowed_cif = cfi.borrow();
+            patch.create_column_family(borrowed_cif.name().clone(), borrowed_cif.id(),
+                                       borrowed_cif.internal_key_cmp().name());
+            patch.set_redo_log(borrowed_cif.id(), borrowed_cif.redo_log_number());
+
+            // TODO: write level files
+
+            self.write_patch(patch)?;
+        }
+
+        let mut patch = VersionPatch::default();
+        patch.set_max_column_family(borrowed_cfs.max_column_family_id());
+        patch.set_last_sequence_number(self.last_sequence_number());
+        patch.set_next_file_number(self.next_file_number());
+        patch.set_redo_log_number(self.redo_log_number);
+        patch.set_prev_log_number(self.prev_log_number);
+
+        let current_file_path = files::paths::current_file(self.abs_db_path());
+        self.env().write_all(current_file_path.as_path(),
+                             self.manifest_file_number.to_string().as_bytes())?;
+        self.write_patch(patch)
+    }
+
+    fn write_patch(&mut self, patch: VersionPatch) -> io::Result<()> {
+        let mut buf = Vec::new();
+        patch.marshal(&mut buf);
+
+        let log = self.log.as_mut().unwrap();
+        log.append(buf.as_slice())?;
+        log.flush()?;
+        log.sync()
     }
 
     pub fn abs_db_path(&self) -> &Path {
@@ -78,7 +138,7 @@ impl VersionSet {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct FileMetadata {
     pub number: u64,
     pub smallest_key: Vec<u8>,
@@ -88,6 +148,7 @@ pub struct FileMetadata {
 }
 
 mod patch {
+    use num_enum::TryFromPrimitive;
     use std::io::Write;
     use std::mem::size_of;
     use std::slice;
@@ -121,22 +182,22 @@ mod patch {
         pub comparator_name: String,
     }
 
-    #[derive(Debug, Default, Clone)]
+    #[derive(Debug, Default, Clone, PartialEq)]
     pub struct FileDeletion {
         pub cf_id: u32,
         pub level: i32,
         pub number: u64,
     }
 
-    #[derive(Debug, Default, Clone)]
+    #[derive(Debug, Default, Clone, PartialEq)]
     pub struct FileCreation {
         pub cf_id: u32,
         pub level: i32,
         pub metadata: Arc<FileMetadata>,
     }
 
-    #[repr(C)]
-    #[derive(PartialEq, Debug, Clone, Copy)]
+    #[repr(u32)]
+    #[derive(PartialEq, Debug, Clone, Copy, TryFromPrimitive)]
     pub enum Field {
         LastSequenceNumber,
         NextFileNumber,
@@ -189,10 +250,19 @@ mod patch {
             size += self.cf_id.write_to(buf);
             size += self.level.write_to(buf);
             size += self.metadata.number.write_to(buf);
-            size += self.metadata.largest_key.write_to(buf);
             size += self.metadata.smallest_key.write_to(buf);
+            size += self.metadata.largest_key.write_to(buf);
             size += self.metadata.size.write_to(buf);
             size += self.metadata.ctime.write_to(buf);
+            size
+        }
+    }
+
+    impl Encode<FileDeletion> for FileDeletion {
+        fn write_to(&self, buf: &mut Vec<u8>) -> usize {
+            let mut size = self.cf_id.write_to(buf);
+            size += self.level.write_to(buf);
+            size += self.number.write_to(buf);
             size
         }
     }
@@ -223,16 +293,60 @@ struct VersionPatch {
 
 use patch::FileCreation;
 use patch::CFCreation;
-use crate::marshal::Encode;
+use crate::files;
+use crate::marshal::{Decode, Decoder, Encode};
+use crate::wal::LogWriter;
 
 impl VersionPatch {
-
-    pub fn from_unmarshal(bytes: &[u8]) -> (usize, VersionPatch) {
+    pub fn from_unmarshal(bytes: &[u8]) -> io::Result<(usize, VersionPatch)> {
         let mut patch = VersionPatch::default();
-        let mut offset = 0usize;
+        let mut decoder = Decoder::new();
+        while decoder.offset() < bytes.len() {
+            let field_tag = patch::Field::try_from_primitive(decoder.read_from(bytes)?);
+            if let Err(_e) = field_tag {
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
+            }
+            match field_tag.unwrap() {
+                patch::Field::LastSequenceNumber =>
+                    patch.set_last_sequence_number(decoder.read_from(bytes)?),
+                patch::Field::NextFileNumber =>
+                    patch.set_next_file_number(decoder.read_from(bytes)?),
+                patch::Field::RedoLogNumber =>
+                    patch.set_redo_log_number(decoder.read_from(bytes)?),
+                patch::Field::RedoLog =>
+                    patch.set_redo_log(decoder.read_from(bytes)?,
+                                       decoder.read_from(bytes)?),
+                patch::Field::PrevLogNumber =>
+                    patch.set_prev_log_number(decoder.read_from(bytes)?),
+                patch::Field::CompactionPoint =>
+                    patch.set_compaction_point(decoder.read_from(bytes)?,
+                                               decoder.read_from(bytes)?,
+                                               decoder.read_slice(bytes)?),
+                patch::Field::FileDeletion =>
+                    patch.delete_file(decoder.read_from(bytes)?,
+                                      decoder.read_from(bytes)?,
+                                      decoder.read_from(bytes)?),
+                patch::Field::FileCreation =>
+                    patch.create_file(decoder.read_from(bytes)?,
+                                      decoder.read_from(bytes)?,
+                                      decoder.read_from(bytes)?,
+                                      decoder.read_slice(bytes)?,
+                                      decoder.read_slice(bytes)?,
+                                      decoder.read_from(bytes)?,
+                                      decoder.read_from(bytes)?),
+                patch::Field::MaxColumnFamily =>
+                    patch.set_max_column_family(decoder.read_from(bytes)?),
+                patch::Field::AddColumnFamily =>
+                    patch.create_column_family(decoder.read_from(bytes)?,
+                                               decoder.read_from(bytes)?,
+                                               decoder.read_from(bytes)?),
+                patch::Field::DropColumnFamily =>
+                    patch.drop_column_family(decoder.read_from(bytes)?),
+                patch::Field::MaxFields => break,
+            }
+        }
 
-
-        (0, patch)
+        Ok((decoder.offset(), patch))
     }
 
     pub fn set_last_sequence_number(&mut self, version: u64) {
@@ -324,7 +438,7 @@ impl VersionPatch {
 
     pub fn create_file(&mut self, cf_id: u32, level: i32, file_number: u64, smallest_key: &[u8],
                        largest_key: &[u8], file_size: u64, ctime: u64) {
-        let file_metadata = Arc::new(FileMetadata{
+        let file_metadata = Arc::new(FileMetadata {
             number: file_number,
             smallest_key: Vec::from(smallest_key),
             largest_key: Vec::from(largest_key),
@@ -362,7 +476,7 @@ impl VersionPatch {
         self.cf_creation = patch::CFCreation {
             cf_id,
             name,
-            comparator_name
+            comparator_name,
         };
     }
 
@@ -424,6 +538,13 @@ impl VersionPatch {
                 item.write_to(buf);
             }
         }
+        if self.has_file_deletion() {
+            for item in self.file_deletion.iter() {
+                patch::Field::FileDeletion.write_to(buf);
+                item.write_to(buf);
+            }
+        }
+        patch::Field::MaxFields.write_to(buf); // End of version patch
     }
 
     pub fn reset(&mut self) {
@@ -509,12 +630,55 @@ mod tests {
     }
 
     #[test]
-    fn version_patch_marshal() {
+    fn version_patch_marshal() -> io::Result<()> {
         let mut patch = VersionPatch::default();
         patch.set_redo_log(1, 99);
 
         let mut buf = Vec::<u8>::new();
         patch.marshal(&mut buf);
-        assert_eq!(13, buf.len());
+        assert_eq!(4, buf.len());
+
+        let (loaded, b) = VersionPatch::from_unmarshal(buf.as_slice())?;
+        assert_eq!(4, loaded);
+        assert_eq!(patch.redo_log().cf_id, b.redo_log().cf_id);
+        assert_eq!(patch.redo_log().number, b.redo_log().number);
+
+        Ok(())
+    }
+
+    #[test]
+    fn marshal_create_file() -> io::Result<()> {
+        let mut a = VersionPatch::default();
+        a.create_file(11, 1, 99, "aaa".as_bytes(), "bbb".as_bytes(), 996, 7000000);
+        a.create_file(12, 0, 100, "ccc".as_bytes(), "ddd".as_bytes(), 1000, 1100000);
+        let mut buf = Vec::<u8>::new();
+        a.marshal(&mut buf);
+        assert_eq!(36, buf.len());
+
+        let (loaded, b) = VersionPatch::from_unmarshal(buf.as_slice())?;
+        assert_eq!(36, loaded);
+        assert_eq!(a.file_creation().len(), b.file_creation().len());
+        assert_eq!(a.file_creation()[0], b.file_creation()[0]);
+        assert_eq!(a.file_creation()[1], b.file_creation()[1]);
+        Ok(())
+    }
+
+    #[test]
+    fn marshal_delete_file() -> io::Result<()> {
+        let mut a = VersionPatch::default();
+        a.delete_file(1, 0, 100);
+        a.delete_file(2, 1, 700);
+        a.delete_file(3, 0, 996);
+        let mut buf = Vec::<u8>::new();
+        a.marshal(&mut buf);
+        assert_eq!(15, buf.len());
+
+        let (loaded, b) = VersionPatch::from_unmarshal(buf.as_slice())?;
+        assert_eq!(15, loaded);
+        assert_eq!(a.file_deletion().len(), b.file_deletion().len());
+        assert_eq!(a.file_deletion()[0], b.file_deletion()[0]);
+        assert_eq!(a.file_deletion()[1], b.file_deletion()[1]);
+        assert_eq!(a.file_deletion()[2], b.file_deletion()[2]);
+        Ok(())
     }
 }
