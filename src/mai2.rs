@@ -48,6 +48,28 @@ impl Default for ColumnFamilyOptions {
     }
 }
 
+pub struct OptionsBuilder {
+    opts: Options,
+}
+
+impl OptionsBuilder {
+    pub fn new() -> Self {
+        Self { opts: Options::default() }
+    }
+
+    pub fn create_if_missing(&mut self, opt: bool) -> &mut OptionsBuilder {
+        self.opts.create_if_missing = opt;
+        self
+    }
+
+    pub fn error_if_exists(&mut self, opt: bool) -> &mut Self {
+        self.opts.error_if_exists = opt;
+        self
+    }
+
+    pub fn build(&self) -> Options { self.opts.clone() }
+}
+
 
 #[derive(Clone)]
 pub struct Options {
@@ -59,6 +81,18 @@ pub struct Options {
     pub max_open_files: u32,
     pub max_total_wal_size: usize,
     pub block_cache_capacity: usize,
+}
+
+impl Options {
+    pub fn with_dir(dir: String) -> Options {
+        let mut opts = Options::default();
+        opts.core.dir = dir;
+        opts
+    }
+
+    pub fn with() -> OptionsBuilder {
+        OptionsBuilder::new()
+    }
 }
 
 impl Default for Options {

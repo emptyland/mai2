@@ -1,10 +1,10 @@
 use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64};
 
-use crate::{files, mai2};
+use crate::mai2;
 use crate::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
 use crate::env::{Env, WritableFile};
 use crate::files::paths;
@@ -43,9 +43,12 @@ impl DBImpl {
                 -> mai2::Result<(Arc<RefCell<dyn DB>>, Vec<Arc<RefCell<dyn ColumnFamily>>>)> {
         let env = options.env.clone();
         let versions = VersionSet::new_dummy(name.clone().into(), &options);
+
+        let abs_db_path = from_io_result(env.get_work_dir())?
+            .join(Path::new(&name));
         let mut db = DBImpl {
             db_name: name.clone(),
-            abs_db_path: env.get_absolute_path(Path::new(&name)).unwrap(),
+            abs_db_path,
             options,
             env: env.clone(),
             versions: versions.clone(),
@@ -115,8 +118,10 @@ impl DBImpl {
             if name == DEFAULT_COLUMN_FAMILY_NAME {
                 continue; //
             }
-            let mut borrowed_cfs = column_families.borrow_mut();
-            let id = borrowed_cfs.next_column_family_id();
+            let id = {
+                let mut borrowed_cfs = column_families.borrow_mut();
+                borrowed_cfs.next_column_family_id()
+            };
             ColumnFamilySet::new_column_family(&column_families, id, name, opts.clone());
         }
 
@@ -182,17 +187,24 @@ impl Drop for DBImpl {
 
 #[cfg(test)]
 mod tests {
+    use crate::env::JunkFilesCleaner;
+
     use super::*;
 
     #[test]
-    fn sanity() {
+    fn sanity() -> mai2::Result<()> {
+        let _junk = JunkFilesCleaner::new("demo".into());
+
         let descs = [
             ColumnFamilyDescriptor {
                 name: String::from("cf"),
                 options: ColumnFamilyOptions::default(),
             }];
-        let rs = DBImpl::open(Options::default(), String::from("demo"), &descs);
-        assert!(rs.is_ok());
-        let (_db, _cfs) = rs.unwrap();
+        let options = Options::with()
+            .create_if_missing(true)
+            .build();
+        let (_db, _cfs) = DBImpl::open(options, String::from("demo"), &descs)?;
+
+        Ok(())
     }
 }

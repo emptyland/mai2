@@ -1,10 +1,9 @@
 use std::any::Any;
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 use std::cmp::max;
-use std::collections::{HashMap, LinkedList};
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::io;
-use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
@@ -230,11 +229,12 @@ impl ColumnFamilySet {
         -> Arc<RefCell<ColumnFamilyImpl>> {
         // TODO:
         let cf = ColumnFamilyImpl::new_dummy(name, id, options, Arc::downgrade(this));
-        this.borrow_mut().column_families.insert(cf.borrow().id(), cf.clone());
-        this.borrow_mut().column_family_names.insert(cf.borrow().name().clone(), cf.clone());
-        this.borrow_mut().update_max_column_family_id(id);
+        let mut borrowed_this = this.borrow_mut();
+        borrowed_this.column_families.insert(cf.borrow().id(), cf.clone());
+        borrowed_this.column_family_names.insert(cf.borrow().name().clone(), cf.clone());
+        borrowed_this.update_max_column_family_id(id);
         if id == 0 {
-            this.borrow_mut().default_column_family = Some(cf.clone());
+            borrowed_this.default_column_family = Some(cf.clone());
         }
         cf
     }

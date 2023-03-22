@@ -66,8 +66,8 @@ impl Decoder {
     pub fn offset(&self) -> usize { self.offset }
 
     fn checked_slice<'a>(&self, buf: &'a [u8], len: usize) -> io::Result<&'a [u8]> {
-        if self.offset() + len >= buf.len() {
-            Err(io::Error::from(io::ErrorKind::InvalidData))
+        if self.offset() + len > buf.len() {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "len not enough"))
         } else {
             Ok(&buf[self.offset..self.offset + len])
         }
