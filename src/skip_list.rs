@@ -1,20 +1,23 @@
 use std::alloc::{alloc, Layout};
+use std::cell::RefCell;
 use std::cmp;
 use std::mem::{align_of, size_of};
+use std::ops::DerefMut;
 use std::ptr::{addr_of, NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use rand::prelude::*;
 
-use crate::arena::Arena;
+use crate::arena::{Allocator, Arena};
 
 //type Comparator = Box<dyn for<'a> Comparing<&'a [u8]>>;
 
 const MAX_HEIGHT: usize = 12usize;
 const BRANCHING: usize = 4usize;
 
-pub struct SkipList<'a, Key: 'a, Cmp> {
-    arena: &'a mut Arena,
+pub struct SkipList<Key, Cmp> {
+    arena: Rc<RefCell<Arena>>,
     comparator: Cmp,
     max_height: AtomicU32,
     head: NonNull<Node<Key>>,
@@ -41,9 +44,9 @@ pub trait Comparing<T> {
     }
 }
 
-impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<'_, Key, Cmp> {
-    pub fn new(arena: &mut Arena, comparator: Cmp) -> SkipList<'_, Key, Cmp> {
-        let head = Node::new(arena, Key::default(), MAX_HEIGHT).unwrap();
+impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<Key, Cmp> {
+    pub fn new(arena: Rc<RefCell<Arena>>, comparator: Cmp) -> SkipList<Key, Cmp> {
+        let head = Node::new(arena.borrow_mut().deref_mut(), Key::default(), MAX_HEIGHT).unwrap();
         SkipList {
             arena,
             comparator,
@@ -51,45 +54,6 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<'_,
             max_height: AtomicU32::new(1),
         }
     }
-
-    pub fn arena_mut(&'a mut self) -> &'a mut Arena {
-        self.arena
-    }
-
-    // void Put(Key key) {
-    //     // TODO(opt): We can use a barrier-free variant of FindGreaterOrEqual()
-    //     // here since Insert() is externally synchronized.
-    //     Node* prev[kMaxHeight];
-    //     Node* x = FindGreaterOrEqual(key, prev);
-
-    //     // Our data structure does not allow duplicate insertion
-    //     DCHECK(x == NULL || !Equal(key, x->key));
-
-    //     int height = RandomHeight();
-    //     if (height > max_height()) {
-    //         for (int i = max_height(); i < height; i++) {
-    //             prev[i] = head_;
-    //         }
-    //         //fprintf(stderr, "Change height from %d to %d\n", max_height_, height);
-
-    //         // It is ok to mutate max_height_ without any synchronization
-    //         // with concurrent readers.  A concurrent reader that observes
-    //         // the new value of max_height_ will see either the old value of
-    //         // new level pointers from head_ (NULL), or a new value set in
-    //         // the loop below.  In the former case the reader will
-    //         // immediately drop to the next level since NULL sorts after all
-    //         // keys.  In the latter case the reader will use the new node.
-    //         max_height_.store(height, std::memory_order_relaxed);
-    //     }
-
-    //     x = NewNode(key, height);
-    //     for (int i = 0; i < height; i++) {
-    //         // NoBarrier_SetNext() suffices since we will add a barrier when
-    //         // we publish a pointer to "x" in prev[i].
-    //         x->nobarrier_set_next(i, prev[i]->nobarrier_next(i));
-    //         prev[i]->set_next(i, x);
-    //     }
-    // }
 
     pub fn insert(&mut self, key: &'a Key) {
         let mut prev: [Option<NonNull<Node<Key>>>; MAX_HEIGHT] = [None; MAX_HEIGHT];
@@ -106,7 +70,7 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<'_,
             self.max_height.store(height as u32, Ordering::Relaxed);
         }
 
-        x = Node::new(self.arena, *key, height);
+        x = Node::new(self.arena.borrow_mut().deref_mut(), *key, height);
         for i in 0..height {
             Node::no_barrier_set_next(x.unwrap().as_ptr(), i,
                                       Node::no_barrier_next(prev[i].unwrap().as_ptr(), i));
@@ -114,31 +78,12 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<'_,
         }
     }
 
-    pub fn iter(&'a mut self) -> IteratorImpl<Key, Cmp> {
+    pub fn iter(&mut self) -> IteratorImpl<Key, Cmp> {
         let mut it = IteratorImpl::new(self);
         it.seek_to_first();
         it
     }
 
-    // Node *FindGreaterOrEqual(Key key, Node** prev) const {
-    //     auto x = head_;
-    //     int level = max_height() - 1;
-    //     while (true) {
-    //         Node* next = x->next(level);
-    //         if (KeyIsAfterNode(key, next)) {
-    //             // Keep searching in this list
-    //             x = next;
-    //         } else {
-    //             if (prev != NULL) prev[level] = x;
-    //             if (level == 0) {
-    //                 return next;
-    //             } else {
-    //                 // Switch to next list
-    //                 level--;
-    //             }
-    //         }
-    //     }
-    // }
     fn find_greater_or_equal(&self, key: &'a Key, prev: &mut [Option<NonNull<Node<Key>>>]) -> Option<NonNull<Node<Key>>> {
         let mut x = self.head;
         let mut level = (self.max_height() - 1) as usize;
@@ -160,18 +105,6 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<'_,
         }
     }
 
-    // int RandomHeight() {
-    //     int height = 1;
-
-    //     while (height < kMaxHeight && (rand_() % kBranching) == 0) {
-    //         height++;
-    //     }
-
-    //     DCHECK_GT(height, 0);
-    //     DCHECK_LE(height, kMaxHeight);
-
-    //     return height;
-    // }
     fn random_height(&self) -> usize {
         let mut height = 1usize;
         while height < MAX_HEIGHT && random::<usize>() % BRANCHING == 0 {
@@ -207,7 +140,7 @@ struct Node<Key> {
 
 
 impl<Key> Node<Key> {
-    fn new(arena: &mut Arena, key: Key, height: usize) -> Option<NonNull<Node<Key>>> {
+    fn new(arena: &mut dyn Allocator, key: Key, height: usize) -> Option<NonNull<Node<Key>>> {
         let size_in_bytes = size_of::<Self>() + size_of::<AtomicPtr<Self>>() * height + size_of::<usize>();
         //dbg!(size_in_bytes);
         let layout = Layout::from_size_align(size_in_bytes, align_of::<Self>()).unwrap();
@@ -268,15 +201,15 @@ impl<Key> Node<Key> {
     }
 }
 
-pub struct IteratorImpl<'a, Key: 'a, Cmp> {
-    own: &'a SkipList<'a, Key, Cmp>,
+pub struct IteratorImpl<Key, Cmp> {
+    owns: *const SkipList<Key, Cmp>,
     node: Option<NonNull<Node<Key>>>
 }
 
-impl <'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> IteratorImpl<'_, Key, Cmp> {
-    pub fn new(own: &'a SkipList<'a, Key, Cmp>) -> IteratorImpl<'_, Key, Cmp> {
+impl <'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> IteratorImpl<Key, Cmp> {
+    pub fn new(owns: *const SkipList<Key, Cmp>) -> Self {
         IteratorImpl {
-            own,
+            owns,
             node: None
         }
     }
@@ -300,16 +233,20 @@ impl <'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> IteratorImp
     }
 
     pub fn seek(&mut self, key: &'a Key) {
-        self.node = self.own.find_greater_or_equal(key, &mut [None; 0]);
+        self.node = self.owns().find_greater_or_equal(key, &mut [None; 0]);
     }
 
     pub fn seek_to_first(&mut self) {
-        self.node = Node::next(self.own.head.as_ptr(), 0);
+        self.node = Node::next(self.owns().head.as_ptr(), 0);
         //dbg!(self.node);
+    }
+
+    fn owns(&self) -> &SkipList<Key, Cmp> {
+        unsafe { &*self.owns }
     }
 }
 
-impl <'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> Iterator for IteratorImpl<'_, Key, Cmp> {
+impl <'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> Iterator for IteratorImpl<Key, Cmp> {
     type Item = Key;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -352,23 +289,24 @@ mod tests {
 
     #[test]
     fn sanity() {
-        let mut arena = Arena::new();
-        let key = KeyBundle::for_key_value(&mut arena, 1,
+        let arena = Arena::new_rc();
+        let key = KeyBundle::for_key_value(arena.borrow_mut().deref_mut(), 1,
                                            "111".as_bytes(), "a".as_bytes());
         let cmp = KeyComparator {};
-        let mut map = SkipList::new(&mut arena, cmp);
+        let mut map = SkipList::new(arena, cmp);
         map.insert(&key);
     }
 
     #[test]
     fn insert_keys() {
-        let mut arena = Arena::new();
+        let arena = Arena::new_rc();
         let cmp = KeyComparator{};
-        let mut map = SkipList::new(&mut arena, cmp);
+        let mut map = SkipList::new(arena.clone(), cmp);
 
         for i in 0..100 {
+            //let mut borrowed = arena.borrow_mut();
             let s = format!("{:03}", i);
-            let key = KeyBundle::for_key_value(map.arena_mut(), 1, s.as_bytes(), "a".as_bytes());
+            let key = KeyBundle::for_key_value(arena.borrow_mut().deref_mut(), 1, s.as_bytes(), "a".as_bytes());
             map.insert(&key);
         }
 
@@ -395,9 +333,9 @@ mod tests {
 
     #[test]
     fn iterate() {
-        let mut arena = Arena::new();
+        let arena = Arena::new_rc();
         let cmp = IntComparator {};
-        let mut map = SkipList::new(&mut arena, cmp);
+        let mut map = SkipList::new(arena, cmp);
         map.insert(&1);
 
         let mut iter = IteratorImpl::new(&map);
@@ -413,9 +351,9 @@ mod tests {
 
     #[test]
     fn iterate_more() {
-        let mut arena = Arena::new();
+        let arena = Arena::new_rc();
         let cmp = IntComparator {};
-        let mut map = SkipList::new(&mut arena, cmp);
+        let mut map = SkipList::new(arena, cmp);
         for i in 0..100 {
             map.insert(&i);
         }
@@ -433,9 +371,9 @@ mod tests {
 
     #[test]
     fn rust_iter() {
-        let mut arena = Arena::new();
+        let arena = Arena::new_rc();
         let cmp = IntComparator {};
-        let mut map = SkipList::new(&mut arena, cmp);
+        let mut map = SkipList::new(arena, cmp);
         for i in 0..100 {
             map.insert(&i);
         }

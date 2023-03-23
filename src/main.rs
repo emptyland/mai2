@@ -13,6 +13,8 @@ mod files;
 mod marshal;
 mod varint;
 mod wal;
+mod memory_table;
+mod iterator;
 
 fn main() {
     println!("ok")

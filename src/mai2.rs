@@ -4,7 +4,6 @@ use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
 
-//use traitcast::{TraitcastFrom, Traitcast};
 use crate::comparator::{BitwiseComparator, Comparator};
 use crate::env::{Env, EnvImpl};
 use crate::status::{Corrupting, Status};
@@ -27,6 +26,21 @@ impl Default for ColumnFamilyDescriptor {
     }
 }
 
+pub struct ColumnFamilyOptionsBuilder {
+    opts: ColumnFamilyOptions
+}
+
+impl ColumnFamilyOptionsBuilder {
+    pub fn dir(&mut self, dir: String) -> &mut Self {
+        self.opts.dir = dir;
+        self
+    }
+
+    pub fn build(&mut self) -> ColumnFamilyOptions {
+        self.opts.clone()
+    }
+}
+
 #[derive(Clone)]
 pub struct ColumnFamilyOptions {
     pub user_comparator: Rc<dyn Comparator>,
@@ -34,6 +48,16 @@ pub struct ColumnFamilyOptions {
     pub write_buf_size: usize,
     pub block_restart_interval: i32,
     pub dir: String,
+}
+
+impl ColumnFamilyOptions {
+    pub fn with() -> ColumnFamilyOptionsBuilder {
+        ColumnFamilyOptionsBuilder {opts: Self::default()}
+    }
+
+    pub fn with_modify(&self) -> ColumnFamilyOptionsBuilder {
+        ColumnFamilyOptionsBuilder { opts: self.clone() }
+    }
 }
 
 impl Default for ColumnFamilyOptions {
@@ -55,6 +79,11 @@ pub struct OptionsBuilder {
 impl OptionsBuilder {
     pub fn new() -> Self {
         Self { opts: Options::default() }
+    }
+
+    pub fn dir(&mut self, opt: String) -> &mut OptionsBuilder {
+        self.opts.core.dir = opt;
+        self
     }
 
     pub fn create_if_missing(&mut self, opt: bool) -> &mut OptionsBuilder {
@@ -124,7 +153,6 @@ pub trait Snapshot {
 }
 
 pub trait DB {
-    //fn open() -> Result<Box<dyn DB>, Status>;
     fn new_column_family(&mut self, name: &str, options: ColumnFamilyOptions)
         -> Result<Arc<RefCell<dyn ColumnFamily>>>;
 

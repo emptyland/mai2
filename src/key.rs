@@ -7,7 +7,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::slice;
 
-use crate::arena::Arena;
+use crate::arena::{Allocator, Arena};
 use crate::comparator::{BitwiseComparator, Comparator};
 
 #[derive(Copy)]
@@ -37,7 +37,14 @@ impl Tag {
 }
 
 impl KeyBundle {
-    pub fn for_key_value(arena: &mut Arena, sequence_number: u64, key: &[u8], value: &[u8]) -> KeyBundle {
+    pub fn new(arena: &mut dyn Allocator, tag: Tag, sequence_number: u64, key: &[u8], value: &[u8]) -> Self {
+        let kb = Self::for_uninitialized(arena, sequence_number, tag, key.len(), value.len());
+        kb.user_key_mut().write(key).unwrap();
+        kb.value_mut().write(value).unwrap();
+        kb
+    }
+
+    pub fn for_key_value(arena: &mut dyn Allocator, sequence_number: u64, key: &[u8], value: &[u8]) -> Self {
         let kb = Self::for_uninitialized(arena, sequence_number, Tag::KEY,
                                          key.len(), value.len());
         kb.user_key_mut().write(key).unwrap();
@@ -45,14 +52,21 @@ impl KeyBundle {
         kb
     }
 
-    pub fn for_deletion(arena: &mut Arena, sequence_number: u64, key: &[u8]) -> KeyBundle {
+    pub fn for_key(arena: &mut dyn Allocator, sequence_number: u64, key: &[u8]) -> Self {
+        let kb = Self::for_uninitialized(arena, sequence_number, Tag::KEY,
+                                         key.len(), 0);
+        kb.user_key_mut().write(key).unwrap();
+        kb
+    }
+
+    pub fn for_deletion(arena: &mut dyn Allocator, sequence_number: u64, key: &[u8]) -> Self {
         let kb = Self::for_uninitialized(arena, sequence_number, Tag::DELETION,
                                          key.len(), 0);
         kb.user_key_mut().write(key).unwrap();
         kb
     }
 
-    fn for_uninitialized(arena: &mut Arena, sequence_number: u64, tag: Tag, user_key_size: usize, value_size: usize) -> KeyBundle {
+    fn for_uninitialized(arena: &mut dyn Allocator, sequence_number: u64, tag: Tag, user_key_size: usize, value_size: usize) -> Self {
         let mut header;
         unsafe {
             let chunk = arena.allocate(Self::build_layout(user_key_size + TAG_SIZE + value_size));
@@ -63,7 +77,7 @@ impl KeyBundle {
 
             *(base_ptr.add(size_of::<KeyHeader>() + user_key_size) as *mut u64) = sequence_number | tag.flag()
         }
-        KeyBundle { bundle: NonNull::new(header).unwrap() }
+        Self { bundle: NonNull::new(header).unwrap() }
     }
 
     pub fn sequence_number(&self) -> u64 {
@@ -190,10 +204,10 @@ impl PartialOrd for KeyBundle {
 
 const TAG_SIZE: usize = size_of::<u64>();
 
-struct InternalKey<'a> {
-    sequence_number: u64,
-    tag: Tag,
-    user_key: &'a [u8],
+pub struct InternalKey<'a> {
+    pub sequence_number: u64,
+    pub tag: Tag,
+    pub user_key: &'a [u8],
 }
 
 impl InternalKey<'_> {
@@ -217,6 +231,7 @@ impl InternalKey<'_> {
     }
 }
 
+#[derive(Clone)]
 pub struct InternalKeyComparator {
     user_cmp: Rc<dyn Comparator>,
 }

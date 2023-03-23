@@ -3,7 +3,7 @@ use std::cmp::max;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 
 use num_enum::TryFromPrimitive;
 
@@ -11,9 +11,10 @@ use patch::CFCreation;
 use patch::FileCreation;
 
 use crate::column_family::ColumnFamilySet;
+use crate::db_impl::Locking;
 use crate::env::{Env, WritableFile};
 use crate::files;
-use crate::mai2::Options;
+use crate::mai2::{ColumnFamilyOptions, Options};
 use crate::marshal::{Decode, Decoder, Encode};
 use crate::wal::LogWriter;
 
@@ -80,7 +81,7 @@ impl VersionSet {
 
             // TODO: write level files
 
-            self.write_patch(patch)?;
+            self.write_patch(&patch)?;
         }
 
         let mut patch = VersionPatch::default();
@@ -93,10 +94,72 @@ impl VersionSet {
         let current_file_path = files::paths::current_file(self.abs_db_path());
         self.env().write_all(current_file_path.as_path(),
                              self.manifest_file_number.to_string().as_bytes())?;
-        self.write_patch(patch)
+        self.write_patch(&patch)
     }
 
-    fn write_patch(&mut self, patch: VersionPatch) -> io::Result<()> {
+    pub fn log_and_apply(&mut self, cf_options: ColumnFamilyOptions, mut patch: VersionPatch,
+                         _locking: &MutexGuard<Locking>) -> io::Result<()> {
+        if patch.has_redo_log_number() {
+            assert!(patch.redo_log_number >= self.redo_log_number);
+            assert!(patch.redo_log_number < self.next_file_number);
+        } else {
+            patch.set_redo_log_number(self.redo_log_number);
+        }
+
+        if !patch.has_prev_log_number() {
+            patch.set_prev_log_number(self.prev_log_number);
+        }
+
+        patch.set_next_file_number(self.next_file_number);
+        patch.set_last_sequence_number(self.last_sequence_number);
+
+        //
+        if patch.has_column_family_creation() {
+            ColumnFamilySet::new_column_family(&self.column_families().clone(),
+                                               patch.column_family_creation().cf_id,
+                                               patch.column_family_creation().name.clone(),
+                                               cf_options);
+
+            let column_families = self.column_families().borrow_mut();
+            patch.set_max_column_family(column_families.max_column_family_id());
+        }
+
+        if patch.has_redo_log() {
+            let column_families = self.column_families().borrow_mut();
+            let id = patch.redo_log.cf_id;
+            let cf = column_families.get_column_family_by_id(id).unwrap();
+            let mut borrowed_cf = cf.borrow_mut();
+            assert!(patch.redo_log.number >= borrowed_cf.redo_log_number());
+            assert!(patch.redo_log.number < self.next_file_number);
+            borrowed_cf.set_redo_log_number(patch.redo_log.number);
+        }
+
+        if patch.has_column_family_deletion() {
+            let column_families = self.column_families().borrow_mut();
+            let id = patch.cf_deletion;
+            assert_ne!(id, 0);
+            let cf = column_families.get_column_family_by_id(id).unwrap();
+            cf.borrow_mut().drop_it();
+        }
+
+        if matches!(self.log, None) {
+            self.create_manifest_file()?;
+            patch.set_next_file_number(self.next_file_number);
+        }
+
+        self.write_patch(&patch)?;
+
+        if patch.has_file_creation() || patch.has_file_creation() {
+            // TODO: Version builder!
+            todo!()
+        }
+
+        self.redo_log_number = patch.redo_log_number();
+        self.prev_log_number = patch.prev_log_number();
+        Ok(())
+    }
+
+    fn write_patch(&mut self, patch: &VersionPatch) -> io::Result<()> {
         let mut buf = Vec::new();
         patch.marshal(&mut buf);
 
@@ -285,14 +348,14 @@ mod patch {
 }
 
 #[derive(Debug, Default, Clone)]
-struct VersionPatch {
+pub struct VersionPatch {
     max_column_family: u32,
     cf_deletion: u32,
     cf_creation: patch::CFCreation,
     last_sequence_number: u64,
     next_file_number: u64,
     redo_log: patch::RedoLog,
-    prev_redo_log: u64,
+    prev_log_number: u64,
     compaction_point: patch::CompactionPoint,
     redo_log_number: u64,
     file_creation: Vec<patch::FileCreation>,
@@ -397,12 +460,12 @@ impl VersionPatch {
 
     pub fn set_prev_log_number(&mut self, value: u64) {
         self.set_field(patch::Field::PrevLogNumber);
-        self.prev_redo_log = value;
+        self.prev_log_number = value;
     }
 
     pub const fn has_prev_log_number(&self) -> bool { self.has_field(patch::Field::PrevLogNumber) }
 
-    pub const fn prev_log_number(&self) -> u64 { self.prev_redo_log }
+    pub const fn prev_log_number(&self) -> u64 { self.prev_log_number }
 
     pub fn set_max_column_family(&mut self, value: u32) {
         self.set_field(patch::Field::MaxColumnFamily);
@@ -492,7 +555,7 @@ impl VersionPatch {
     pub fn marshal(&self, buf: &mut Vec<u8>) {
         if self.has_prev_log_number() {
             patch::Field::PrevLogNumber.write_to(buf);
-            self.prev_redo_log.write_to(buf);
+            self.prev_log_number.write_to(buf);
         }
 
         if self.has_redo_log() {

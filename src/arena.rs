@@ -1,6 +1,12 @@
 use std::alloc::{alloc, dealloc, Layout};
-use std::mem::align_of;
-use std::ptr::{NonNull, slice_from_raw_parts_mut};
+use std::cell::RefCell;
+use std::iter;
+use std::ptr::{addr_of, addr_of_mut, NonNull, slice_from_raw_parts_mut};
+use std::rc::Rc;
+
+pub trait Allocator {
+    fn allocate(&mut self, layout: Layout) -> Result<NonNull<[u8]>, ()>;
+}
 
 #[derive(Debug)]
 pub struct Arena {
@@ -16,11 +22,31 @@ struct Page {
 }
 
 impl Arena {
-    pub fn new() -> Arena {
+    pub fn new() -> Self {
         Arena { pages: None }
     }
 
-    pub fn allocate(&mut self, layout: Layout) -> Result<NonNull<[u8]>, ()> {
+    pub fn new_rc() -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self::new()))
+    }
+
+    pub fn pages_count(&self) -> i32 {
+        let mut head = &self.pages;
+        let mut count = 0;
+        loop {
+            match head {
+                Some(page) => unsafe {
+                    count += 1;
+                    head = &page.as_ref().next;
+                }
+                None => break count
+            }
+        }
+    }
+}
+
+impl Allocator for Arena {
+    fn allocate(&mut self, layout: Layout) -> Result<NonNull<[u8]>, ()> {
         match self.pages {
             Some(mut head) => unsafe {
                 let chunk = head.as_mut().allocate(layout);
@@ -35,20 +61,6 @@ impl Arena {
             None => {
                 self.pages = Page::new(self.pages);
                 self.allocate(layout)
-            }
-        }
-    }
-
-    pub fn pages_count(&self) -> i32 {
-        let mut head = &self.pages;
-        let mut count = 0;
-        loop {
-            match head {
-                Some(page) => unsafe {
-                    count += 1;
-                    head = &page.as_ref().next;
-                }
-                None => break count
             }
         }
     }
@@ -100,6 +112,38 @@ impl Page {
             self.free = aligned.add(layout.size());
         }
         NonNull::new(slice_from_raw_parts_mut(aligned, layout.size()))
+    }
+}
+
+pub struct ScopedMemory {
+    block: [u8;128],
+    chunk: Vec<u8>
+}
+
+impl ScopedMemory {
+    pub fn new() -> Self {
+        Self {
+            block: [0;128],
+            chunk: Vec::new()
+        }
+    }
+}
+
+impl Allocator for ScopedMemory {
+    fn allocate(&mut self, layout: Layout) -> Result<NonNull<[u8]>, ()> {
+        let non_null = if layout.size() + layout.align() <= self.block.len() {
+            let ptr = round_up(addr_of_mut!(self.block[0]), layout.align() as i64);
+            NonNull::new(slice_from_raw_parts_mut(ptr, layout.size()))
+        } else {
+            self.chunk.extend(iter::repeat(0).take(layout.size() + layout.align()));
+            let ptr = round_up(addr_of_mut!(self.chunk.as_mut_slice()[0]), layout.align() as i64);
+            NonNull::new(slice_from_raw_parts_mut(ptr, layout.size()))
+        };
+
+        match non_null {
+            Some(ptr) => Ok(ptr),
+            None => Err(())
+        }
     }
 }
 

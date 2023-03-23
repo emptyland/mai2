@@ -13,6 +13,7 @@ use crate::comparator::Comparator;
 use crate::env::Env;
 use crate::key::InternalKeyComparator;
 use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME};
+use crate::memory_table::MemoryTable;
 use crate::status::Status;
 use crate::version::VersionSet;
 
@@ -26,6 +27,7 @@ pub struct ColumnFamilyImpl {
     initialized: bool,
     background_progress: AtomicBool,
     redo_log_number: u64,
+    mutable: Arc<RefCell<MemoryTable>>,
     // TODO:
 }
 
@@ -43,16 +45,18 @@ impl ColumnFamilyImpl {
     fn new_dummy(name: String, id: u32, options: ColumnFamilyOptions, owns: Weak<RefCell<ColumnFamilySet>>)
                  -> Arc<RefCell<ColumnFamilyImpl>> {
         let ikc = options.user_comparator.clone();
+        let internal_key_cmp = InternalKeyComparator::new(ikc);
         let cfi = ColumnFamilyImpl {
             name,
             id,
             options,
             owns,
             dropped: AtomicBool::from(false),
-            internal_key_cmp: InternalKeyComparator::new(ikc),
+            internal_key_cmp: internal_key_cmp.clone(),
             initialized: false,
             background_progress: AtomicBool::new(false),
             redo_log_number: 0,
+            mutable: MemoryTable::new_rc(internal_key_cmp.clone())
         };
         Arc::new(RefCell::new(cfi))
     }
@@ -67,7 +71,6 @@ impl ColumnFamilyImpl {
     pub fn install(&mut self) -> io::Result<()> {
         assert!(!self.initialized());
 
-        // TODO: memory-table
         let cf_path = self.get_work_path();
         let owns = self.owns.upgrade().unwrap();
         owns.borrow().env().make_dir(cf_path.as_path())?;
@@ -90,7 +93,7 @@ impl ColumnFamilyImpl {
 
     pub fn get_work_path(&self) -> PathBuf {
         let owns = self.owns.upgrade().unwrap();
-        let mut path = PathBuf::new();
+        let path = PathBuf::new();
         if self.options.dir.is_empty() {
             path.join(owns.borrow().abs_db_path()).join(self.name())
         } else {
@@ -211,27 +214,32 @@ impl ColumnFamilySet {
             column_family_names: HashMap::new(),
         };
         let owns = Arc::new(RefCell::new(cfs));
-        let cf = Self::new_column_family_dummy(&owns, String::from(DEFAULT_COLUMN_FAMILY_NAME), ColumnFamilyOptions::default());
-        owns.borrow_mut().default_column_family = Some(cf);
+        // let cf = Self::new_column_family_dummy(&owns, String::from(DEFAULT_COLUMN_FAMILY_NAME), ColumnFamilyOptions::default());
+        // owns.borrow_mut().default_column_family = Some(cf);
         owns
     }
 
-    fn new_column_family_dummy(this: &Arc<RefCell<Self>>, name: String, options: ColumnFamilyOptions)
-        -> Arc<RefCell<ColumnFamilyImpl>> {
-        let cf = ColumnFamilyImpl::new_dummy(name,
-                                             this.borrow_mut().next_column_family_id(),
-                                             options, Arc::downgrade(this));
-        this.borrow_mut().column_families.insert(cf.borrow().id(), cf.clone());
-        cf
-    }
+    // fn new_column_family_dummy(this: &Arc<RefCell<Self>>, name: String, options: ColumnFamilyOptions)
+    //     -> Arc<RefCell<ColumnFamilyImpl>> {
+    //     let cf = ColumnFamilyImpl::new_dummy(name,
+    //                                          this.borrow_mut().next_column_family_id(),
+    //                                          options, Arc::downgrade(this));
+    //     this.borrow_mut().column_families.insert(cf.borrow().id(), cf.clone());
+    //     cf
+    // }
 
     pub fn new_column_family(this: &Arc<RefCell<Self>>, id: u32, name: String, options: ColumnFamilyOptions)
         -> Arc<RefCell<ColumnFamilyImpl>> {
         // TODO:
         let cf = ColumnFamilyImpl::new_dummy(name, id, options, Arc::downgrade(this));
         let mut borrowed_this = this.borrow_mut();
+
+        assert!(borrowed_this.get_column_family_by_id(cf.borrow().id()).is_none());
         borrowed_this.column_families.insert(cf.borrow().id(), cf.clone());
+
+        assert!(borrowed_this.get_column_family_by_name(cf.borrow().name()).is_none());
         borrowed_this.column_family_names.insert(cf.borrow().name().clone(), cf.clone());
+
         borrowed_this.update_max_column_family_id(id);
         if id == 0 {
             borrowed_this.default_column_family = Some(cf.clone());
