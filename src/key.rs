@@ -310,7 +310,7 @@ mod tests {
                                           "1".as_bytes());
         let b2 = KeyBundle::for_key_value(&mut arena, 2, "111".as_bytes(),
                                           "2".as_bytes());
-        let user_cmp = Rc::new(BitwiseComparator{});
+        let user_cmp = Rc::new(BitwiseComparator {});
         let cmp = InternalKeyComparator::new(user_cmp);
         assert_eq!(Ordering::Greater, cmp.compare(b1.key(), b2.key()));
     }

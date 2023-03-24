@@ -39,7 +39,7 @@ pub mod paths {
 }
 
 pub fn log_file_name(db_name: &String, number: u64) -> String {
-    let mut  name = String::new();
+    let mut name = String::new();
     name.write_fmt(format_args!("{}/{}{}", db_name, number, LOG_POSTFIX)).unwrap();
     name
 }

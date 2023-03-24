@@ -40,12 +40,12 @@ pub struct LogWriter {
     file_writer: marshal::FileWriter,
     block_size: usize,
     block_offset: usize,
-    record_ty_crc32_sums: [u32;MAX_RECORD_TYPE+1]
+    record_ty_crc32_sums: [u32; MAX_RECORD_TYPE + 1],
 }
 
 impl LogWriter {
     pub fn new(file: Rc<RefCell<dyn WritableFile>>, block_size: usize) -> Self {
-        let mut sums: [u32;MAX_RECORD_TYPE+1] = [0;MAX_RECORD_TYPE+1];
+        let mut sums: [u32; MAX_RECORD_TYPE + 1] = [0; MAX_RECORD_TYPE + 1];
         let crc = Crc::<u32>::new(&CRC_32_ISCSI);
 
         for i in 0..sums.len() {
@@ -58,7 +58,7 @@ impl LogWriter {
             file_writer: marshal::FileWriter::new(file),
             block_size,
             block_offset: 0,
-            record_ty_crc32_sums: sums
+            record_ty_crc32_sums: sums,
         }
     }
 
@@ -78,7 +78,7 @@ impl LogWriter {
             }
 
             let avail = self.block_size - self.block_offset - HEADER_SIZE;
-            let fragment_len = if left < avail {left} else {avail};
+            let fragment_len = if left < avail { left } else { avail };
 
             let end = left == fragment_len;
             let record_ty = if begin && end {
@@ -144,7 +144,7 @@ impl LogReader {
             file_reader: marshal::FileReader::new(file),
             verify_checksum,
             block_size,
-            block_offset: 0
+            block_offset: 0,
         }
     }
 
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn block_2_log() {
-        let data: [u8;33] = [0xab;33];
+        let data: [u8; 33] = [0xab; 33];
         let wf = new_and_write_log(&data, 16);
         let buf = MemoryWritableFile::get_buf(&wf);
         let rf = MemorySequentialFile::new_rc(buf);

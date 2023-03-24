@@ -5,6 +5,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::comparator::{BitwiseComparator, Comparator};
+use crate::config;
 use crate::env::{Env, EnvImpl};
 use crate::status::{Corrupting, Status};
 
@@ -14,20 +15,20 @@ pub const DEFAULT_COLUMN_FAMILY_NAME: &str = "default";
 
 pub struct ColumnFamilyDescriptor {
     pub(crate) name: String,
-    pub(crate) options: ColumnFamilyOptions
+    pub(crate) options: ColumnFamilyOptions,
 }
 
 impl Default for ColumnFamilyDescriptor {
     fn default() -> Self {
         ColumnFamilyDescriptor {
             name: String::from("cf"),
-            options: ColumnFamilyOptions::default()
+            options: ColumnFamilyOptions::default(),
         }
     }
 }
 
 pub struct ColumnFamilyOptionsBuilder {
-    opts: ColumnFamilyOptions
+    opts: ColumnFamilyOptions,
 }
 
 impl ColumnFamilyOptionsBuilder {
@@ -52,7 +53,7 @@ pub struct ColumnFamilyOptions {
 
 impl ColumnFamilyOptions {
     pub fn with() -> ColumnFamilyOptionsBuilder {
-        ColumnFamilyOptionsBuilder {opts: Self::default()}
+        ColumnFamilyOptionsBuilder { opts: Self::default() }
     }
 
     pub fn with_modify(&self) -> ColumnFamilyOptionsBuilder {
@@ -63,7 +64,7 @@ impl ColumnFamilyOptions {
 impl Default for ColumnFamilyOptions {
     fn default() -> Self {
         Self {
-            user_comparator: Rc::new(BitwiseComparator{}),
+            user_comparator: Rc::new(BitwiseComparator {}),
             block_size: 4096,
             write_buf_size: 40 * 1024 * 1024,
             block_restart_interval: 16,
@@ -134,12 +135,12 @@ impl Default for Options {
             error_if_exists: true,
             max_open_files: 1000,
             max_total_wal_size: 80 * 1024 * 1024,
-            block_cache_capacity: 10 * 1024 * 1024
+            block_cache_capacity: 10 * 1024 * 1024,
         }
     }
 }
 
-pub trait ColumnFamily  {
+pub trait ColumnFamily {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn name(&self) -> String;
@@ -148,17 +149,17 @@ pub trait ColumnFamily  {
     fn get_descriptor(&self) -> Result<ColumnFamilyDescriptor>;
 }
 
-pub trait Snapshot {
-
-}
+pub trait Snapshot {}
 
 pub trait DB {
     fn new_column_family(&mut self, name: &str, options: ColumnFamilyOptions)
-        -> Result<Arc<RefCell<dyn ColumnFamily>>>;
+                         -> Result<Arc<RefCell<dyn ColumnFamily>>>;
 
     fn drop_column_family(&mut self, column_family: Arc<RefCell<dyn ColumnFamily>>) -> Result<()>;
 
-    fn release_column_family(&mut self, column_family: Arc<RefCell<dyn ColumnFamily>>) -> Result<()>;
+    fn get_all_column_families(&self) -> Result<Vec<Arc<RefCell<dyn ColumnFamily>>>>;
+
+    fn default_column_family(&self) -> Arc<RefCell<dyn ColumnFamily>>;
 }
 
 #[inline]

@@ -1,6 +1,6 @@
 use crate::status::Status;
 
-pub trait Iterator : std::iter::Iterator {
+pub trait Iterator: std::iter::Iterator {
     fn valid(&self) -> bool;
     fn seek_to_first(&mut self);
     fn seek_to_last(&mut self);

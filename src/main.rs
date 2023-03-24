@@ -15,6 +15,7 @@ mod varint;
 mod wal;
 mod memory_table;
 mod iterator;
+mod config;
 
 fn main() {
     println!("ok")

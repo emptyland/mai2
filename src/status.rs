@@ -1,4 +1,3 @@
-
 #[derive(Debug, Clone)]
 pub enum Status {
     Ok,
@@ -6,7 +5,7 @@ pub enum Status {
     NotFound,
 }
 
-pub trait Corrupting<T> : Sized {
+pub trait Corrupting<T>: Sized {
     fn corrupted(message: T) -> Status;
 }
 

@@ -31,12 +31,12 @@ pub trait Env {
     }
 }
 
-pub trait SequentialFile : io::Read {
+pub trait SequentialFile: io::Read {
     fn skip(&mut self, bytes: usize) -> io::Result<u64>;
     fn get_file_size(&self) -> io::Result<usize>;
 }
 
-pub trait WritableFile : io::Write {
+pub trait WritableFile: io::Write {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
@@ -58,7 +58,7 @@ pub struct EnvImpl;
 
 impl EnvImpl {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self{})
+        Arc::new(Self {})
     }
 
     pub fn new_chroot(root: &Path) -> Self {
@@ -121,13 +121,13 @@ impl Env for EnvImpl {
 }
 
 struct SequentialFileImpl {
-    file: File
+    file: File,
 }
 
 impl SequentialFileImpl {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = open_read_only_file(path)?;
-        Ok(Self{file})
+        Ok(Self { file })
     }
 }
 
@@ -149,7 +149,7 @@ impl SequentialFile for SequentialFileImpl {
 }
 
 struct WritableFileImpl {
-    file: File
+    file: File,
 }
 
 impl WritableFileImpl {
@@ -161,7 +161,7 @@ impl WritableFileImpl {
             .create_new(true)
             .append(append)
             .open(path)?;
-        Ok(Self{file})
+        Ok(Self { file })
     }
 }
 
@@ -200,19 +200,17 @@ impl WritableFile for WritableFileImpl {
 }
 
 impl Drop for WritableFileImpl {
-    fn drop(&mut self) {
-
-    }
+    fn drop(&mut self) {}
 }
 
 struct RandomAccessFileImpl {
-    file: File
+    file: File,
 }
 
 impl RandomAccessFileImpl {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = open_read_only_file(path)?;
-        Ok(Self{file})
+        Ok(Self { file })
     }
 }
 
@@ -238,7 +236,7 @@ impl RandomAccessFile for RandomAccessFileImpl {
 }
 
 pub struct MemoryWritableFile {
-    buf: Vec<u8>
+    buf: Vec<u8>,
 }
 
 impl MemoryWritableFile {
@@ -306,15 +304,14 @@ impl WritableFile for MemoryWritableFile {
 
 pub struct MemorySequentialFile {
     buf: Vec<u8>,
-    offset: usize
+    offset: usize,
 }
 
 impl MemorySequentialFile {
-
     pub fn new(buf: Vec<u8>) -> Self {
         Self {
             buf,
-            offset: 0
+            offset: 0,
         }
     }
 
@@ -350,16 +347,16 @@ impl SequentialFile for MemorySequentialFile {
 }
 
 pub struct JunkFilesCleaner {
-    paths: Vec<String>
+    paths: Vec<String>,
 }
 
 impl JunkFilesCleaner {
     pub fn new(path: &str) -> Self {
-        Self{paths: vec![String::from(path)]}
+        Self { paths: vec![String::from(path)] }
     }
 
     pub fn new_all(paths: &[&str]) -> Self {
-        Self{paths: paths.iter().map(|x| String::from(*x)).collect()}
+        Self { paths: paths.iter().map(|x| String::from(*x)).collect() }
     }
 
     pub fn path_str(&self, i: usize) -> &String {
@@ -410,7 +407,7 @@ mod tests {
     fn work_dir() -> io::Result<()> {
         let path = env::current_dir()?;
         assert!(path.is_absolute());
-        dbg!(path);
+        //dbg!(path);
         Ok(())
     }
 
@@ -439,8 +436,6 @@ mod tests {
         {
             let file = env.new_writable_file(files.path(0), false)?;
             file.borrow_mut().write("hello\n".as_bytes())?;
-
-            dbg!(env.get_absolute_path(files.path(0)).unwrap());
         }
         {
             let rs = env.new_writable_file(files.path(0), false);

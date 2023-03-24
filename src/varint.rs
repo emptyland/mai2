@@ -31,7 +31,7 @@ impl Varint<u32> {
         for b in buf {
             n += 1;
             if n >= MAX_VARINT32_LEN {
-                return Err(io::Error::from(io::ErrorKind::InvalidData))
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             if *b < 0x80u8 {
                 rs |= *b as u32;
@@ -85,7 +85,7 @@ impl Varint<u64> {
         for b in buf {
             n += 1;
             if n >= MAX_VARINT64_LEN {
-                return Err(io::Error::from(io::ErrorKind::InvalidData))
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
             if *b & 0x80 == 0 {
                 rs |= *b as u64;
@@ -94,7 +94,6 @@ impl Varint<u64> {
 
             rs |= (b & 0x7f) as u64;
             rs <<= 7;
-
         }
         Ok((rs, n))
     }
@@ -106,25 +105,25 @@ impl Varint<u64> {
 }
 
 pub fn zig_zag32_encode(value: i32) -> u32 {
-    let bit = if value < 0 {1} else {0};
+    let bit = if value < 0 { 1 } else { 0 };
     (value.unsigned_abs() << 1) | bit
 }
 
 pub fn zig_zag32_decode(value: u32) -> i32 {
     let signed = (value & 1) == 1;
     let i = i32::from_le_bytes((value >> 1).to_le_bytes());
-    if signed {-i} else {i}
+    if signed { -i } else { i }
 }
 
 pub fn zig_zag64_encode(value: i64) -> u64 {
-    let bit = if value < 0 {1} else {0};
+    let bit = if value < 0 { 1 } else { 0 };
     (value.unsigned_abs() << 1) | bit
 }
 
 pub fn zig_zag64_decode(value: u64) -> i64 {
     let signed = (value & 1) == 1;
     let i = i64::from_le_bytes((value >> 1).to_le_bytes());
-    if signed {-i} else {i}
+    if signed { -i } else { i }
 }
 
 #[cfg(test)]

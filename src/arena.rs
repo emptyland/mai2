@@ -1,7 +1,7 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::iter;
-use std::ptr::{addr_of, addr_of_mut, NonNull, slice_from_raw_parts_mut};
+use std::ptr::{addr_of_mut, NonNull, slice_from_raw_parts_mut};
 use std::rc::Rc;
 
 pub trait Allocator {
@@ -116,15 +116,15 @@ impl Page {
 }
 
 pub struct ScopedMemory {
-    block: [u8;128],
-    chunk: Vec<u8>
+    block: [u8; 128],
+    chunk: Vec<u8>,
 }
 
 impl ScopedMemory {
     pub fn new() -> Self {
         Self {
-            block: [0;128],
-            chunk: Vec::new()
+            block: [0; 128],
+            chunk: Vec::new(),
         }
     }
 }

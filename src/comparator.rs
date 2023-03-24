@@ -48,7 +48,7 @@ mod tests {
 
     #[test]
     fn sanity() {
-        let cmp: Box<dyn Comparator> = Box::new(BitwiseComparator{});
+        let cmp: Box<dyn Comparator> = Box::new(BitwiseComparator {});
         let ord = cmp.compare("111".as_bytes(), "222".as_bytes());
         assert!(matches!(ord, Ordering::Less));
     }

@@ -203,14 +203,14 @@ impl<Key> Node<Key> {
 
 pub struct IteratorImpl<Key, Cmp> {
     owns: *const SkipList<Key, Cmp>,
-    node: Option<NonNull<Node<Key>>>
+    node: Option<NonNull<Node<Key>>>,
 }
 
-impl <'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> IteratorImpl<Key, Cmp> {
+impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> IteratorImpl<Key, Cmp> {
     pub fn new(owns: *const SkipList<Key, Cmp>) -> Self {
         IteratorImpl {
             owns,
-            node: None
+            node: None,
         }
     }
 
@@ -246,7 +246,7 @@ impl <'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> IteratorImp
     }
 }
 
-impl <'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> Iterator for IteratorImpl<Key, Cmp> {
+impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> Iterator for IteratorImpl<Key, Cmp> {
     type Item = Key;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -273,6 +273,7 @@ mod tests {
     use super::*;
 
     struct KeyComparator;
+
     impl Comparing<&KeyBundle> for KeyComparator {
         fn cmp(&self, lhs: &KeyBundle, rhs: &KeyBundle) -> Option<cmp::Ordering> {
             lhs.user_key().partial_cmp(rhs.user_key())
@@ -280,8 +281,8 @@ mod tests {
     }
 
     struct IntComparator;
-    impl Comparing<&i32> for IntComparator {
 
+    impl Comparing<&i32> for IntComparator {
         fn cmp(&self, lhs: &i32, rhs: &i32) -> Option<cmp::Ordering> {
             lhs.partial_cmp(rhs)
         }
@@ -300,7 +301,7 @@ mod tests {
     #[test]
     fn insert_keys() {
         let arena = Arena::new_rc();
-        let cmp = KeyComparator{};
+        let cmp = KeyComparator {};
         let mut map = SkipList::new(arena.clone(), cmp);
 
         for i in 0..100 {

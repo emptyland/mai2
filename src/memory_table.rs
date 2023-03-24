@@ -4,9 +4,10 @@ use std::ops::DerefMut;
 use std::ptr::addr_of;
 use std::rc::Rc;
 use std::sync::Arc;
+
+use crate::{iterator, mai2, skip_list};
 use crate::arena::{Arena, ScopedMemory};
 use crate::comparator::Comparator;
-use crate::{iterator, mai2, skip_list};
 use crate::iterator::Iterator;
 use crate::key::{InternalKey, InternalKeyComparator, KeyBundle, Tag};
 use crate::skip_list::{Comparing, SkipList};
@@ -150,14 +151,13 @@ impl iterator::Iterator for IteratorImpl {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::comparator::BitwiseComparator;
+
+    use super::*;
 
     #[test]
     fn sanity() {
-        let user_cmp = Rc::new(BitwiseComparator {});
-        let internal_key_cmp = InternalKeyComparator::new(user_cmp);
-        let mut table = MemoryTable::new(internal_key_cmp);
+        let mut table = MemoryTable::new(default_internal_key_cmp());
 
         table.insert("aaa".as_bytes(), "boo".as_bytes(), 1, Tag::KEY);
         table.insert("aaa".as_bytes(), "obo".as_bytes(), 2, Tag::KEY);
@@ -174,5 +174,21 @@ mod tests {
             assert_eq!("obo", String::from_utf8_lossy(value));
             assert_eq!(Tag::KEY, tag);
         }
+    }
+
+    #[test]
+    fn insert_keys() {
+        let core = MemoryTable::new(default_internal_key_cmp());
+        let mut table = Rc::new(core);
+
+        let rf = Rc::get_mut(&mut table).unwrap();
+        rf.insert("aaa".as_bytes(), "boo".as_bytes(), 1, Tag::KEY);
+
+        //Rc::make_mut(&mut table);
+    }
+
+    fn default_internal_key_cmp() -> InternalKeyComparator {
+        let user_cmp = Rc::new(BitwiseComparator {});
+        InternalKeyComparator::new(user_cmp)
     }
 }

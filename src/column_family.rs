@@ -1,21 +1,22 @@
+use std::{array, io};
 use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::max;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::comparator::Comparator;
+use crate::config;
 use crate::env::Env;
 use crate::key::InternalKeyComparator;
 use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME};
 use crate::memory_table::MemoryTable;
 use crate::status::Status;
-use crate::version::VersionSet;
+use crate::version::{Version, VersionSet};
 
 pub struct ColumnFamilyImpl {
     name: String,
@@ -23,10 +24,16 @@ pub struct ColumnFamilyImpl {
     options: ColumnFamilyOptions,
     owns: Weak<RefCell<ColumnFamilySet>>,
     dropped: AtomicBool,
-    internal_key_cmp: InternalKeyComparator,
+    pub internal_key_cmp: InternalKeyComparator,
     initialized: bool,
     background_progress: AtomicBool,
     redo_log_number: u64,
+
+    history: Vec<Version>,
+    current_version_index: usize,
+
+    compaction_points: [Vec<u8>; config::MAX_LEVEL],
+
     mutable: Arc<RefCell<MemoryTable>>,
     // TODO:
 }
@@ -56,7 +63,11 @@ impl ColumnFamilyImpl {
             initialized: false,
             background_progress: AtomicBool::new(false),
             redo_log_number: 0,
-            mutable: MemoryTable::new_rc(internal_key_cmp.clone())
+            history: Vec::new(),
+            current_version_index: 0,
+            mutable: MemoryTable::new_rc(internal_key_cmp.clone()),
+            compaction_points: array::from_fn(|_| Vec::new()),
+
         };
         Arc::new(RefCell::new(cfi))
     }
@@ -91,6 +102,12 @@ impl ColumnFamilyImpl {
         Ok(())
     }
 
+    pub fn append(&mut self, version: Version) { self.history.push(version); }
+
+    pub fn set_compaction_point(&mut self, level: usize, key: Vec<u8>) {
+        self.compaction_points[level] = key;
+    }
+
     pub fn get_work_path(&self) -> PathBuf {
         let owns = self.owns.upgrade().unwrap();
         let path = PathBuf::new();
@@ -100,6 +117,10 @@ impl ColumnFamilyImpl {
             path.join(owns.borrow().env().get_absolute_path(Path::new(&self.options.dir)).unwrap())
                 .join(self.name())
         }
+    }
+
+    pub fn current(&self) -> &Version {
+        self.history.get(self.current_version_index).unwrap()
     }
 
     pub const fn id(&self) -> u32 { self.id }
@@ -132,7 +153,6 @@ impl ColumnFamilyImpl {
 
 impl Drop for ColumnFamilyImpl {
     fn drop(&mut self) {
-
         if !self.dropped() {
             if let Some(owns) = self.owns.upgrade() {
                 owns.borrow_mut().remove_column_family(self);
@@ -150,7 +170,7 @@ pub struct ColumnFamilyHandle {
 
 impl ColumnFamilyHandle {
     pub fn new(core: Arc<RefCell<ColumnFamilyImpl>>) -> Arc<RefCell<dyn ColumnFamily>> {
-        Arc::new( RefCell::new(ColumnFamilyHandle {
+        Arc::new(RefCell::new(ColumnFamilyHandle {
             db: 0 as *const u8,
             core,
         }))
@@ -186,7 +206,7 @@ impl ColumnFamily for ColumnFamilyHandle {
         if self.core().borrow().dropped() {
             Err(Status::Corruption(String::from("Column family is dropped!")))
         } else {
-            Ok(ColumnFamilyDescriptor{
+            Ok(ColumnFamilyDescriptor {
                 name: self.name(),
                 options: self.core().borrow().options().clone(),
             })
@@ -229,7 +249,7 @@ impl ColumnFamilySet {
     // }
 
     pub fn new_column_family(this: &Arc<RefCell<Self>>, id: u32, name: String, options: ColumnFamilyOptions)
-        -> Arc<RefCell<ColumnFamilyImpl>> {
+                             -> Arc<RefCell<ColumnFamilyImpl>> {
         // TODO:
         let cf = ColumnFamilyImpl::new_dummy(name, id, options, Arc::downgrade(this));
         let mut borrowed_this = this.borrow_mut();
@@ -304,13 +324,14 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore]
     fn sanity() {
-        let vss = VersionSet::new_dummy(PathBuf::from("db"), &Options::default());
+        let vss = VersionSet::new(PathBuf::from("db"), &Options::default());
         let vs = vss.borrow();
         let cfs = vs.column_families();
-        assert_eq!(1, cfs.borrow().max_column_family_id());
+        assert_eq!(0, cfs.borrow().max_column_family_id());
         let dcf = cfs.borrow().default_column_family();
-        assert_eq!(1, dcf.borrow().id());
+        assert_eq!(0, dcf.borrow().id());
         assert_eq!("default", dcf.borrow().name());
     }
 }

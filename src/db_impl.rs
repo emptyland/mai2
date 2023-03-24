@@ -1,13 +1,15 @@
 use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
+use std::io;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64};
 
-use crate::mai2;
 use crate::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
 use crate::env::{Env, WritableFile};
 use crate::files::paths;
+use crate::mai2;
 use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DB, DEFAULT_COLUMN_FAMILY_NAME, from_io_result, Options};
 use crate::status::{Corrupting, Status};
 use crate::version::{VersionPatch, VersionSet};
@@ -43,7 +45,7 @@ impl DBImpl {
                 -> mai2::Result<(Arc<RefCell<dyn DB>>, Vec<Arc<RefCell<dyn ColumnFamily>>>)> {
         let env = options.env.clone();
         let abs_db_path = DBImpl::make_abs_db_path(&options.core.dir, &name, &env)?;
-        let versions = VersionSet::new_dummy(abs_db_path.clone(), &options);
+        let versions = VersionSet::new(abs_db_path.clone(), &options);
 
         let mut db = DBImpl {
             db_name: name.clone(),
@@ -193,26 +195,98 @@ impl DBImpl {
         // TODO: logger
         Ok(())
     }
+
+    fn internal_new_column_family(&mut self, name: String, options: ColumnFamilyOptions,
+                                  locking: &MutexGuard<Locking>)
+                                  -> mai2::Result<u32> {
+        let (id, patch) = {
+            let versions = self.versions.borrow_mut();
+            let mut cfs = versions.column_families().borrow_mut();
+            if cfs.get_column_family_by_name(&name).is_some() {
+                return Err(Status::corrupted(format!("duplicated column family name: {}", &name)));
+            }
+
+            let new_id = cfs.next_column_family_id();
+            let mut patch = VersionPatch::default();
+            patch.create_column_family(name.clone(), new_id,
+                                       options.user_comparator.name().clone());
+            (new_id, patch)
+        };
+
+        from_io_result(self.versions.borrow_mut().log_and_apply(options, patch, locking))?;
+        Ok(id)
+    }
 }
 
 impl DB for DBImpl {
     fn new_column_family(&mut self, name: &str, options: ColumnFamilyOptions)
-                         -> Result<Arc<RefCell<dyn ColumnFamily>>, Status> {
-        todo!()
+                         -> mai2::Result<Arc<RefCell<dyn ColumnFamily>>> {
+        let mutex = self.mutex.clone();
+        let lock = mutex.lock().unwrap();
+        //--------------------------lock version-set------------------------------------------------
+        let id = self.internal_new_column_family(String::from(name), options, &lock)?;
+
+        let versions = self.versions.borrow();
+        let cfs = versions.column_families().borrow();
+        let cfi = cfs.get_column_family_by_id(id).unwrap();
+        from_io_result(cfi.borrow_mut().install())?;
+        cfi.borrow_mut().set_redo_log_number(self.log_file_number);
+        assert!(cfi.borrow().initialized());
+        Ok(ColumnFamilyHandle::new(cfi.clone()))
+        //--------------------------unlock version-set----------------------------------------------
     }
 
     fn drop_column_family(&mut self, column_family: Arc<RefCell<dyn ColumnFamily>>) -> mai2::Result<()> {
-        let _lock = self.mutex.lock().unwrap();
-        todo!()
+        {
+            let cf = column_family.borrow();
+            if cf.id() == 0 {
+                return Err(Status::corrupted("can not drop default column family!"));
+            }
+        }
+        let cfi = ColumnFamilyImpl::from(&column_family);
+        if cfi.borrow().dropped() {
+            return Err(Status::corrupted(format!("column family: {} has dropped",
+                                                 cfi.borrow().name())));
+        }
+
+        let mutex = self.mutex.clone();
+        let lock = mutex.lock().unwrap();
+        //--------------------------lock version-set------------------------------------------------
+        while cfi.borrow().background_progress() {
+            // Waiting for all background progress done
+            todo!()
+        }
+        let mut patch = VersionPatch::default();
+        patch.drop_column_family(cfi.borrow().id());
+
+        let cf_opts = cfi.borrow().options().clone();
+        from_io_result(self.versions.borrow_mut()
+            .log_and_apply(cf_opts, patch, &lock))?;
+        from_io_result(cfi.borrow_mut().uninstall())?;
+        Ok(())
+        //--------------------------unlock version-set----------------------------------------------
     }
 
-    fn release_column_family(&mut self, column_family: Arc<RefCell<dyn ColumnFamily>>) -> mai2::Result<()> {
-        let _lock = self.mutex.lock().unwrap();
-        let cfi = ColumnFamilyImpl::from(&column_family);
-        dbg!(cfi);
+    fn get_all_column_families(&self) -> mai2::Result<Vec<Arc<RefCell<dyn ColumnFamily>>>> {
+        let mutex = self.mutex.clone();
+        let _lock = mutex.lock().unwrap();
+        //--------------------------lock version-set------------------------------------------------
 
+        let mut cfs: Vec<Arc<RefCell<dyn ColumnFamily>>> = self.versions
+            .borrow().column_families()
+            .borrow().column_family_impls()
+            .iter()
+            .map(|x| (**x).clone())
+            .filter(|x| !x.borrow().dropped() && x.borrow().initialized())
+            .map(|x| ColumnFamilyHandle::new(x.clone()))
+            .collect();
+        cfs.sort_by(|a, b| a.borrow().id().cmp(&b.borrow().id()));
+        Ok(cfs)
+        //--------------------------unlock version-set----------------------------------------------
+    }
 
-        todo!()
+    fn default_column_family(&self) -> Arc<RefCell<dyn ColumnFamily>> {
+        self.default_column_family.as_ref().unwrap().clone()
     }
 }
 
@@ -225,9 +299,7 @@ impl Drop for DBImpl {
 
 #[cfg(test)]
 mod tests {
-    use rand::distributions::uniform::SampleBorrow;
     use crate::env::JunkFilesCleaner;
-
     use super::*;
 
     #[test]
@@ -254,5 +326,65 @@ mod tests {
         assert!(junk.path(0).join("cf").exists());
         assert!(junk.path(0).join("default").exists());
         Ok(())
+    }
+
+    #[test]
+    fn default_cf() -> mai2::Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db0");
+        let db = open_simple_db("db0")?;
+        let cf = db.borrow().default_column_family();
+        assert_eq!(0, cf.borrow().id());
+        assert_eq!(DEFAULT_COLUMN_FAMILY_NAME, cf.borrow().name());
+
+        let cfs = db.borrow().get_all_column_families()?;
+        assert_eq!(1, cfs.len());
+        assert_eq!(cf.borrow().id(), cfs[0].borrow().id());
+        assert_eq!(cf.borrow().name(), cfs[0].borrow().name());
+        Ok(())
+    }
+
+    #[test]
+    fn new_cf() -> mai2::Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db1");
+
+        let descs = [
+            ColumnFamilyDescriptor {
+                name: String::from("cf"),
+                options: ColumnFamilyOptions::default(),
+            }];
+        let options = Options::with()
+            .create_if_missing(true)
+            .dir(String::from("tests"))
+            .build();
+        let (db, cfs) = DBImpl::open(options, String::from("db1"), &descs)?;
+        assert_eq!(1, cfs.len());
+
+        let cf1 = db.borrow_mut()
+            .new_column_family("cf1", ColumnFamilyOptions::default())?;
+        assert_eq!(2, cf1.borrow().id());
+        assert_eq!("cf1", cf1.borrow().name());
+
+        db.borrow_mut().drop_column_family(cfs[0].clone())?;
+
+        {
+            let cfs = db.borrow().get_all_column_families()?;
+            assert_eq!(2, cfs.len());
+
+            assert_eq!(0, cfs[0].borrow().id());
+            assert_eq!(DEFAULT_COLUMN_FAMILY_NAME, cfs[0].borrow().name());
+
+            assert_eq!(2, cfs[1].borrow().id());
+            assert_eq!("cf1", cfs[1].borrow().name());
+        }
+        Ok(())
+    }
+
+    fn open_simple_db(name: &str) -> mai2::Result<Arc<RefCell<dyn DB>>> {
+        let options = Options::with()
+            .create_if_missing(true)
+            .dir(String::from("tests"))
+            .build();
+        let (db, _cfs) = DBImpl::open(options, String::from(name), &Vec::new())?;
+        Ok(db)
     }
 }

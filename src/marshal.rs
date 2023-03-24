@@ -136,7 +136,7 @@ pub struct FileWriter {
     file: Rc<RefCell<dyn WritableFile>>,
 }
 
-static DUMMY: [u8;64] = [0;64];
+static DUMMY: [u8; 64] = [0; 64];
 
 impl FileWriter {
     pub fn new(file: Rc<RefCell<dyn WritableFile>>) -> Self {
@@ -148,7 +148,7 @@ impl FileWriter {
     }
 
     pub fn write_pad(&self, n: usize) -> io::Result<usize> {
-        for _ in 0..n/ DUMMY.len() {
+        for _ in 0..n / DUMMY.len() {
             self.write(&DUMMY)?;
         }
         let remaining = n % DUMMY.len();
@@ -209,25 +209,25 @@ impl FileReader {
     }
 
     pub fn read_byte(&self) -> io::Result<u8> {
-        let mut buf:[u8;1] = [0;1];
+        let mut buf: [u8; 1] = [0; 1];
         self.read(&mut buf)?;
         Ok(buf[0])
     }
 
     pub fn read_fixed_u16(&self) -> io::Result<u16> {
-        let mut buf:[u8;2] = [0;2];
+        let mut buf: [u8; 2] = [0; 2];
         self.read(&mut buf)?;
         Ok(u16::from_le_bytes(buf))
     }
 
     pub fn read_fixed_u32(&self) -> io::Result<u32> {
-        let mut buf:[u8;4] = [0;4];
+        let mut buf: [u8; 4] = [0; 4];
         self.read(&mut buf)?;
         Ok(u32::from_le_bytes(buf))
     }
 
     pub fn read_fixed_u64(&self) -> io::Result<u64> {
-        let mut buf:[u8;8] = [0;8];
+        let mut buf: [u8; 8] = [0; 8];
         self.read(&mut buf)?;
         Ok(u64::from_le_bytes(buf))
     }

@@ -1,22 +1,28 @@
+use std::{array, io};
 use std::cell::RefCell;
-use std::cmp::max;
-use std::io;
+use std::cmp::{max, Ordering};
+use std::collections::{BTreeSet, HashMap};
+use std::fs::{File, read};
 use std::path::{Path, PathBuf};
+use std::ptr::addr_of_mut;
 use std::rc::Rc;
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, MutexGuard, Weak};
 
 use num_enum::TryFromPrimitive;
 
 use patch::CFCreation;
 use patch::FileCreation;
 
-use crate::column_family::ColumnFamilySet;
+use crate::{config, files, wal};
+use crate::column_family::{ColumnFamilyImpl, ColumnFamilySet};
+use crate::comparator::Comparator;
+use crate::config::max_size_for_level;
 use crate::db_impl::Locking;
 use crate::env::{Env, WritableFile};
-use crate::files;
+use crate::key::InternalKeyComparator;
 use crate::mai2::{ColumnFamilyOptions, Options};
 use crate::marshal::{Decode, Decoder, Encode};
-use crate::wal::LogWriter;
+use crate::wal::{LogReader, LogWriter};
 
 pub struct VersionSet {
     env: Arc<dyn Env>,
@@ -36,7 +42,7 @@ pub struct VersionSet {
 
 
 impl VersionSet {
-    pub fn new_dummy(abs_db_path: PathBuf, options: &Options) -> Arc<RefCell<VersionSet>> {
+    pub fn new(abs_db_path: PathBuf, options: &Options) -> Arc<RefCell<VersionSet>> {
         Arc::new_cyclic(|weak| {
             RefCell::new(Self {
                 env: options.env.clone(),
@@ -52,6 +58,145 @@ impl VersionSet {
                 log_file: None,
             })
         })
+    }
+
+    pub fn recover(this: &Arc<RefCell<VersionSet>>, desc: &HashMap<String, ColumnFamilyOptions>, file_number: u64)
+                   -> io::Result<BTreeSet<u64>> {
+        let mut reader = {
+            let versions = this.borrow_mut();
+            let manifest_file_path = files::paths::manifest_file(versions.abs_db_path.as_path(), file_number);
+            let file = versions.env.new_sequential_file(manifest_file_path.as_path())?;
+            LogReader::new(file, true, wal::DEFAULT_BLOCK_SIZE)
+        };
+
+        let mut history = BTreeSet::new();
+        loop {
+            let record = reader.read()?;
+            if record.is_empty() {
+                break;
+            }
+
+            let (_, patch) = VersionPatch::from_unmarshal(record.as_slice())?;
+
+            if patch.has_column_family_creation() {
+                if !desc.contains_key(&patch.cf_creation.name) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                              format!("column family options: {} not found",
+                                                      patch.cf_creation.name)));
+                }
+
+                let opts = desc.get(&patch.cf_creation.name).unwrap();
+                if patch.cf_creation.comparator_name != opts.user_comparator.name() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                              format!("difference comparator: {} vs {}",
+                                                      patch.cf_creation.comparator_name,
+                                                      opts.user_comparator.name())));
+                }
+
+                ColumnFamilySet::new_column_family(this.borrow().column_families(),
+                                                   patch.cf_creation.cf_id,
+                                                   patch.cf_creation.name.clone(),
+                                                   opts.clone());
+            }
+
+            if patch.has_column_family_deletion() {
+                let id = patch.cf_deletion;
+                assert_ne!(0, id);
+                let cfi = Self::ensure_column_family_impl(this, id);
+                cfi.borrow_mut().drop_it();
+            }
+
+            if patch.has_file_creation() || patch.has_file_deletion() {
+                let mut builder = Version::with(this.borrow().column_families.clone());
+                let mut version = builder
+                    .prepare(&patch)
+                    .apply(&patch)
+                    .build();
+                Self::finalize(&mut version);
+                builder.cf.unwrap().borrow_mut().append(version);
+            }
+
+            if patch.has_compaction_point() {
+                let id = patch.compaction_point.cf_id;
+                let level = patch.compaction_point.level as usize;
+                let compaction_key = &patch.compaction_point.key;
+                let cfi = Self::ensure_column_family_impl(this, id);
+                cfi.borrow_mut().set_compaction_point(level, compaction_key.clone());
+            }
+
+            if patch.has_redo_log() {
+                let id = patch.redo_log.cf_id;
+                let cfi = Self::ensure_column_family_impl(this, id);
+                cfi.borrow_mut().set_redo_log_number(patch.redo_log.number);
+            }
+
+            if patch.has_last_sequence_number() {
+                this.borrow_mut().last_sequence_number = patch.last_sequence_number;
+            }
+
+            if patch.has_redo_log_number() {
+                this.borrow_mut().redo_log_number = patch.redo_log_number;
+                history.insert(this.borrow().redo_log_number);
+            }
+
+            if patch.has_prev_log_number() {
+                this.borrow_mut().prev_log_number = patch.prev_log_number;
+            }
+
+            if patch.has_next_file_number() {
+                this.borrow_mut().next_file_number = patch.next_file_number;
+            }
+
+            if patch.has_max_column_family() {
+                this.borrow_mut().column_families()
+                    .borrow_mut().update_max_column_family_id(patch.max_column_family);
+            }
+        }
+
+        this.borrow_mut().manifest_file_number = file_number;
+        Ok(history)
+    }
+
+    fn ensure_column_family_impl(this: &Arc<RefCell<VersionSet>>, id: u32)
+                                 -> Arc<RefCell<ColumnFamilyImpl>> {
+        let versions = this.borrow();
+        let cfs = versions.column_families().borrow();
+        let cfi = cfs.get_column_family_by_id(id);
+        cfi.unwrap().clone()
+    }
+
+    fn finalize(version: &mut Version) {
+        // Precomputed best level for next compaction
+        let mut best_level = -1i32;
+        let mut best_score = -1.0f64;
+
+        for level in 0..config::MAX_LEVEL - 1 {
+            let score = if level == 0 {
+                // We treat level-0 specially by bounding the number of files
+                // instead of number of bytes for two reasons:
+                //
+                // (1) With larger write-buffer sizes, it is nice not to do too
+                // many level-0 compactions.
+                //
+                // (2) The files in level-0 are merged on every read and
+                // therefore we wish to avoid too many files when the individual
+                // file size is small (perhaps because of a small write-buffer
+                // setting, or very high compression ratios, or lots of
+                // overwrites/deletions).
+                version.files[level].len() as f64 / (config::MAX_NUMBER_OF_LEVEL_0_FILES as f64)
+            } else {
+                // Compute the ratio of current size to size limit.
+                let size_in_bytes = version.size_of_level_files(level);
+                (size_in_bytes as f64) / max_size_for_level(level) as f64
+            };
+            dbg!(score);
+            if score > best_score {
+                best_level = level as i32;
+                best_score = score;
+            }
+        }
+        version.compaction_score = best_score;
+        version.compaction_level = best_level;
     }
 
     pub fn create_manifest_file(&mut self) -> io::Result<()> {
@@ -135,10 +280,12 @@ impl VersionSet {
         }
 
         if patch.has_column_family_deletion() {
-            let column_families = self.column_families().borrow_mut();
-            let id = patch.cf_deletion;
-            assert_ne!(id, 0);
-            let cf = column_families.get_column_family_by_id(id).unwrap();
+            let cf = {
+                let column_families = self.column_families().borrow_mut();
+                let id = patch.cf_deletion;
+                assert_ne!(id, 0);
+                column_families.get_column_family_by_id(id).unwrap().clone()
+            };
             cf.borrow_mut().drop_it();
         }
 
@@ -150,8 +297,12 @@ impl VersionSet {
         self.write_patch(&patch)?;
 
         if patch.has_file_creation() || patch.has_file_creation() {
-            // TODO: Version builder!
-            todo!()
+            let mut builder = Version::with(self.column_families.clone());
+            builder.prepare(&patch);
+            builder.apply(&patch);
+            let mut version = builder.build();
+            Self::finalize(&mut version);
+            builder.cf.unwrap().borrow_mut().append(version);
         }
 
         self.redo_log_number = patch.redo_log_number();
@@ -630,6 +781,127 @@ impl VersionPatch {
     }
 }
 
+#[derive(Debug)]
+pub struct Version {
+    owns: Weak<RefCell<ColumnFamilyImpl>>,
+    compaction_level: i32,
+    compaction_score: f64,
+    files: [Vec<Arc<FileMetadata>>; config::MAX_LEVEL],
+}
+
+impl Version {
+    pub fn new(owns: Weak<RefCell<ColumnFamilyImpl>>) -> Self {
+        Self {
+            owns,
+            compaction_level: -1,
+            compaction_score: -1.0f64,
+            files: array::from_fn(|_| Vec::new()),
+        }
+    }
+
+    pub fn with(cfs: Arc<RefCell<ColumnFamilySet>>) -> VersionBuilder {
+        VersionBuilder {
+            cfs,
+            levels: array::from_fn(|_| FileEntry::default()),
+            cf: None,
+        }
+    }
+
+    pub fn level_files(&self, level: usize) -> &Vec<Arc<FileMetadata>> {
+        &self.files[level]
+    }
+
+    pub fn size_of_level_files(&self, level: usize) -> u64 {
+        let mut size_in_bytes = 0;
+        for file_metadata in self.level_files(level) {
+            size_in_bytes += file_metadata.size;
+        }
+        size_in_bytes
+    }
+
+    pub fn number_of_level_files(&self, level: usize) -> usize {
+        self.level_files(level).len()
+    }
+}
+
+pub struct VersionBuilder {
+    cfs: Arc<RefCell<ColumnFamilySet>>,
+    levels: [FileEntry; config::MAX_LEVEL],
+    pub cf: Option<Arc<RefCell<ColumnFamilyImpl>>>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct FileEntry {
+    deletion: BTreeSet<u64>,
+    creation: Vec<Arc<FileMetadata>>,
+}
+
+impl VersionBuilder {
+    pub fn build(&mut self) -> Version {
+        let cfi = self.cf.clone().unwrap().clone();
+
+        let mut version = Version::new(Arc::downgrade(&cfi));
+        for i in 0..config::MAX_LEVEL {
+            for file_metadata in cfi.borrow().current().level_files(i) {
+                if !self.levels[i].deletion.contains(&file_metadata.number) {
+                    version.files[i].push(file_metadata.clone())
+                }
+            }
+            self.levels[i].deletion.clear();
+
+            Self::sort_files_metadata(&mut self.levels[i].creation, &cfi.borrow().internal_key_cmp);
+            for file_metadata in &self.levels[i].creation {
+                version.files[i].push(file_metadata.clone());
+            }
+            self.levels[i].creation.clear();
+        }
+
+        version
+    }
+
+    pub fn apply(&mut self, patch: &VersionPatch) -> &mut Self {
+        for item in patch.file_deletion() {
+            self.levels[item.level as usize].deletion.insert(item.number);
+        }
+
+        for item in patch.file_creation() {
+            self.levels[item.level as usize].deletion.remove(&item.metadata.number);
+            self.levels[item.level as usize].creation.push(item.metadata.clone());
+        }
+        self
+    }
+
+    pub fn prepare(&mut self, patch: &VersionPatch) -> &mut Self {
+        for item in patch.file_creation() {
+            self.try_get_column_family_impl(item.cf_id);
+        }
+        for item in patch.file_deletion() {
+            self.try_get_column_family_impl(item.cf_id);
+        }
+        self
+    }
+
+    fn sort_files_metadata(this: &mut Vec<Arc<FileMetadata>>, internal_key_cmp: &InternalKeyComparator) {
+        this.sort_by(|left, right| {
+            let ord = internal_key_cmp.compare(left.smallest_key.as_slice(),
+                                               right.smallest_key.as_slice());
+            match ord {
+                Ordering::Equal => left.number.cmp(&right.number),
+                _ => ord
+            }
+        });
+    }
+
+    fn try_get_column_family_impl(&mut self, cf_id: u32) {
+        match self.cf.as_ref() {
+            Some(cfi) => assert_eq!(cfi.borrow().id(), cf_id),
+            None => self.cf = Some(self.cfs
+                .borrow().get_column_family_by_id(cf_id)
+                .unwrap().clone())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -639,11 +911,11 @@ mod tests {
     #[test]
     fn sanity() {
         let opts = Options::default();
-        let vs = VersionSet::new_dummy(PathBuf::from("/db/demo"), &opts);
+        let vs = VersionSet::new(PathBuf::from("/tests/demo"), &opts);
         let mut ver = vs.borrow_mut();
 
         assert_eq!(0, ver.last_sequence_number());
-        assert_eq!(Path::new("/db/demo"), ver.abs_db_path());
+        assert_eq!(Path::new("/tests/demo"), ver.abs_db_path());
 
         assert_eq!(0, ver.next_file_number());
         assert_eq!(0, ver.generate_file_number());
@@ -746,5 +1018,14 @@ mod tests {
         assert_eq!(a.file_deletion()[1], b.file_deletion()[1]);
         assert_eq!(a.file_deletion()[2], b.file_deletion()[2]);
         Ok(())
+    }
+
+    #[test]
+    fn version_building() {
+        let opts = Options::default();
+        let refs = VersionSet::new(PathBuf::from("/tests/demo"), &opts);
+        //let versions = refs.borrow_mut();
+
+        Version::with(refs.borrow().column_families.clone());
     }
 }
