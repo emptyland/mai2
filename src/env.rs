@@ -1,8 +1,8 @@
 use std::{env, fs, io};
 use std::any::Any;
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 use std::cmp::min;
-use std::fs::{File, remove_dir_all, remove_file};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -12,16 +12,51 @@ pub trait Env {
     fn new_sequential_file(&self, path: &Path) -> io::Result<Rc<RefCell<dyn SequentialFile>>>;
     fn new_writable_file(&self, path: &Path, append: bool) -> io::Result<Rc<RefCell<dyn WritableFile>>>;
     fn new_random_access_file(&self, path: &Path) -> io::Result<Rc<RefCell<dyn RandomAccessFile>>>;
-    fn make_dir(&self, path: &Path) -> io::Result<()>;
-    fn file_exists(&self, path: &Path) -> bool;
-    fn is_dir(&self, path: &Path) -> bool;
-    fn get_children(&self, path: &Path) -> io::Result<Vec<String>>;
-    fn delete_file(&self, path: &Path, recursive: bool) -> io::Result<()>;
-    fn get_absolute_path(&self, path: &Path) -> io::Result<PathBuf>;
-    fn get_work_dir(&self) -> io::Result<PathBuf>;
+
+    fn make_dir(&self, path: &Path) -> io::Result<()> {
+        fs::create_dir_all(path)
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir()
+    }
+
+    fn get_children(&self, path: &Path) -> io::Result<Vec<String>> {
+        let mut rs = Vec::<String>::new();
+        for entry in fs::read_dir(path)? {
+            let dir = entry?;
+            rs.push(String::from(dir.path().as_path().as_os_str().to_str().unwrap()));
+        }
+        Ok(rs)
+    }
+
+    fn delete_file(&self, path: &Path, recursive: bool) -> io::Result<()> {
+        if self.is_dir(path) {
+            if recursive {
+                fs::remove_dir_all(path)
+            } else {
+                fs::remove_dir(path)
+            }
+        } else {
+            fs::remove_file(path)
+        }
+    }
+
+    fn get_absolute_path(&self, path: &Path) -> io::Result<PathBuf> { fs::canonicalize(path) }
+
+    fn get_work_dir(&self) -> io::Result<PathBuf> { env::current_dir() }
+
+    fn file_exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
 
     fn file_not_exists(&self, path: &Path) -> bool {
         !self.file_exists(path)
+    }
+
+    fn get_file_size(&self, path: &Path) -> io::Result<u64> {
+        let md = fs::metadata(path)?;
+        Ok(md.len())
     }
 
     fn write_all(&self, path: &Path, data: &[u8]) -> io::Result<()> {
@@ -81,43 +116,6 @@ impl Env for EnvImpl {
         let file_impl = RandomAccessFileImpl::open(path)?;
         Ok(Rc::new(RefCell::new(file_impl)))
     }
-
-    fn make_dir(&self, path: &Path) -> io::Result<()> {
-        fs::create_dir_all(path)
-    }
-
-    fn file_exists(&self, path: &Path) -> bool {
-        path.exists()
-    }
-
-    fn is_dir(&self, path: &Path) -> bool {
-        path.is_dir()
-    }
-
-    fn get_children(&self, path: &Path) -> io::Result<Vec<String>> {
-        let mut rs = Vec::<String>::new();
-        for entry in fs::read_dir(path)? {
-            let dir = entry?;
-            rs.push(String::from(dir.path().as_path().as_os_str().to_str().unwrap()));
-        }
-        Ok(rs)
-    }
-
-    fn delete_file(&self, path: &Path, recursive: bool) -> io::Result<()> {
-        if self.is_dir(path) {
-            if recursive {
-                fs::remove_dir_all(path)
-            } else {
-                fs::remove_dir(path)
-            }
-        } else {
-            fs::remove_file(path)
-        }
-    }
-
-    fn get_absolute_path(&self, path: &Path) -> io::Result<PathBuf> { fs::canonicalize(path) }
-
-    fn get_work_dir(&self) -> io::Result<PathBuf> { env::current_dir() }
 }
 
 struct SequentialFileImpl {
@@ -377,9 +375,9 @@ impl Drop for JunkFilesCleaner {
             }
 
             if path.is_dir() {
-                remove_dir_all(path).expect("clean fail!")
+                fs::remove_dir_all(path).expect("clean fail!")
             } else {
-                remove_file(path).expect("clean fail!")
+                fs::remove_file(path).expect("clean fail!")
             }
         }
     }

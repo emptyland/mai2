@@ -73,9 +73,8 @@ impl ColumnFamilyImpl {
     }
 
     #[inline]
-    pub fn from(cf: &Arc<RefCell<dyn ColumnFamily>>) -> Arc<RefCell<Self>> {
-        let mut borrowed = cf.borrow_mut();
-        let handle = borrowed.as_any_mut().downcast_mut::<ColumnFamilyHandle>().unwrap();
+    pub fn from(cf: &Arc<dyn ColumnFamily>) -> Arc<RefCell<Self>> {
+        let handle = cf.as_any().downcast_ref::<ColumnFamilyHandle>().unwrap();
         handle.core().clone()
     }
 
@@ -169,11 +168,11 @@ pub struct ColumnFamilyHandle {
 }
 
 impl ColumnFamilyHandle {
-    pub fn new(core: Arc<RefCell<ColumnFamilyImpl>>) -> Arc<RefCell<dyn ColumnFamily>> {
-        Arc::new(RefCell::new(ColumnFamilyHandle {
+    pub fn new(core: Arc<RefCell<ColumnFamilyImpl>>) -> Arc<dyn ColumnFamily> {
+        Arc::new(ColumnFamilyHandle {
             db: 0 as *const u8,
             core,
-        }))
+        })
     }
 
     pub fn core(&self) -> &Arc<RefCell<ColumnFamilyImpl>> {
@@ -183,10 +182,6 @@ impl ColumnFamilyHandle {
 
 impl ColumnFamily for ColumnFamilyHandle {
     fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 

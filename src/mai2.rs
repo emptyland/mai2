@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::cell::RefCell;
-use std::io;
+use std::{io, iter};
+use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -140,9 +141,16 @@ impl Default for Options {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct ReadOptions {
+    snapshot: Option<Arc<dyn Snapshot>>,
+    verify_checksum: bool,
+}
+
+
 pub trait ColumnFamily {
     fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
+    //fn as_any_mut(&mut self) -> &mut dyn Any;
     fn name(&self) -> String;
     fn id(&self) -> u32;
     fn comparator(&self) -> Rc<dyn Comparator>;
@@ -151,15 +159,44 @@ pub trait ColumnFamily {
 
 pub trait Snapshot {}
 
+const REDO_HEADER_SIZE: usize = size_of::<u64>() + size_of::<u32>();
+
+#[derive(Default, Clone, Debug)]
+pub struct WriteBatch {
+    redo: Vec<u8>,
+    number_of_ops: usize
+}
+
+impl WriteBatch {
+    pub fn new() -> Self {
+        let mut buf = Vec::with_capacity(REDO_HEADER_SIZE + 64);
+        buf.extend(iter::repeat(0).take(REDO_HEADER_SIZE));
+        Self {
+            redo: buf,
+            number_of_ops: 0
+        }
+    }
+
+    pub fn insert(cf: &Arc<dyn ColumnFamily>, key: &[u8], value: &[u8]) {
+        todo!()
+    }
+}
+
+
+
+
 pub trait DB {
     fn new_column_family(&mut self, name: &str, options: ColumnFamilyOptions)
-                         -> Result<Arc<RefCell<dyn ColumnFamily>>>;
+                         -> Result<Arc<dyn ColumnFamily>>;
 
-    fn drop_column_family(&mut self, column_family: Arc<RefCell<dyn ColumnFamily>>) -> Result<()>;
+    fn drop_column_family(&mut self, column_family: Arc<dyn ColumnFamily>) -> Result<()>;
 
-    fn get_all_column_families(&self) -> Result<Vec<Arc<RefCell<dyn ColumnFamily>>>>;
+    fn get_all_column_families(&self) -> Result<Vec<Arc<dyn ColumnFamily>>>;
 
-    fn default_column_family(&self) -> Arc<RefCell<dyn ColumnFamily>>;
+    fn default_column_family(&self) -> Arc<dyn ColumnFamily>;
+
+    fn get(&self, options: ReadOptions, column_family: &Arc<dyn ColumnFamily>,
+           key: &[u8]) -> Result<Vec<u8>>;
 }
 
 #[inline]

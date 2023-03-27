@@ -1,18 +1,22 @@
 use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
-use std::io;
-use std::ops::Deref;
+use std::{io, thread};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread::JoinHandle;
 
 use crate::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
 use crate::env::{Env, WritableFile};
-use crate::files::paths;
-use crate::mai2;
-use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DB, DEFAULT_COLUMN_FAMILY_NAME, from_io_result, Options};
+use crate::files::{Kind, paths};
+use crate::{files, mai2, wal};
+use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DB, DEFAULT_COLUMN_FAMILY_NAME, from_io_result, Options, ReadOptions};
 use crate::status::{Corrupting, Status};
 use crate::version::{VersionPatch, VersionSet};
+use crate::wal::LogWriter;
 
 pub struct DBImpl {
     pub db_name: String,
@@ -20,14 +24,36 @@ pub struct DBImpl {
     options: Options,
     env: Arc<dyn Env>,
     versions: Arc<RefCell<VersionSet>>,
-    default_column_family: Option<Arc<RefCell<dyn ColumnFamily>>>,
-    log_file: Option<Arc<RefCell<dyn WritableFile>>>,
-    log_file_number: u64,
+    default_column_family: Option<Arc<dyn ColumnFamily>>,
+    redo_log: Option<WALDescriptor>,
     bkg_active: AtomicI32,
     shutting_down: AtomicBool,
     total_wal_size: AtomicU64,
-    flush_request: AtomicI32,
+    //flush_request: AtomicI32,
+    flush_worker: Option<WorkerDescriptor>,
     mutex: Arc<Mutex<Locking>>,
+}
+
+enum WorkerCommand {
+    Work(Arc<RefCell<dyn WritableFile>>),
+    Exit,
+}
+
+unsafe impl Send for WorkerCommand {
+
+}
+
+struct WorkerDescriptor {
+    tx: Sender<WorkerCommand>,
+    //rx: Receiver<WorkerCommand>,
+    join_handle: JoinHandle<()>
+}
+
+// Write-ahead-log
+struct WALDescriptor {
+    log: LogWriter,
+    file: Rc<RefCell<dyn WritableFile>>,
+    number: u64,
 }
 
 pub struct Locking {
@@ -42,7 +68,7 @@ impl Locking {
 
 impl DBImpl {
     pub fn open(options: Options, name: String, column_family_descriptors: &[ColumnFamilyDescriptor])
-                -> mai2::Result<(Arc<RefCell<dyn DB>>, Vec<Arc<RefCell<dyn ColumnFamily>>>)> {
+                -> mai2::Result<(Arc<RefCell<dyn DB>>, Vec<Arc<dyn ColumnFamily>>)> {
         let env = options.env.clone();
         let abs_db_path = DBImpl::make_abs_db_path(&options.core.dir, &name, &env)?;
         let versions = VersionSet::new(abs_db_path.clone(), &options);
@@ -56,10 +82,9 @@ impl DBImpl {
             bkg_active: AtomicI32::new(0),
             shutting_down: AtomicBool::new(false),
             total_wal_size: AtomicU64::new(0),
-            flush_request: AtomicI32::new(0),
             default_column_family: None,
-            log_file: None,
-            log_file_number: 0,
+            redo_log: None,
+            flush_worker: None,
             mutex: Locking::new(),
         };
         if env.file_not_exists(paths::current_file(db.abs_db_path.as_path()).as_path()) {
@@ -76,7 +101,7 @@ impl DBImpl {
         let borrowed_versions = versions.borrow();
         let column_families = borrowed_versions.column_families();
 
-        let mut cfs = Vec::<Arc<RefCell<dyn ColumnFamily>>>::new();
+        let mut cfs = Vec::<Arc<dyn ColumnFamily>>::new();
         for desc in column_family_descriptors {
             let borrowed_cfs = column_families.borrow();
             let cfi = borrowed_cfs.get_column_family_by_name(&desc.name).unwrap();
@@ -97,8 +122,46 @@ impl DBImpl {
             println!("----------");
         }
 
-        // TODO: start flush worker
         Ok((Arc::new(RefCell::new(db)), cfs))
+    }
+
+    fn start_flush_worker(&mut self) {
+        let (tx, rx) = channel();
+        let mutex = self.mutex.clone();
+        let join_handle = thread::Builder::new()
+            .name("flush-worker".to_string())
+            .spawn(move || {
+                loop {
+                    let command = rx.recv().unwrap();
+                    match command {
+                        WorkerCommand::Work(file) => {
+                            let _locking = mutex.lock().unwrap();
+                            file.borrow_mut().flush().unwrap();
+                            file.borrow_mut().sync().unwrap();
+                        },
+                        WorkerCommand::Exit => break
+                    }
+                }
+                drop(rx);
+            }).unwrap();
+        self.flush_worker = Some(WorkerDescriptor{
+            tx,
+            join_handle,
+        })
+    }
+
+    fn get_total_redo_log_size(&mut self) -> io::Result<u64> {
+        let env = self.env.clone();
+        let children = env.get_children(self.abs_db_path.as_path())?;
+        let mut total_size = 0u64;
+        for child in children {
+            let (kind, _) = files::parse_name(&child);
+            if kind == Kind::Log {
+                total_size += env.get_file_size(self.abs_db_path.join(child).as_path())?;
+            }
+        }
+
+        Ok(total_size)
     }
 
     fn make_abs_db_path(dir: &String, name: &String, env: &Arc<dyn Env>) -> mai2::Result<PathBuf> {
@@ -124,7 +187,7 @@ impl DBImpl {
         {
             let borrowed_mutex = self.mutex.clone();
             let lock = borrowed_mutex.lock().unwrap();
-            self.renew_logger(&lock)?;
+            self.renew_log_file(&lock)?;
         }
 
         let mut cfs = HashMap::<String, ColumnFamilyOptions>::new();
@@ -157,12 +220,12 @@ impl DBImpl {
 
         for cfi in column_families.borrow().column_family_impls() {
             from_io_result(cfi.borrow_mut().install())?;
-            cfi.borrow_mut().set_redo_log_number(self.log_file_number);
+            cfi.borrow_mut().set_redo_log_number(self.redo_log_number());
         }
 
         let mut patch = VersionPatch::default();
         patch.set_prev_log_number(0);
-        patch.set_redo_log_number(self.log_file_number);
+        patch.set_redo_log_number(self.redo_log_number());
         {
             let borrowed_mutex = self.mutex.clone();
             let lock = borrowed_mutex.lock().unwrap();
@@ -176,23 +239,37 @@ impl DBImpl {
         todo!()
     }
 
-    fn renew_logger(&mut self, _locking: &MutexGuard<Locking>) -> mai2::Result<()> {
-        if let Some(file) = &self.log_file {
-            let mut borrow = file.borrow_mut();
+    fn redo_log_number(&self) -> u64 { self.redo_log.as_ref().unwrap().number }
+
+    fn renew_log_file(&mut self, _locking: &MutexGuard<Locking>) -> mai2::Result<()> {
+        if let Some(redo_log) = &self.redo_log {
+            let mut borrow = redo_log.file.borrow_mut();
             from_io_result(borrow.flush())?;
             from_io_result(borrow.sync())?;
         }
 
-        let mut versions = self.versions.borrow_mut();
+        let versions_copy = self.versions.clone();
+        let mut versions = versions_copy.borrow_mut();
         let new_log_number = versions.generate_file_number();
         let log_file_path = paths::log_file(self.abs_db_path.as_path(), new_log_number);
         let rs = from_io_result(self.env.new_writable_file(log_file_path.as_path(), true));
-        if rs.is_err() {
-            versions.reuse_file_number(new_log_number);
-            rs?;
+        match rs {
+            Err(_) => {
+                versions.reuse_file_number(new_log_number);
+                rs?;
+            },
+            Ok(file) => {
+                self.redo_log = Some(WALDescriptor{
+                    file: file.clone(),
+                    number: new_log_number,
+                    log: LogWriter::new(file, wal::DEFAULT_BLOCK_SIZE)
+                });
+            }
         }
-        self.log_file_number = new_log_number;
-        // TODO: logger
+
+        if let None = self.flush_worker {
+            self.start_flush_worker();
+        }
         Ok(())
     }
 
@@ -220,7 +297,7 @@ impl DBImpl {
 
 impl DB for DBImpl {
     fn new_column_family(&mut self, name: &str, options: ColumnFamilyOptions)
-                         -> mai2::Result<Arc<RefCell<dyn ColumnFamily>>> {
+                         -> mai2::Result<Arc<dyn ColumnFamily>> {
         let mutex = self.mutex.clone();
         let lock = mutex.lock().unwrap();
         //--------------------------lock version-set------------------------------------------------
@@ -230,18 +307,15 @@ impl DB for DBImpl {
         let cfs = versions.column_families().borrow();
         let cfi = cfs.get_column_family_by_id(id).unwrap();
         from_io_result(cfi.borrow_mut().install())?;
-        cfi.borrow_mut().set_redo_log_number(self.log_file_number);
+        cfi.borrow_mut().set_redo_log_number(self.redo_log_number());
         assert!(cfi.borrow().initialized());
         Ok(ColumnFamilyHandle::new(cfi.clone()))
         //--------------------------unlock version-set----------------------------------------------
     }
 
-    fn drop_column_family(&mut self, column_family: Arc<RefCell<dyn ColumnFamily>>) -> mai2::Result<()> {
-        {
-            let cf = column_family.borrow();
-            if cf.id() == 0 {
-                return Err(Status::corrupted("can not drop default column family!"));
-            }
+    fn drop_column_family(&mut self, column_family: Arc<dyn ColumnFamily>) -> mai2::Result<()> {
+        if column_family.id() == 0 {
+            return Err(Status::corrupted("can not drop default column family!"));
         }
         let cfi = ColumnFamilyImpl::from(&column_family);
         if cfi.borrow().dropped() {
@@ -267,12 +341,12 @@ impl DB for DBImpl {
         //--------------------------unlock version-set----------------------------------------------
     }
 
-    fn get_all_column_families(&self) -> mai2::Result<Vec<Arc<RefCell<dyn ColumnFamily>>>> {
+    fn get_all_column_families(&self) -> mai2::Result<Vec<Arc<dyn ColumnFamily>>> {
         let mutex = self.mutex.clone();
         let _lock = mutex.lock().unwrap();
         //--------------------------lock version-set------------------------------------------------
 
-        let mut cfs: Vec<Arc<RefCell<dyn ColumnFamily>>> = self.versions
+        let mut cfs: Vec<Arc<dyn ColumnFamily>> = self.versions
             .borrow().column_families()
             .borrow().column_family_impls()
             .iter()
@@ -280,19 +354,29 @@ impl DB for DBImpl {
             .filter(|x| !x.borrow().dropped() && x.borrow().initialized())
             .map(|x| ColumnFamilyHandle::new(x.clone()))
             .collect();
-        cfs.sort_by(|a, b| a.borrow().id().cmp(&b.borrow().id()));
+        cfs.sort_by(|a, b| a.id().cmp(&b.id()));
         Ok(cfs)
         //--------------------------unlock version-set----------------------------------------------
     }
 
-    fn default_column_family(&self) -> Arc<RefCell<dyn ColumnFamily>> {
+    fn default_column_family(&self) -> Arc<dyn ColumnFamily> {
         self.default_column_family.as_ref().unwrap().clone()
+    }
+
+    fn get(&self, options: ReadOptions, column_family: &Arc<dyn ColumnFamily>, key: &[u8])
+        -> mai2::Result<Vec<u8>> {
+        todo!()
     }
 }
 
 impl Drop for DBImpl {
     fn drop(&mut self) {
-        // TODO:
+        self.shutting_down.store(true,Ordering::Release);
+
+        if let Some(worker) = self.flush_worker.as_ref() {
+            worker.tx.send(WorkerCommand::Exit).unwrap();
+            //worker.join_handle.join().unwrap();
+        };
         println!("drop it! DBImpl");
     }
 }
@@ -319,8 +403,8 @@ mod tests {
         assert_eq!(1, cfs.len());
 
         let cf = cfs.get(0).unwrap().clone();
-        assert_eq!("cf", cf.borrow().name());
-        assert_ne!(0, cf.borrow().id());
+        assert_eq!("cf", cf.name());
+        assert_ne!(0, cf.id());
 
         assert!(junk.path(0).exists());
         assert!(junk.path(0).join("cf").exists());
@@ -333,13 +417,13 @@ mod tests {
         let _junk = JunkFilesCleaner::new("tests/db0");
         let db = open_simple_db("db0")?;
         let cf = db.borrow().default_column_family();
-        assert_eq!(0, cf.borrow().id());
-        assert_eq!(DEFAULT_COLUMN_FAMILY_NAME, cf.borrow().name());
+        assert_eq!(0, cf.id());
+        assert_eq!(DEFAULT_COLUMN_FAMILY_NAME, cf.name());
 
         let cfs = db.borrow().get_all_column_families()?;
         assert_eq!(1, cfs.len());
-        assert_eq!(cf.borrow().id(), cfs[0].borrow().id());
-        assert_eq!(cf.borrow().name(), cfs[0].borrow().name());
+        assert_eq!(cf.id(), cfs[0].id());
+        assert_eq!(cf.name(), cfs[0].name());
         Ok(())
     }
 
@@ -361,8 +445,8 @@ mod tests {
 
         let cf1 = db.borrow_mut()
             .new_column_family("cf1", ColumnFamilyOptions::default())?;
-        assert_eq!(2, cf1.borrow().id());
-        assert_eq!("cf1", cf1.borrow().name());
+        assert_eq!(2, cf1.id());
+        assert_eq!("cf1", cf1.name());
 
         db.borrow_mut().drop_column_family(cfs[0].clone())?;
 
@@ -370,11 +454,11 @@ mod tests {
             let cfs = db.borrow().get_all_column_families()?;
             assert_eq!(2, cfs.len());
 
-            assert_eq!(0, cfs[0].borrow().id());
-            assert_eq!(DEFAULT_COLUMN_FAMILY_NAME, cfs[0].borrow().name());
+            assert_eq!(0, cfs[0].id());
+            assert_eq!(DEFAULT_COLUMN_FAMILY_NAME, cfs[0].name());
 
-            assert_eq!(2, cfs[1].borrow().id());
-            assert_eq!("cf1", cfs[1].borrow().name());
+            assert_eq!(2, cfs[1].id());
+            assert_eq!("cf1", cfs[1].name());
         }
         Ok(())
     }

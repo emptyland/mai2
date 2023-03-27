@@ -1,4 +1,6 @@
 use std::fmt::Write;
+use std::str::FromStr;
+use crate::files::Kind::Unknown;
 
 const LOCK_NAME: &str = "LOCK";
 const CURRENT_NAME: &str = "CURRENT";
@@ -35,6 +37,57 @@ pub mod paths {
 
     pub fn lock_file(db_path: &Path) -> PathBuf {
         db_path.to_path_buf().join(LOCK_NAME)
+    }
+}
+
+#[derive(Eq, PartialEq)]
+pub enum Kind {
+    Unknown,
+    Log,
+    SstTable,
+    Manifest,
+    Current,
+    Lock
+}
+
+pub fn parse_name(name: &String) -> (Kind, u64) {
+    match name.as_str() {
+        LOCK_NAME => (Kind::Lock, 0),
+        CURRENT_NAME => (Kind::Current, 0),
+        &_ => {
+            if name.starts_with(MANIFEST_PREFIX) {
+                parse_fixed_prefix_name(name, MANIFEST_PREFIX, Kind::Manifest)
+            } else if name.ends_with(LOG_POSTFIX) {
+                parse_fixed_postfix_name(name, Kind::Log)
+            } else if name.ends_with(SST_TABLE_POSTFIX) {
+                parse_fixed_postfix_name(name, Kind::Log)
+            } else {
+                (Unknown, 0)
+            }
+        }
+    }
+}
+
+fn parse_fixed_postfix_name(name: &String, kind: Kind) -> (Kind, u64) {
+    if let Some((part1, _)) = name.split_once(".") {
+        match u64::from_str(part1) {
+            Err(_) =>(Unknown, 0),
+            Ok(n) => (kind, n)
+        }
+    } else {
+        (Unknown, 0)
+    }
+}
+
+fn parse_fixed_prefix_name(name: &String, prefix: &str, kind: Kind) -> (Kind, u64) {
+    if let Some((part1, postfix)) = name.split_once("-") {
+        assert_eq!(part1, prefix);
+        match u64::from_str(postfix) {
+            Err(_) =>(Unknown, 0),
+            Ok(n) => (kind, n)
+        }
+    } else {
+        (Unknown, 0)
     }
 }
 
