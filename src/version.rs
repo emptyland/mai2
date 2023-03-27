@@ -6,7 +6,7 @@ use std::fs::{File, read};
 use std::path::{Path, PathBuf};
 use std::ptr::addr_of_mut;
 use std::rc::Rc;
-use std::sync::{Arc, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use num_enum::TryFromPrimitive;
 
@@ -37,23 +37,26 @@ pub struct VersionSet {
     manifest_file_number: u64,
     column_families: Arc<RefCell<ColumnFamilySet>>,
     log: Option<LogWriter>,
-    log_file: Option<Rc<RefCell<dyn WritableFile>>>,
+    log_file: Option<Arc<RefCell<dyn WritableFile>>>,
 }
 
+unsafe impl Sync for VersionSet {
+
+}
 
 impl VersionSet {
-    pub fn new(abs_db_path: PathBuf, options: &Options) -> Arc<RefCell<VersionSet>> {
+    pub fn new(abs_db_path: PathBuf, options: &Options) -> Arc<Mutex<VersionSet>> {
         Arc::new_cyclic(|weak| {
-            RefCell::new(Self {
+            Mutex::new(Self {
                 env: options.env.clone(),
-                abs_db_path,
+                abs_db_path: abs_db_path.clone(),
                 block_size: options.core.block_size,
                 last_sequence_number: 0,
                 next_file_number: 0,
                 prev_log_number: 0,
                 redo_log_number: 0,
                 manifest_file_number: 0,
-                column_families: ColumnFamilySet::new_dummy(weak.clone()),
+                column_families: ColumnFamilySet::new_dummy(weak.clone(), abs_db_path),
                 log: None,
                 log_file: None,
             })
@@ -242,8 +245,8 @@ impl VersionSet {
         self.write_patch(&patch)
     }
 
-    pub fn log_and_apply(&mut self, cf_options: ColumnFamilyOptions, mut patch: VersionPatch,
-                         _locking: &MutexGuard<Locking>) -> io::Result<()> {
+    pub fn log_and_apply(&mut self, cf_options: ColumnFamilyOptions, mut patch: VersionPatch)
+        -> io::Result<()> {
         if patch.has_redo_log_number() {
             assert!(patch.redo_log_number >= self.redo_log_number);
             assert!(patch.redo_log_number < self.next_file_number);
@@ -912,7 +915,7 @@ mod tests {
     fn sanity() {
         let opts = Options::default();
         let vs = VersionSet::new(PathBuf::from("/tests/demo"), &opts);
-        let mut ver = vs.borrow_mut();
+        let mut ver = vs.lock().unwrap();
 
         assert_eq!(0, ver.last_sequence_number());
         assert_eq!(Path::new("/tests/demo"), ver.abs_db_path());
@@ -1026,6 +1029,6 @@ mod tests {
         let refs = VersionSet::new(PathBuf::from("/tests/demo"), &opts);
         //let versions = refs.borrow_mut();
 
-        Version::with(refs.borrow().column_families.clone());
+        Version::with(refs.lock().unwrap().column_families.clone());
     }
 }

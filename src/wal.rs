@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crc::{Crc, CRC_32_ISCSI};
 use num_enum::TryFromPrimitive;
@@ -44,7 +45,7 @@ pub struct LogWriter {
 }
 
 impl LogWriter {
-    pub fn new(file: Rc<RefCell<dyn WritableFile>>, block_size: usize) -> Self {
+    pub fn new(file: Arc<RefCell<dyn WritableFile>>, block_size: usize) -> Self {
         let mut sums: [u32; MAX_RECORD_TYPE + 1] = [0; MAX_RECORD_TYPE + 1];
         let crc = Crc::<u32>::new(&CRC_32_ISCSI);
 
@@ -243,7 +244,7 @@ mod tests {
         assert_eq!(data, rd.as_slice());
     }
 
-    fn new_and_write_log(data: &[u8], block_size: usize) -> Rc<RefCell<dyn WritableFile>> {
+    fn new_and_write_log(data: &[u8], block_size: usize) -> Arc<RefCell<dyn WritableFile>> {
         let wf = MemoryWritableFile::new_rc();
         let mut log = LogWriter::new(wf.clone(), block_size);
         let written_bytes = log.append(data).unwrap();

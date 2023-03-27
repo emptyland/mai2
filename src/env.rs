@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 pub trait Env {
     fn new_sequential_file(&self, path: &Path) -> io::Result<Rc<RefCell<dyn SequentialFile>>>;
-    fn new_writable_file(&self, path: &Path, append: bool) -> io::Result<Rc<RefCell<dyn WritableFile>>>;
+    fn new_writable_file(&self, path: &Path, append: bool) -> io::Result<Arc<RefCell<dyn WritableFile>>>;
     fn new_random_access_file(&self, path: &Path) -> io::Result<Rc<RefCell<dyn RandomAccessFile>>>;
 
     fn make_dir(&self, path: &Path) -> io::Result<()> {
@@ -107,9 +107,9 @@ impl Env for EnvImpl {
         Ok(Rc::new(RefCell::new(file_impl)))
     }
 
-    fn new_writable_file(&self, path: &Path, append: bool) -> io::Result<Rc<RefCell<dyn WritableFile>>> {
+    fn new_writable_file(&self, path: &Path, append: bool) -> io::Result<Arc<RefCell<dyn WritableFile>>> {
         let file_impl = WritableFileImpl::open(path, append)?;
-        Ok(Rc::new(RefCell::new(file_impl)))
+        Ok(Arc::new(RefCell::new(file_impl)))
     }
 
     fn new_random_access_file(&self, path: &Path) -> io::Result<Rc<RefCell<dyn RandomAccessFile>>> {
@@ -242,8 +242,8 @@ impl MemoryWritableFile {
         Self { buf: Vec::new() }
     }
 
-    pub fn new_rc() -> Rc<RefCell<dyn WritableFile>> {
-        Rc::new(RefCell::new(MemoryWritableFile::new()))
+    pub fn new_rc() -> Arc<RefCell<dyn WritableFile>> {
+        Arc::new(RefCell::new(MemoryWritableFile::new()))
     }
 
     pub fn buf(&self) -> &Vec<u8> {
@@ -254,7 +254,7 @@ impl MemoryWritableFile {
         &mut self.buf
     }
 
-    pub fn get_buf(wf: &Rc<RefCell<dyn WritableFile>>) -> Vec<u8> {
+    pub fn get_buf(wf: &Arc<RefCell<dyn WritableFile>>) -> Vec<u8> {
         let borrowed_wf = wf.borrow();
         borrowed_wf.as_any().downcast_ref::<Self>().as_ref().unwrap().buf().clone()
     }

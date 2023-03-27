@@ -133,13 +133,13 @@ impl Decode<Vec<u8>> for Decoder {
 }
 
 pub struct FileWriter {
-    file: Rc<RefCell<dyn WritableFile>>,
+    file: Arc<RefCell<dyn WritableFile>>,
 }
 
 static DUMMY: [u8; 64] = [0; 64];
 
 impl FileWriter {
-    pub fn new(file: Rc<RefCell<dyn WritableFile>>) -> Self {
+    pub fn new(file: Arc<RefCell<dyn WritableFile>>) -> Self {
         Self { file }
     }
 

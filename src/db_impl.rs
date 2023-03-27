@@ -23,7 +23,7 @@ pub struct DBImpl {
     pub abs_db_path: PathBuf,
     options: Options,
     env: Arc<dyn Env>,
-    versions: Arc<RefCell<VersionSet>>,
+    versions: Arc<Mutex<VersionSet>>,
     default_column_family: Option<Arc<dyn ColumnFamily>>,
     redo_log: Option<WALDescriptor>,
     bkg_active: AtomicI32,
@@ -31,28 +31,26 @@ pub struct DBImpl {
     total_wal_size: AtomicU64,
     //flush_request: AtomicI32,
     flush_worker: Option<WorkerDescriptor>,
-    mutex: Arc<Mutex<Locking>>,
+    //mutex: Arc<Mutex<Locking>>,
 }
 
 enum WorkerCommand {
-    Work(Arc<RefCell<dyn WritableFile>>),
+    Work(Arc<RefCell<dyn WritableFile>>, Arc<Mutex<VersionSet>>),
     Exit,
 }
 
-unsafe impl Send for WorkerCommand {
-
-}
+unsafe impl Send for WorkerCommand {}
 
 struct WorkerDescriptor {
     tx: Sender<WorkerCommand>,
     //rx: Receiver<WorkerCommand>,
-    join_handle: JoinHandle<()>
+    join_handle: JoinHandle<()>,
 }
 
 // Write-ahead-log
 struct WALDescriptor {
     log: LogWriter,
-    file: Rc<RefCell<dyn WritableFile>>,
+    file: Arc<RefCell<dyn WritableFile>>,
     number: u64,
 }
 
@@ -85,7 +83,6 @@ impl DBImpl {
             default_column_family: None,
             redo_log: None,
             flush_worker: None,
-            mutex: Locking::new(),
         };
         if env.file_not_exists(paths::current_file(db.abs_db_path.as_path()).as_path()) {
             if !db.options.create_if_missing {
@@ -98,19 +95,19 @@ impl DBImpl {
             }
             db.recovery(column_family_descriptors)?;
         }
-        let borrowed_versions = versions.borrow();
-        let column_families = borrowed_versions.column_families();
+        let locked_versions = versions.lock().unwrap();
+        let column_families = locked_versions.column_families();
 
         let mut cfs = Vec::<Arc<dyn ColumnFamily>>::new();
         for desc in column_family_descriptors {
             let borrowed_cfs = column_families.borrow();
             let cfi = borrowed_cfs.get_column_family_by_name(&desc.name).unwrap();
-            let cfh = ColumnFamilyHandle::new(cfi.clone());
+            let cfh = ColumnFamilyHandle::new(cfi, &versions);
             cfs.push(cfh);
         }
 
         let cfi = column_families.borrow().default_column_family();
-        db.default_column_family = Some(ColumnFamilyHandle::new(cfi));
+        db.default_column_family = Some(ColumnFamilyHandle::new(&cfi, &versions));
 
         #[cfg(test)]
         {
@@ -125,26 +122,37 @@ impl DBImpl {
         Ok((Arc::new(RefCell::new(db)), cfs))
     }
 
+    fn flush_redo_log(&mut self, sync: bool, locking: &MutexGuard<VersionSet>) {
+        if let Some(desc) = self.redo_log.as_ref() {
+            let worker = self.flush_worker.as_ref().unwrap();
+            if sync {
+                todo!()
+            } else {
+                worker.tx.send(WorkerCommand::Work(desc.file.clone(),
+                                                   self.versions.clone())).unwrap();
+            }
+        }
+    }
+
     fn start_flush_worker(&mut self) {
         let (tx, rx) = channel();
-        let mutex = self.mutex.clone();
         let join_handle = thread::Builder::new()
             .name("flush-worker".to_string())
             .spawn(move || {
                 loop {
                     let command = rx.recv().unwrap();
                     match command {
-                        WorkerCommand::Work(file) => {
+                        WorkerCommand::Work(file, mutex) => {
                             let _locking = mutex.lock().unwrap();
                             file.borrow_mut().flush().unwrap();
                             file.borrow_mut().sync().unwrap();
-                        },
+                        }
                         WorkerCommand::Exit => break
                     }
                 }
                 drop(rx);
             }).unwrap();
-        self.flush_worker = Some(WorkerDescriptor{
+        self.flush_worker = Some(WorkerDescriptor {
             tx,
             join_handle,
         })
@@ -184,18 +192,21 @@ impl DBImpl {
             from_io_result(self.env.make_dir(self.abs_db_path.as_path()))?;
         }
 
-        {
-            let borrowed_mutex = self.mutex.clone();
-            let lock = borrowed_mutex.lock().unwrap();
-            self.renew_log_file(&lock)?;
-        }
+        //------------------------------lock version-set--------------------------------------------
+        // self.renew_log_file(&mut self.versions.lock().unwrap())?;
+        //------------------------------unlock version-set------------------------------------------
 
         let mut cfs = HashMap::<String, ColumnFamilyOptions>::new();
         for item in desc {
             cfs.insert(item.name.clone(), item.options.clone());
         }
 
-        let column_families = self.versions.borrow().column_families().clone();
+        //------------------------------lock version-set--------------------------------------------
+        let mutex = self.versions.clone();
+        let mut versions = mutex.lock().unwrap();
+        self.renew_log_file(&mut versions)?;
+
+        let column_families = versions.column_families().clone();
         let default_cf_name = String::from(DEFAULT_COLUMN_FAMILY_NAME);
         if let Some(opts) = cfs.get(&default_cf_name) {
             ColumnFamilySet::new_column_family(&column_families, 0, default_cf_name, opts.clone());
@@ -219,20 +230,17 @@ impl DBImpl {
         }
 
         for cfi in column_families.borrow().column_family_impls() {
-            from_io_result(cfi.borrow_mut().install())?;
+            from_io_result(cfi.borrow_mut().install(&self.env))?;
             cfi.borrow_mut().set_redo_log_number(self.redo_log_number());
         }
 
         let mut patch = VersionPatch::default();
         patch.set_prev_log_number(0);
         patch.set_redo_log_number(self.redo_log_number());
-        {
-            let borrowed_mutex = self.mutex.clone();
-            let lock = borrowed_mutex.lock().unwrap();
-            let mut versions = self.versions.borrow_mut();
-            versions.add_sequence_number(1);
-            from_io_result(versions.log_and_apply(self.options.core.clone(), patch, &lock))
-        }
+        versions.add_sequence_number(1);
+
+        from_io_result(versions.log_and_apply(self.options.core.clone(), patch))
+        //------------------------------unlock version-set--------------------------------------
     }
 
     fn recovery(&mut self, desc: &[ColumnFamilyDescriptor]) -> mai2::Result<()> {
@@ -241,15 +249,14 @@ impl DBImpl {
 
     fn redo_log_number(&self) -> u64 { self.redo_log.as_ref().unwrap().number }
 
-    fn renew_log_file(&mut self, _locking: &MutexGuard<Locking>) -> mai2::Result<()> {
+    fn renew_log_file(&mut self, locking: &mut MutexGuard<VersionSet>) -> mai2::Result<()> {
         if let Some(redo_log) = &self.redo_log {
             let mut borrow = redo_log.file.borrow_mut();
             from_io_result(borrow.flush())?;
             from_io_result(borrow.sync())?;
         }
 
-        let versions_copy = self.versions.clone();
-        let mut versions = versions_copy.borrow_mut();
+        let versions = locking.deref_mut();
         let new_log_number = versions.generate_file_number();
         let log_file_path = paths::log_file(self.abs_db_path.as_path(), new_log_number);
         let rs = from_io_result(self.env.new_writable_file(log_file_path.as_path(), true));
@@ -257,12 +264,12 @@ impl DBImpl {
             Err(_) => {
                 versions.reuse_file_number(new_log_number);
                 rs?;
-            },
+            }
             Ok(file) => {
-                self.redo_log = Some(WALDescriptor{
+                self.redo_log = Some(WALDescriptor {
                     file: file.clone(),
                     number: new_log_number,
-                    log: LogWriter::new(file, wal::DEFAULT_BLOCK_SIZE)
+                    log: LogWriter::new(file, wal::DEFAULT_BLOCK_SIZE),
                 });
             }
         }
@@ -274,10 +281,10 @@ impl DBImpl {
     }
 
     fn internal_new_column_family(&mut self, name: String, options: ColumnFamilyOptions,
-                                  locking: &MutexGuard<Locking>)
+                                  locking: &mut MutexGuard<VersionSet>)
                                   -> mai2::Result<u32> {
         let (id, patch) = {
-            let versions = self.versions.borrow_mut();
+            let versions = locking.deref_mut();
             let mut cfs = versions.column_families().borrow_mut();
             if cfs.get_column_family_by_name(&name).is_some() {
                 return Err(Status::corrupted(format!("duplicated column family name: {}", &name)));
@@ -290,7 +297,7 @@ impl DBImpl {
             (new_id, patch)
         };
 
-        from_io_result(self.versions.borrow_mut().log_and_apply(options, patch, locking))?;
+        from_io_result(locking.log_and_apply(options, patch))?;
         Ok(id)
     }
 }
@@ -298,18 +305,17 @@ impl DBImpl {
 impl DB for DBImpl {
     fn new_column_family(&mut self, name: &str, options: ColumnFamilyOptions)
                          -> mai2::Result<Arc<dyn ColumnFamily>> {
-        let mutex = self.mutex.clone();
-        let lock = mutex.lock().unwrap();
         //--------------------------lock version-set------------------------------------------------
-        let id = self.internal_new_column_family(String::from(name), options, &lock)?;
+        let mutex = self.versions.clone();
+        let mut versions = mutex.lock().unwrap();
+        let id = self.internal_new_column_family(String::from(name), options, &mut versions)?;
 
-        let versions = self.versions.borrow();
         let cfs = versions.column_families().borrow();
         let cfi = cfs.get_column_family_by_id(id).unwrap();
-        from_io_result(cfi.borrow_mut().install())?;
+        from_io_result(cfi.borrow_mut().install(&self.env))?;
         cfi.borrow_mut().set_redo_log_number(self.redo_log_number());
         assert!(cfi.borrow().initialized());
-        Ok(ColumnFamilyHandle::new(cfi.clone()))
+        Ok(ColumnFamilyHandle::new(&cfi, &self.versions))
         //--------------------------unlock version-set----------------------------------------------
     }
 
@@ -323,9 +329,8 @@ impl DB for DBImpl {
                                                  cfi.borrow().name())));
         }
 
-        let mutex = self.mutex.clone();
-        let lock = mutex.lock().unwrap();
         //--------------------------lock version-set------------------------------------------------
+        let mut versions = self.versions.lock().unwrap();
         while cfi.borrow().background_progress() {
             // Waiting for all background progress done
             todo!()
@@ -334,25 +339,22 @@ impl DB for DBImpl {
         patch.drop_column_family(cfi.borrow().id());
 
         let cf_opts = cfi.borrow().options().clone();
-        from_io_result(self.versions.borrow_mut()
-            .log_and_apply(cf_opts, patch, &lock))?;
-        from_io_result(cfi.borrow_mut().uninstall())?;
+        from_io_result(versions.log_and_apply(cf_opts, patch))?;
+        from_io_result(cfi.borrow_mut().uninstall(&self.env))?;
         Ok(())
         //--------------------------unlock version-set----------------------------------------------
     }
 
     fn get_all_column_families(&self) -> mai2::Result<Vec<Arc<dyn ColumnFamily>>> {
-        let mutex = self.mutex.clone();
-        let _lock = mutex.lock().unwrap();
         //--------------------------lock version-set------------------------------------------------
-
-        let mut cfs: Vec<Arc<dyn ColumnFamily>> = self.versions
-            .borrow().column_families()
+        let versions = self.versions.lock().unwrap();
+        let mut cfs: Vec<Arc<dyn ColumnFamily>> = versions
+            .column_families()
             .borrow().column_family_impls()
             .iter()
             .map(|x| (**x).clone())
             .filter(|x| !x.borrow().dropped() && x.borrow().initialized())
-            .map(|x| ColumnFamilyHandle::new(x.clone()))
+            .map(|x| ColumnFamilyHandle::new(&x, &self.versions))
             .collect();
         cfs.sort_by(|a, b| a.id().cmp(&b.id()));
         Ok(cfs)
@@ -364,14 +366,14 @@ impl DB for DBImpl {
     }
 
     fn get(&self, options: ReadOptions, column_family: &Arc<dyn ColumnFamily>, key: &[u8])
-        -> mai2::Result<Vec<u8>> {
+           -> mai2::Result<Vec<u8>> {
         todo!()
     }
 }
 
 impl Drop for DBImpl {
     fn drop(&mut self) {
-        self.shutting_down.store(true,Ordering::Release);
+        self.shutting_down.store(true, Ordering::Release);
 
         if let Some(worker) = self.flush_worker.as_ref() {
             worker.tx.send(WorkerCommand::Exit).unwrap();

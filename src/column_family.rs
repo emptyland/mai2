@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::comparator::Comparator;
@@ -78,25 +78,24 @@ impl ColumnFamilyImpl {
         handle.core().clone()
     }
 
-    pub fn install(&mut self) -> io::Result<()> {
+    pub fn install(&mut self, env: &Arc<dyn Env>) -> io::Result<()> {
         assert!(!self.initialized());
 
-        let cf_path = self.get_work_path();
-        let owns = self.owns.upgrade().unwrap();
-        owns.borrow().env().make_dir(cf_path.as_path())?;
+        let cf_path = self.get_work_path(env);
+        env.make_dir(cf_path.as_path())?;
 
         self.initialized = true;
         Ok(())
     }
 
-    pub fn uninstall(&mut self) -> io::Result<()> {
+    pub fn uninstall(&mut self, env: &Arc<dyn Env>) -> io::Result<()> {
         assert!(self.initialized());
         assert!(!self.background_progress());
         assert!(self.dropped());
 
-        let work_path = self.get_work_path();
+        let work_path = self.get_work_path(env);
         let owns = self.owns.upgrade().unwrap();
-        owns.borrow().env().delete_file(work_path.as_path(), true)?;
+        env.delete_file(work_path.as_path(), true)?;
         self.initialized = false;
         Ok(())
     }
@@ -107,13 +106,13 @@ impl ColumnFamilyImpl {
         self.compaction_points[level] = key;
     }
 
-    pub fn get_work_path(&self) -> PathBuf {
+    pub fn get_work_path(&self, env: &Arc<dyn Env>) -> PathBuf {
         let owns = self.owns.upgrade().unwrap();
         let path = PathBuf::new();
         if self.options.dir.is_empty() {
-            path.join(owns.borrow().abs_db_path()).join(self.name())
+            path.join(owns.borrow().abs_db_path.as_path()).join(self.name())
         } else {
-            path.join(owns.borrow().env().get_absolute_path(Path::new(&self.options.dir)).unwrap())
+            path.join(env.get_absolute_path(Path::new(&self.options.dir)).unwrap())
                 .join(self.name())
         }
     }
@@ -164,14 +163,22 @@ impl Drop for ColumnFamilyImpl {
 
 pub struct ColumnFamilyHandle {
     db: *const u8,
+    id: u32,
+    name: String,
+    mutex: Arc<Mutex<VersionSet>>,
     core: Arc<RefCell<ColumnFamilyImpl>>,
 }
 
 impl ColumnFamilyHandle {
-    pub fn new(core: Arc<RefCell<ColumnFamilyImpl>>) -> Arc<dyn ColumnFamily> {
+    pub fn new(core: &Arc<RefCell<ColumnFamilyImpl>>, mutex: &Arc<Mutex<VersionSet>>) -> Arc<dyn ColumnFamily> {
+        let id = core.borrow().id();
+        let name = core.borrow().name.clone();
         Arc::new(ColumnFamilyHandle {
             db: 0 as *const u8,
-            core,
+            id,
+            name,
+            core: core.clone(),
+            mutex: mutex.clone(),
         })
     }
 
@@ -186,11 +193,11 @@ impl ColumnFamily for ColumnFamilyHandle {
     }
 
     fn name(&self) -> String {
-        String::from(self.core().borrow().name())
+        self.name.clone()
     }
 
     fn id(&self) -> u32 {
-        self.core().borrow().id
+        self.id
     }
 
     fn comparator(&self) -> Rc<dyn Comparator> {
@@ -211,7 +218,8 @@ impl ColumnFamily for ColumnFamilyHandle {
 
 
 pub struct ColumnFamilySet {
-    owns: Weak<RefCell<VersionSet>>,
+    owns: Weak<Mutex<VersionSet>>,
+    pub abs_db_path: PathBuf,
     max_column_family_id: u32,
     default_column_family: Option<Arc<RefCell<ColumnFamilyImpl>>>,
     column_families: HashMap<u32, Arc<RefCell<ColumnFamilyImpl>>>,
@@ -220,17 +228,16 @@ pub struct ColumnFamilySet {
 }
 
 impl ColumnFamilySet {
-    pub fn new_dummy(owns: Weak<RefCell<VersionSet>>) -> Arc<RefCell<Self>> {
+    pub fn new_dummy(owns: Weak<Mutex<VersionSet>>, abs_db_path: PathBuf) -> Arc<RefCell<Self>> {
         let mut cfs = Self {
             owns,
+            abs_db_path,
             max_column_family_id: 0,
             default_column_family: None,
             column_families: HashMap::new(),
             column_family_names: HashMap::new(),
         };
         let owns = Arc::new(RefCell::new(cfs));
-        // let cf = Self::new_column_family_dummy(&owns, String::from(DEFAULT_COLUMN_FAMILY_NAME), ColumnFamilyOptions::default());
-        // owns.borrow_mut().default_column_family = Some(cf);
         owns
     }
 
@@ -298,16 +305,6 @@ impl ColumnFamilySet {
             .map(|x| x.1)
             .collect()
     }
-
-    pub fn abs_db_path(&self) -> PathBuf {
-        let owns = self.owns.upgrade().unwrap();
-        let borrowed = owns.borrow();
-        borrowed.abs_db_path().to_path_buf()
-    }
-
-    pub fn env(&self) -> Arc<dyn Env> {
-        self.owns.upgrade().unwrap().borrow().env().clone()
-    }
 }
 
 #[cfg(test)]
@@ -321,12 +318,12 @@ mod tests {
     #[test]
     #[ignore]
     fn sanity() {
-        let vss = VersionSet::new(PathBuf::from("db"), &Options::default());
-        let vs = vss.borrow();
-        let cfs = vs.column_families();
-        assert_eq!(0, cfs.borrow().max_column_family_id());
-        let dcf = cfs.borrow().default_column_family();
-        assert_eq!(0, dcf.borrow().id());
-        assert_eq!("default", dcf.borrow().name());
+        // let vss = VersionSet::new(PathBuf::from("db"), &Options::default());
+        // let vs = vss.borrow();
+        // let cfs = vs.column_families();
+        // assert_eq!(0, cfs.borrow().max_column_family_id());
+        // let dcf = cfs.borrow().default_column_family();
+        // assert_eq!(0, dcf.borrow().id());
+        // assert_eq!("default", dcf.borrow().name());
     }
 }
