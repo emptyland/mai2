@@ -151,6 +151,8 @@ impl DBImpl {
                     }
                 }
                 drop(rx);
+                // #[cfg(test)]
+                // println!("flush-worker exit.");
             }).unwrap();
         self.flush_worker = Some(WorkerDescriptor {
             tx,
@@ -375,9 +377,10 @@ impl Drop for DBImpl {
     fn drop(&mut self) {
         self.shutting_down.store(true, Ordering::Release);
 
-        if let Some(worker) = self.flush_worker.as_ref() {
+        if let Some(worker) = self.flush_worker.take() {
             worker.tx.send(WorkerCommand::Exit).unwrap();
-            //worker.join_handle.join().unwrap();
+            worker.join_handle.join().unwrap();
+            drop(worker.tx);
         };
         println!("drop it! DBImpl");
     }
