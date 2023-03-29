@@ -74,14 +74,21 @@ impl Decoder {
     }
 
     pub fn take_slice<'a>(&mut self, buf: &'a [u8], len: usize) -> io::Result<&'a [u8]> {
-        let rs = self.checked_slice(buf, len);
+        let rs = self.checked_slice(buf, len)?;
         self.offset += len;
-        rs
+        Ok(rs)
     }
 
     pub fn read_slice<'a>(&mut self, buf: &'a [u8]) -> io::Result<&'a [u8]> {
         let len: u32 = self.read_from(buf)?;
         self.take_slice(buf, len as usize)
+    }
+}
+
+impl Decode<u8> for Decoder {
+    fn read_from(&mut self, buf: &[u8]) -> io::Result<u8> {
+        let slice = self.take_slice(buf, 1)?;
+        Ok(slice[0])
     }
 }
 

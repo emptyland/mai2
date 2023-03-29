@@ -16,6 +16,7 @@ mod wal;
 mod memory_table;
 mod iterator;
 mod config;
+mod snapshot;
 
 fn main() {
     println!("ok")

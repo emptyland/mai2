@@ -55,7 +55,7 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<Key
         }
     }
 
-    pub fn insert(&mut self, key: &'a Key) {
+    pub fn insert(&self, key: &'a Key) {
         let mut prev: [Option<NonNull<Node<Key>>>; MAX_HEIGHT] = [None; MAX_HEIGHT];
         let mut x = self.find_greater_or_equal(key, &mut prev);
 

@@ -39,8 +39,8 @@ impl MemoryTable {
         }
     }
 
-    pub fn new_rc(internal_key_cmp: InternalKeyComparator) -> Arc<RefCell<Self>> {
-        Arc::new(RefCell::new(Self::new(internal_key_cmp)))
+    pub fn new_rc(internal_key_cmp: InternalKeyComparator) -> Arc<Self> {
+        Arc::new(Self::new(internal_key_cmp))
     }
 
     pub fn iter(this: Arc<RefCell<MemoryTable>>) -> IteratorImpl {
@@ -52,7 +52,7 @@ impl MemoryTable {
         }
     }
 
-    pub fn insert(&mut self, key: &[u8], value: &[u8], sequence_number: u64, tag: Tag) {
+    pub fn insert(&self, key: &[u8], value: &[u8], sequence_number: u64, tag: Tag) {
         let internal_key = {
             let mut arena = self.arena.borrow_mut();
             KeyBundle::new(arena.deref_mut(), tag, sequence_number, key, value)
@@ -68,20 +68,18 @@ impl MemoryTable {
         iter.seek(&internal_key);
 
         if !iter.valid() {
-            //println!("key != valid");
             return Err(Status::NotFound);
         }
 
         let found_key = iter.key().unwrap();
         if found_key.user_key() != key {
-            //println!("key != target");
             return Err(Status::NotFound);
         }
 
         Ok((found_key.value(), found_key.tag()))
     }
 
-    pub fn approximate_memory_usage() -> usize {
+    pub fn approximate_memory_usage(&self) -> usize {
         todo!()
     }
 }

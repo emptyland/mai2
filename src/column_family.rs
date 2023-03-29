@@ -34,7 +34,7 @@ pub struct ColumnFamilyImpl {
 
     compaction_points: [Vec<u8>; config::MAX_LEVEL],
 
-    mutable: Arc<RefCell<MemoryTable>>,
+    pub mutable: Arc<MemoryTable>,
     // TODO:
 }
 
@@ -205,6 +205,7 @@ impl ColumnFamily for ColumnFamilyHandle {
     }
 
     fn get_descriptor(&self) -> Result<ColumnFamilyDescriptor, Status> {
+        let _locking = self.mutex.lock().unwrap();
         if self.core().borrow().dropped() {
             Err(Status::Corruption(String::from("Column family is dropped!")))
         } else {

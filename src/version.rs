@@ -17,7 +17,6 @@ use crate::{config, files, wal};
 use crate::column_family::{ColumnFamilyImpl, ColumnFamilySet};
 use crate::comparator::Comparator;
 use crate::config::max_size_for_level;
-use crate::db_impl::Locking;
 use crate::env::{Env, WritableFile};
 use crate::key::InternalKeyComparator;
 use crate::mai2::{ColumnFamilyOptions, Options};

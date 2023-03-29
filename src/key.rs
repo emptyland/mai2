@@ -28,10 +28,17 @@ pub enum Tag {
 }
 
 impl Tag {
-    fn flag(&self) -> u64 {
+    fn to_flag(&self) -> u64 {
         match self {
             Tag::KEY => 0,
             Tag::DELETION => 1u64 << 63
+        }
+    }
+
+    pub fn to_byte(&self) -> u8 {
+        match self {
+            Tag::KEY => 0,
+            Tag::DELETION => 1
         }
     }
 }
@@ -75,7 +82,7 @@ impl KeyBundle {
             (*header).key_len = (user_key_size + TAG_SIZE) as u32;
             (*header).len = (user_key_size + TAG_SIZE + value_size) as u32;
 
-            *(base_ptr.add(size_of::<KeyHeader>() + user_key_size) as *mut u64) = sequence_number | tag.flag()
+            *(base_ptr.add(size_of::<KeyHeader>() + user_key_size) as *mut u64) = sequence_number | tag.to_flag()
         }
         Self { bundle: NonNull::new(header).unwrap() }
     }
