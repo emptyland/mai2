@@ -18,8 +18,8 @@ pub type Result<T> = std::result::Result<T, Status>;
 pub const DEFAULT_COLUMN_FAMILY_NAME: &str = "default";
 
 pub struct ColumnFamilyDescriptor {
-    pub(crate) name: String,
-    pub(crate) options: ColumnFamilyOptions,
+    pub name: String,
+    pub options: ColumnFamilyOptions,
 }
 
 impl Default for ColumnFamilyDescriptor {
@@ -169,7 +169,7 @@ pub trait Snapshot {
     fn as_any(&self) -> &dyn Any;
 }
 
-const REDO_HEADER_SIZE: usize = size_of::<u64>() + size_of::<u32>();
+pub const REDO_HEADER_SIZE: usize = size_of::<u64>() + size_of::<u32>();
 
 #[derive(Default, Clone, Debug)]
 pub struct WriteBatch {

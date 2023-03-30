@@ -17,6 +17,7 @@ mod memory_table;
 mod iterator;
 mod config;
 mod snapshot;
+mod queue;
 
 fn main() {
     println!("ok")

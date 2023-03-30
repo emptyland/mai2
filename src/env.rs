@@ -1,4 +1,5 @@
 use std::{env, fs, io};
+use std::alloc::System;
 use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::min;
@@ -7,6 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub trait Env {
     fn new_sequential_file(&self, path: &Path) -> io::Result<Rc<RefCell<dyn SequentialFile>>>;
@@ -63,6 +65,32 @@ pub trait Env {
         let wf = self.new_writable_file(path, true)?;
         let mut borrowed_wf = wf.borrow_mut();
         borrowed_wf.write_all(data)
+    }
+
+    fn read_all(&self, path: &Path) -> io::Result<Vec<u8>> {
+        let rf = self.new_sequential_file(path)?;
+        let mut borrowed_rf = rf.borrow_mut();
+        let mut buf = Vec::new();
+        borrowed_rf.read_to_end(&mut buf)?;
+        return Ok(buf)
+    }
+
+    fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        fs::read_to_string(path)
+    }
+
+    fn current_time_micros(&self) -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+    }
+
+    fn current_time_mills(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 }
 
@@ -156,7 +184,7 @@ impl WritableFileImpl {
             .write(true)
             .read(false)
             .create(true)
-            .create_new(true)
+            .create_new(!append)
             .append(append)
             .open(path)?;
         Ok(Self { file })
@@ -385,6 +413,7 @@ impl Drop for JunkFilesCleaner {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::env;
 
     use super::*;
@@ -453,4 +482,14 @@ mod tests {
         assert_eq!("abcd".as_bytes(), wf.buf.as_slice());
         Ok(())
     }
+
+    // #[test]
+    // fn current_time_micros() {
+    //     let env = EnvImpl::new();
+    //     let v: HashSet<_> = (0..10000).map(|_| {
+    //         env.current_time_micros()
+    //     }).collect();
+    //     assert_eq!(10000, v.len());
+    //
+    // }
 }

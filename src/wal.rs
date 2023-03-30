@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::io;
+use std::io::ErrorKind::UnexpectedEof;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -174,7 +175,15 @@ impl LogReader {
     }
 
     fn read_physical_record(&mut self, scratch: &mut Vec<u8>) -> io::Result<RecordType> {
-        let checksum = self.file_reader.read_fixed_u32()?;
+        let rs = self.file_reader.read_fixed_u32();
+        if let Err(e) = rs {
+            return if e.kind() == io::ErrorKind::UnexpectedEof && self.file_reader.eof() {
+                Ok(RecordType::Zero)
+            } else {
+                Err(e)
+            }
+        }
+        let checksum = rs?;
         let len = self.file_reader.read_fixed_u16()? as usize;
         let raw_rd_ty = self.file_reader.read_byte()?;
         let record_ty_rs = RecordType::try_from_primitive(raw_rd_ty as u32);
@@ -195,7 +204,7 @@ impl LogReader {
 
             let checked_sum = digest.finalize();
             if checked_sum != checksum {
-                let msg = format!("incorrect crc32 checksum: {} vs {}", checksum, checked_sum);
+                let msg = format!("incorrect crc32 checksum: {} vs {}", checked_sum, checksum);
                 return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
             }
         }

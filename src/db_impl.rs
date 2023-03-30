@@ -1,6 +1,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::{io, thread};
+use std::cmp::max;
+use std::collections::btree_set::BTreeSet;
+use std::io::{ErrorKind, Write};
 use std::mem::size_of;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
@@ -19,7 +22,7 @@ use crate::memory_table::MemoryTable;
 use crate::snapshot::{SnapshotImpl, SnapshotSet};
 use crate::status::{Corrupting, Status};
 use crate::version::{VersionPatch, VersionSet};
-use crate::wal::LogWriter;
+use crate::wal::{LogReader, LogWriter};
 
 pub struct DBImpl {
     pub db_name: String,
@@ -29,7 +32,7 @@ pub struct DBImpl {
     versions: Arc<Mutex<VersionSet>>,
     default_column_family: Option<Arc<dyn ColumnFamily>>,
     redo_log: Cell<Option<WALDescriptor>>,
-    redo_log_number: u64,
+    redo_log_number: Cell<u64>,
     shutting_down: AtomicBool,
     total_wal_size: AtomicU64,
     flush_worker: Cell<Option<WorkerDescriptor>>,
@@ -58,7 +61,7 @@ struct WALDescriptor {
 
 impl DBImpl {
     pub fn open(options: Options, name: String, column_family_descriptors: &[ColumnFamilyDescriptor])
-                -> mai2::Result<(Arc<dyn DB>, Vec<Arc<dyn ColumnFamily>>)> {
+                -> mai2::Result<(Arc<DBImpl>, Vec<Arc<dyn ColumnFamily>>)> {
         let env = options.env.clone();
         let abs_db_path = DBImpl::make_abs_db_path(&options.core.dir, &name, &env)?;
         let versions = VersionSet::new(abs_db_path.clone(), &options);
@@ -74,7 +77,7 @@ impl DBImpl {
             total_wal_size: AtomicU64::new(0),
             default_column_family: None,
             redo_log: Cell::new(None),
-            redo_log_number: 0,
+            redo_log_number: Cell::new(0),
             flush_worker: Cell::new(None),
             snapshots: SnapshotSet::new(),
         };
@@ -154,14 +157,13 @@ impl DBImpl {
         }
     }
 
-    fn get_total_redo_log_size(&mut self) -> io::Result<u64> {
-        let env = self.env.clone();
-        let children = env.get_children(self.abs_db_path.as_path())?;
+    fn get_total_redo_log_size(&self) -> io::Result<u64> {
+        let children = self.env.get_children(self.abs_db_path.as_path())?;
         let mut total_size = 0u64;
         for child in children {
             let (kind, _) = files::parse_name(&child);
             if kind == Kind::Log {
-                total_size += env.get_file_size(self.abs_db_path.join(child).as_path())?;
+                total_size += self.env.get_file_size(self.abs_db_path.join(child).as_path())?;
             }
         }
 
@@ -227,25 +229,129 @@ impl DBImpl {
 
         for cfi in column_families.borrow().column_family_impls() {
             from_io_result(cfi.borrow_mut().install(&self.env))?;
-            cfi.borrow_mut().set_redo_log_number(self.redo_log_number);
+            cfi.borrow_mut().set_redo_log_number(self.redo_log_number.get());
         }
 
         let mut patch = VersionPatch::default();
         patch.set_prev_log_number(0);
-        patch.set_redo_log_number(self.redo_log_number);
+        patch.set_redo_log_number(self.redo_log_number.get());
         versions.add_sequence_number(1);
 
         from_io_result(versions.log_and_apply(self.options.core.clone(), patch))
         //------------------------------unlock version-set--------------------------------------
     }
 
-    fn recovery(&mut self, desc: &[ColumnFamilyDescriptor]) -> mai2::Result<()> {
-        todo!()
+    fn recovery(&self, desc: &[ColumnFamilyDescriptor]) -> mai2::Result<()> {
+        let current_file_path = paths::current_file(self.abs_db_path.as_path());
+        let rv = from_io_result(self.env.read_to_string(current_file_path.as_path()))?;
+        let rs = u64::from_str_radix(rv.as_str(), 10);
+        if let Err(_) = rs {
+            return Err(Status::corrupted("bad CURRENT file"));
+        }
+        let manifest_file_number = rs.unwrap();
+        drop(rv);
+
+        let mut cfs = HashMap::<String, ColumnFamilyOptions>::new();
+        for item in desc {
+            cfs.insert(item.name.clone(), item.options.clone());
+        }
+
+        //------------------------------lock version-set--------------------------------------------
+        let mutex = self.versions.clone();
+        let mut versions = mutex.lock().unwrap();
+        let mut history: BTreeSet<u64> = from_io_result(versions.recover(&cfs, manifest_file_number))?;
+        assert!(history.len() >= 1);
+
+        if self.options.create_missing_column_families {
+            for cfi in versions.column_families().borrow().column_family_impls() {
+                cfs.remove(cfi.borrow().name());
+            }
+            for (name, opts) in cfs {
+                self.internal_new_column_family(name, opts, &mut versions)?;
+            }
+        }
+
+        // Should replay all column families's redo log file.
+        let mut numbers = BTreeSet::new();
+        for cfi in versions.column_families().borrow().column_family_impls() {
+            let mut borrowed_cfi = cfi.borrow_mut();
+            if !borrowed_cfi.initialized() {
+                from_io_result(borrowed_cfi.install(&self.env))?;
+            }
+            numbers.insert(borrowed_cfi.redo_log_number());
+        }
+        let mut max_number = *numbers.last().unwrap_or(&0);
+
+        // Add undumped log files.
+        numbers.append(&mut history.split_off(&(max_number + 1)));
+        max_number = *numbers.last().unwrap(); // last one is max one
+        assert!(history.len() >= numbers.len());
+
+        let mut update_sequence_number = 0;
+        for number in numbers {
+            // The newest redo log file filter is not need.
+            update_sequence_number = self.redo(number, max_number != number, &versions)?;
+        }
+
+        // The max one is newest file.
+        assert_eq!(max_number, versions.redo_log_number);
+        self.redo_log_number.set(versions.redo_log_number);
+
+        versions.update_sequence_number(update_sequence_number);
+
+        let log_file_path = paths::log_file(self.abs_db_path.as_path(), self.redo_log_number.get());
+        let file = from_io_result(self.env.new_writable_file(log_file_path.as_path(), true))?;
+        self.redo_log.set(Some(WALDescriptor {
+            log: LogWriter::new(file.clone(), wal::DEFAULT_BLOCK_SIZE),
+            file,
+            number: self.redo_log_number.get(),
+        }));
+
+        let total_wal_size = from_io_result(self.get_total_redo_log_size())?;
+        self.total_wal_size.store(total_wal_size, Ordering::Release);
+        Ok(())
+        //------------------------------unlock version-set------------------------------------------
+    }
+
+    fn redo(&self, log_file_number: u64, filter: bool, versions: &MutexGuard<VersionSet>) -> mai2::Result<u64> {
+        let log_file_path = paths::log_file(self.abs_db_path.as_path(), log_file_number);
+        let file = from_io_result(self.env.new_sequential_file(log_file_path.as_path()))?;
+
+        let mut handler = WritingHandler::new(log_file_number, filter, 0,
+                                              versions.column_families().clone());
+        let mut update_sequence_number = 0;
+        let mut reader = LogReader::new(file, true, wal::DEFAULT_BLOCK_SIZE);
+        loop {
+            let mut record = from_io_result(reader.read())?;
+            if record.is_empty() {
+                break;
+            }
+            let mut offset = 0;
+            let sequence_number = {
+                let mut buf: [u8; 8] = [0; 8];
+                (&mut buf[..]).write(&record.as_slice()[offset..offset + 8]).unwrap();
+                u64::from_le_bytes(buf)
+            };
+            offset += 8;
+            let _n_entries = {
+                let mut buf: [u8; 4] = [0; 4];
+                (&mut buf[..]).write(&record.as_slice()[offset..offset + 4]).unwrap();
+                u32::from_le_bytes(buf)
+            };
+
+            handler.reset_last_sequence_number(sequence_number);
+            WriteBatch::iterate_since(WriteBatch::skip_header(record.as_slice()), &handler);
+            //assert_eq!(n_entries as u64, handler.sequence_number_count.get());
+
+            update_sequence_number = sequence_number + handler.sequence_number_count.get();
+        }
+
+        Ok(update_sequence_number)
     }
 
     //fn redo_log_number(&self) -> u64 { self.redo_log.into_inner().as_ref().unwrap().number }
 
-    fn renew_log_file(&mut self, locking: &mut MutexGuard<VersionSet>) -> mai2::Result<()> {
+    fn renew_log_file(&self, locking: &mut MutexGuard<VersionSet>) -> mai2::Result<()> {
         if let Some(redo_log) = self.redo_log.take() {
             {
                 let mut borrow = redo_log.file.borrow_mut();
@@ -293,7 +399,7 @@ impl DBImpl {
 
             let new_id = cfs.next_column_family_id();
             let mut patch = VersionPatch::default();
-            patch.create_column_family(name.clone(), new_id,
+            patch.create_column_family(new_id, name.clone(),
                                        options.user_comparator.name().clone());
             (new_id, patch)
         };
@@ -360,7 +466,7 @@ impl DBImpl {
 
         let mut memory_tables = Vec::new();
         memory_tables.push(borrowed_cfi.mutable.clone());
-        // TODO: push immutables
+        memory_tables.append(&mut borrowed_cfi.immutable_pipeline.peek_all());
         // TODO: get current version
 
         //------------------------------unlock version-set------------------------------------------
@@ -383,7 +489,7 @@ impl DB for DBImpl {
         let cfs = versions.column_families().borrow();
         let cfi = cfs.get_column_family_by_id(id).unwrap();
         from_io_result(cfi.borrow_mut().install(&self.env))?;
-        cfi.borrow_mut().set_redo_log_number(self.redo_log_number);
+        cfi.borrow_mut().set_redo_log_number(self.redo_log_number.get());
         assert!(cfi.borrow().initialized());
         Ok(ColumnFamilyHandle::new(&cfi, &self.versions))
         //--------------------------unlock version-set----------------------------------------------
@@ -464,7 +570,7 @@ impl DB for DBImpl {
         let versions = mutex.lock().unwrap();
         //--------------------------lock version-set------------------------------------------------
         SnapshotSet::new_snapshot(&self.snapshots, versions.last_sequence_number(),
-                                  0)
+                                  self.env.current_time_mills())
         //--------------------------unlock version-set----------------------------------------------
     }
 
@@ -697,12 +803,71 @@ mod tests {
         Ok(())
     }
 
-    fn open_test_db(name: &str) -> mai2::Result<Arc<dyn DB>> {
+    #[test]
+    fn recover_db() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db5");
+        {
+            let db = open_test_db("db5")?;
+            let cf0 = db.default_column_family();
+            let cf1 = db.new_column_family("cf1", ColumnFamilyOptions::default())?;
+            let wr_opts = WriteOptions::default();
+
+            db.insert(&wr_opts, &cf0, "1111".as_bytes(), "a".as_bytes())?;
+            db.insert(&wr_opts, &cf0, "3333".as_bytes(), "b".as_bytes())?;
+            db.insert(&wr_opts, &cf0, "4444".as_bytes(), "c".as_bytes())?;
+
+            db.insert(&wr_opts, &cf1, "2222".as_bytes(), "cc".as_bytes())?;
+        }
+
+        {
+            let desc = [ColumnFamilyDescriptor {
+                name: DEFAULT_COLUMN_FAMILY_NAME.to_string(),
+                options: ColumnFamilyOptions::default(),
+            }, ColumnFamilyDescriptor {
+                name: "cf1".to_string(),
+                options: ColumnFamilyOptions::default(),
+            }];
+
+            let db = load_test_db("db5", &desc)?;
+            let cf0 = db.default_column_family();
+            let cfs = db.get_all_column_families()?;
+            let maybe_cf0 = cfs.iter().find(|x| { x.name() == "cf1" });
+            assert!(maybe_cf0.is_some());
+            let cf1 = maybe_cf0.unwrap();
+
+            check_key_value_pairs(&db, &cf0,
+                                  &vec!["1111", "3333", "4444"],
+                                  &vec!["a", "b", "c"])?;
+            check_key_value_pairs(&db, &cf1, &vec!["2222"], &vec!["cc"])?;
+        }
+        Ok(())
+    }
+
+    fn check_key_value_pairs(db: &Arc<DBImpl>, cf: &Arc<dyn ColumnFamily>, keys: &[&str], values: &[&str]) -> Result<()> {
+        assert_eq!(keys.len(), values.len());
+        let rd_opts = ReadOptions::default();
+        for i in 0..keys.len() {
+            let v = db.get(&rd_opts, &cf, keys[i].as_bytes())?;
+            assert_eq!(values[i].as_bytes(), v.as_slice());
+        }
+        Ok(())
+    }
+
+    fn open_test_db(name: &str) -> mai2::Result<Arc<DBImpl>> {
         let options = Options::with()
             .create_if_missing(true)
             .dir(String::from("tests"))
             .build();
         let (db, _cfs) = DBImpl::open(options, String::from(name), &Vec::new())?;
+        Ok(db)
+    }
+
+    fn load_test_db(name: &str, desc: &[ColumnFamilyDescriptor]) -> mai2::Result<Arc<DBImpl>> {
+        let options = Options::with()
+            .dir("tests".to_string())
+            .error_if_exists(false)
+            .build();
+        let (db, _cfs) = DBImpl::open(options, String::from(name), desc)?;
         Ok(db)
     }
 }

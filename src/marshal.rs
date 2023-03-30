@@ -1,5 +1,5 @@
 use core::slice;
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::io;
 use std::io::Write;
 use std::mem::size_of;
@@ -204,15 +204,22 @@ impl FileWriter {
 
 pub struct FileReader {
     file: Rc<RefCell<dyn SequentialFile>>,
+    eof: Cell<bool>
 }
 
 impl FileReader {
     pub fn new(file: Rc<RefCell<dyn SequentialFile>>) -> Self {
-        Self { file }
+        Self { file, eof: Cell::new(false) }
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.file.borrow_mut().read(buf)
+        let read_in_bytes = self.file.borrow_mut().read(buf)?;
+        if read_in_bytes < buf.len() {
+            self.eof.set(true);
+            Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+        } else {
+            Ok(read_in_bytes)
+        }
     }
 
     pub fn read_byte(&self) -> io::Result<u8> {
@@ -242,6 +249,8 @@ impl FileReader {
     pub fn skip(&self, n: usize) -> io::Result<u64> {
         self.file.borrow_mut().skip(n)
     }
+
+    pub fn eof(&self) -> bool { self.eof.get() }
 }
 
 #[cfg(test)]

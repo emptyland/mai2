@@ -15,6 +15,7 @@ use crate::env::Env;
 use crate::key::InternalKeyComparator;
 use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME};
 use crate::memory_table::MemoryTable;
+use crate::queue::NonBlockingQueue;
 use crate::status::Status;
 use crate::version::{Version, VersionSet};
 
@@ -35,6 +36,7 @@ pub struct ColumnFamilyImpl {
     compaction_points: [Vec<u8>; config::MAX_LEVEL],
 
     pub mutable: Arc<MemoryTable>,
+    pub immutable_pipeline: Arc<NonBlockingQueue<Arc<MemoryTable>>>,
     // TODO:
 }
 
@@ -66,6 +68,7 @@ impl ColumnFamilyImpl {
             history: Vec::new(),
             current_version_index: 0,
             mutable: MemoryTable::new_rc(internal_key_cmp.clone()),
+            immutable_pipeline: Arc::new(NonBlockingQueue::new()),
             compaction_points: array::from_fn(|_| Vec::new()),
 
         };
@@ -223,7 +226,7 @@ pub struct ColumnFamilySet {
     pub abs_db_path: PathBuf,
     max_column_family_id: u32,
     default_column_family: Option<Arc<RefCell<ColumnFamilyImpl>>>,
-    column_families: HashMap<u32, Arc<RefCell<ColumnFamilyImpl>>>,
+    pub column_families: HashMap<u32, Arc<RefCell<ColumnFamilyImpl>>>,
     column_family_names: HashMap<String, Arc<RefCell<ColumnFamilyImpl>>>,
 
 }

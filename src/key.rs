@@ -240,7 +240,7 @@ impl InternalKey<'_> {
 
 #[derive(Clone)]
 pub struct InternalKeyComparator {
-    user_cmp: Rc<dyn Comparator>,
+    pub user_cmp: Rc<dyn Comparator>,
 }
 
 impl InternalKeyComparator {

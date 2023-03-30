@@ -38,7 +38,7 @@ impl Comparator for BitwiseComparator {
     }
 
     fn name(&self) -> String {
-        String::from("bitwise")
+        String::from("bitwise-comparator")
     }
 }
 
