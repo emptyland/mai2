@@ -1,46 +1,52 @@
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::{io, thread};
-use std::cmp::max;
+use std::cell::{Cell, RefCell};
 use std::collections::btree_set::BTreeSet;
+use std::collections::HashMap;
 use std::io::{ErrorKind, Write};
 use std::mem::size_of;
-use std::ops::DerefMut;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::thread::JoinHandle;
 
+use crate::{config, files, mai2, sst, wal};
 use crate::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
+use crate::comparator::Comparator;
 use crate::env::{Env, WritableFile};
 use crate::files::{Kind, paths};
-use crate::{files, mai2, wal};
 use crate::key::Tag;
 use crate::mai2::*;
 use crate::memory_table::MemoryTable;
 use crate::snapshot::{SnapshotImpl, SnapshotSet};
+use crate::sst::SSTBuilder;
 use crate::status::{Corrupting, Status};
-use crate::version::{VersionPatch, VersionSet};
+use crate::status::Status::Corruption;
+use crate::version::{FileMetadata, Version, VersionPatch, VersionSet};
 use crate::wal::{LogReader, LogWriter};
 
 pub struct DBImpl {
     pub db_name: String,
     pub abs_db_path: PathBuf,
+    this: Option<Weak<DBImpl>>,
     options: Options,
     env: Arc<dyn Env>,
     versions: Arc<Mutex<VersionSet>>,
     default_column_family: Option<Arc<dyn ColumnFamily>>,
     redo_log: Cell<Option<WALDescriptor>>,
     redo_log_number: Cell<u64>,
+    background_active: AtomicBool,
     shutting_down: AtomicBool,
     total_wal_size: AtomicU64,
     flush_worker: Cell<Option<WorkerDescriptor>>,
+    compaction_worker: Cell<Option<WorkerDescriptor>>,
     snapshots: Arc<SnapshotSet>,
 }
 
 enum WorkerCommand {
     Work(Arc<RefCell<dyn WritableFile>>, Arc<Mutex<VersionSet>>),
+    Compact(Weak<DBImpl>, Arc<ColumnFamilyImpl>),
     Exit,
 }
 
@@ -69,16 +75,18 @@ impl DBImpl {
         let mut db = DBImpl {
             db_name: name.clone(),
             abs_db_path,
+            this: None,
             options,
             env: env.clone(),
             versions: versions.clone(),
-            //bkg_active: AtomicI32::new(0),
+            background_active: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             total_wal_size: AtomicU64::new(0),
             default_column_family: None,
             redo_log: Cell::new(None),
             redo_log_number: Cell::new(0),
             flush_worker: Cell::new(None),
+            compaction_worker: Cell::new(None),
             snapshots: SnapshotSet::new(),
         };
         if env.file_not_exists(paths::current_file(db.abs_db_path.as_path()).as_path()) {
@@ -111,12 +119,15 @@ impl DBImpl {
             println!("----------");
             let borrowed_cfs = column_families.borrow();
             for cfi in borrowed_cfs.column_family_impls() {
-                println!("cf[{}][{}]", cfi.borrow().id(), cfi.borrow().name());
+                println!("cf[{}][{}]", cfi.id(), cfi.name());
             }
             println!("----------");
         }
 
-        Ok((Arc::new(db), cfs))
+        Ok((Arc::new_cyclic(|this| {
+            db.this = Some(this.clone());
+            db
+        }), cfs))
     }
 
     fn flush_redo_log(&self, sync: bool, _locking: &MutexGuard<VersionSet>) {
@@ -146,7 +157,8 @@ impl DBImpl {
                             file.borrow_mut().flush().unwrap();
                             file.borrow_mut().sync().unwrap();
                         }
-                        WorkerCommand::Exit => break
+                        WorkerCommand::Exit => break,
+                        _ => unreachable!(),
                     }
                 }
                 drop(rx);
@@ -228,8 +240,8 @@ impl DBImpl {
         }
 
         for cfi in column_families.borrow().column_family_impls() {
-            from_io_result(cfi.borrow_mut().install(&self.env))?;
-            cfi.borrow_mut().set_redo_log_number(self.redo_log_number.get());
+            from_io_result(cfi.install(&self.env))?;
+            cfi.set_redo_log_number(self.redo_log_number.get());
         }
 
         let mut patch = VersionPatch::default();
@@ -264,7 +276,7 @@ impl DBImpl {
 
         if self.options.create_missing_column_families {
             for cfi in versions.column_families().borrow().column_family_impls() {
-                cfs.remove(cfi.borrow().name());
+                cfs.remove(cfi.name());
             }
             for (name, opts) in cfs {
                 self.internal_new_column_family(name, opts, &mut versions)?;
@@ -274,11 +286,10 @@ impl DBImpl {
         // Should replay all column families's redo log file.
         let mut numbers = BTreeSet::new();
         for cfi in versions.column_families().borrow().column_family_impls() {
-            let mut borrowed_cfi = cfi.borrow_mut();
-            if !borrowed_cfi.initialized() {
-                from_io_result(borrowed_cfi.install(&self.env))?;
+            if !cfi.initialized() {
+                from_io_result(cfi.install(&self.env))?;
             }
-            numbers.insert(borrowed_cfi.redo_log_number());
+            numbers.insert(cfi.redo_log_number());
         }
         let mut max_number = *numbers.last().unwrap_or(&0);
 
@@ -414,9 +425,9 @@ impl DBImpl {
         //------------------------------lock version-set--------------------------------------------
         let last_version = versions.last_sequence_number();
         {
-            let cfs = versions.column_families().borrow();
-            for cfi in cfs.column_family_impls() {
-                self.make_room_for_write(cfi, &versions)?;
+            let cfs = versions.column_families().clone();
+            for cfi in cfs.borrow().column_family_impls() {
+                versions = self.make_room_for_write(cfi, versions)?;
             }
         }
         let redo = updates.take_redo(last_version + 1);
@@ -436,9 +447,192 @@ impl DBImpl {
         Ok(())
     }
 
-    fn make_room_for_write(&self, _cfi: &Arc<RefCell<ColumnFamilyImpl>>, _locking: &MutexGuard<VersionSet>) -> mai2::Result<()> {
-        // TODO:
-        Ok(())
+    fn make_room_for_write<'a>(&'a self, cfi: &Arc<ColumnFamilyImpl>, mut locking: MutexGuard<'a, VersionSet>) -> mai2::Result<MutexGuard<'a, VersionSet>> {
+        loop {
+            if let Err(e) = cfi.background_result.replace(Ok(())) {
+                return Err(e.clone());
+            } else if cfi.mutable().approximate_memory_usage() < cfi.options().write_buf_size {
+                // Memory table usage samll than write buffer. Ignore it.
+                // Memory table conflict-factor too small. Ignore it.
+                break;
+            } else if cfi.immutable_pipeline.is_not_empty() {
+                // Immutable table pipeline in progress.
+                break;
+            } else if cfi.background_progress() &&
+                cfi.current().level_files(0).len() > config::MAX_NUMBER_OF_LEVEL_0_FILES as usize {
+                let cv = &cfi.background_cv;
+                return Ok(cv.wait(locking).unwrap());
+            } else {
+                assert_eq!(0, locking.prev_log_number);
+                self.renew_log_file(&mut locking)?;
+
+                let mut patch = VersionPatch::default();
+                patch.set_redo_log_number(self.redo_log_number.get());
+                from_io_result(locking.log_and_apply(self.options.core.clone(), patch))?;
+
+                cfi.make_immutable_pipeline(self.redo_log_number.get());
+
+                self.maybe_schedule_compacting(cfi, &locking);
+            }
+        }
+        Ok(locking)
+    }
+
+    fn maybe_schedule_compacting(&self, cfi: &Arc<ColumnFamilyImpl>,
+                                 _locking: &MutexGuard<VersionSet>) {
+        if self.background_active.load(Ordering::Acquire) {
+            // Compaction is running.
+            return;
+        }
+        if self.shutting_down.load(Ordering::Acquire) {
+            // Is shutting down, ignore schedule
+            return;
+        }
+        if cfi.immutable_pipeline.is_empty() && !cfi.need_compaction() {
+            return; // Compaction is no need
+        }
+
+        let this = self.this.as_ref().unwrap().clone();
+        if let Some(worker) = self.compaction_worker.take() {
+            worker.tx.send(WorkerCommand::Compact(this, cfi.clone())).unwrap();
+            self.compaction_worker.set(Some(worker));
+        } else {
+            let worker = self.start_compacting_worker();
+            worker.tx.send(WorkerCommand::Compact(this, cfi.clone())).unwrap();
+            self.compaction_worker.set(Some(worker));
+        }
+    }
+
+    fn start_compacting_worker(&self) -> WorkerDescriptor {
+        let (tx, rx) = channel();
+        let join_handle = thread::Builder::new()
+            .name("compact-worker".to_string())
+            .spawn(move || {
+                loop {
+                    let command = rx.recv().unwrap();
+                    match command {
+                        WorkerCommand::Compact(this, cfi) => {
+                            let db = if let Some(db) = this.upgrade() {
+                                db
+                            } else {
+                                break;
+                            };
+                            db.background_active.store(true, Ordering::Release);
+                            cfi.set_background_progress(true);
+
+
+                            if !db.shutting_down.load(Ordering::Acquire) {
+                                let mutex = db.versions.clone();
+                                db.compact(&cfi, mutex);
+                            }
+
+                            db.background_active.store(false, Ordering::Release);
+                            cfi.set_background_progress(false);
+
+                            let mutex = db.versions.clone();
+                            db.maybe_schedule_compacting(&cfi, &mutex.lock().unwrap());
+
+                            cfi.background_cv.notify_all();
+                        }
+                        WorkerCommand::Exit => break,
+                        _ => unreachable!(),
+                    }
+                }
+                drop(rx);
+            }).unwrap();
+        WorkerDescriptor {
+            tx,
+            join_handle,
+        }
+    }
+
+    fn compact(&self, cfi: &Arc<ColumnFamilyImpl>, mutex: Arc<Mutex<VersionSet>>) {
+        let mut locking = mutex.lock().unwrap();
+        if cfi.immutable_pipeline.is_not_empty() {
+            let rs = self.compact_memory_table(cfi, mutex.deref(), locking);
+            if let Err(e) = rs {
+                cfi.set_background_result(Err(e));
+                return;
+            }
+            locking = rs.unwrap();
+        }
+
+        // TODO: Pick compaction
+    }
+
+    fn compact_memory_table<'a>(&self, cfi: &Arc<ColumnFamilyImpl>, mutex: &'a Mutex<VersionSet>,
+                                mut locking: MutexGuard<'a, VersionSet>)
+                                -> mai2::Result<MutexGuard<'a, VersionSet>> {
+        assert!(cfi.immutable_pipeline.is_not_empty());
+
+        while let Some(memory_table) = cfi.immutable_pipeline.take() {
+            let new_file_number = locking.generate_file_number();
+            drop(locking);
+            //------------------------------unlock--------------------------------------------------
+            let mut patch = VersionPatch::default();
+            let file_number = memory_table.associated_file_number();
+            let rs = self.write_level0_table(cfi.current(), new_file_number, memory_table, &mut patch);
+            if let Err(e) = rs {
+                // reuse the fucking file number again.
+                mutex.lock().unwrap().reuse_file_number(new_file_number);
+                from_io_result(Err(e))?;
+            }
+
+            if self.shutting_down.load(Ordering::Acquire) {
+                return Err(Status::corrupted("Deleting DB during memtable compaction"));
+            }
+            patch.set_prev_log_number(0);
+            patch.set_redo_log(cfi.id(), file_number);
+
+            //------------------------------lock again----------------------------------------------
+            locking = mutex.lock().unwrap();
+            from_io_result(locking.log_and_apply(ColumnFamilyOptions::default(), patch))?;
+        }
+        Ok(locking)
+    }
+
+    fn write_level0_table(&self, version: Arc<Version>, file_number: u64,
+                          memory_table: Arc<MemoryTable>, patch: &mut VersionPatch)
+                          -> io::Result<u64> {
+        let _jiffies = self.env.current_time_mills();
+        let cfi = version.owns.upgrade().unwrap();
+        let file_path = paths::table_file_by_cf(cfi.get_work_path(&self.env).as_path(), file_number);
+        let file = self.env.new_writable_file(file_path.as_path(), false)?;
+
+        let builder = SSTBuilder::new(&cfi.internal_key_cmp, file, cfi.options().block_size,
+                                      cfi.options().block_restart_interval,
+                                      memory_table.number_of_entries());
+
+        let mut smallest_key = Vec::new();
+        let mut largest_key = Vec::new();
+        for (key, value) in MemoryTable::iter(memory_table) {
+            if let Err(e) = builder.add(&key, &value) {
+                builder.abandon();
+                return Err(e);
+            }
+
+            if smallest_key.is_empty() || cfi.internal_key_cmp.lt(&key, &smallest_key) {
+                smallest_key = key.clone();
+            }
+            if largest_key.is_empty() || cfi.internal_key_cmp.gt(&key, &largest_key) {
+                largest_key = key.clone();
+            }
+        }
+        builder.finish()?;
+
+        let metadata = FileMetadata {
+            number: file_number,
+            smallest_key,
+            largest_key,
+            size: builder.file_size(),
+            ctime: self.env.current_time_mills(),
+        };
+        patch.create_file_by_file_metadata(cfi.id(), 0, Arc::new(metadata));
+        Ok(file_number)
+    }
+
+    fn delete_obsolete_files(&self, cfi: &mut ColumnFamilyImpl, _locking: &mut MutexGuard<VersionSet>) {
+        todo!()
     }
 
     fn prepare_for_get(&self, options: &ReadOptions, cf: &Arc<dyn ColumnFamily>) -> mai2::Result<Get> {
@@ -447,9 +641,8 @@ impl DBImpl {
         //------------------------------lock version-set--------------------------------------------
         let mutex = self.versions.clone();
         let versions = mutex.lock().unwrap();
-        let borrowed_cfi = cfi.borrow();
 
-        if borrowed_cfi.dropped() {
+        if cfi.dropped() {
             return Err(Status::corrupted("column family has dropped"));
         }
         let last_sequence_number =
@@ -465,8 +658,8 @@ impl DBImpl {
         }
 
         let mut memory_tables = Vec::new();
-        memory_tables.push(borrowed_cfi.mutable.clone());
-        memory_tables.append(&mut borrowed_cfi.immutable_pipeline.peek_all());
+        memory_tables.push(cfi.mutable().clone());
+        memory_tables.append(&mut cfi.immutable_pipeline.peek_all());
         // TODO: get current version
 
         //------------------------------unlock version-set------------------------------------------
@@ -488,9 +681,9 @@ impl DB for DBImpl {
 
         let cfs = versions.column_families().borrow();
         let cfi = cfs.get_column_family_by_id(id).unwrap();
-        from_io_result(cfi.borrow_mut().install(&self.env))?;
-        cfi.borrow_mut().set_redo_log_number(self.redo_log_number.get());
-        assert!(cfi.borrow().initialized());
+        from_io_result(cfi.install(&self.env))?;
+        cfi.set_redo_log_number(self.redo_log_number.get());
+        assert!(cfi.initialized());
         Ok(ColumnFamilyHandle::new(&cfi, &self.versions))
         //--------------------------unlock version-set----------------------------------------------
     }
@@ -502,22 +695,22 @@ impl DB for DBImpl {
 
         //--------------------------lock version-set------------------------------------------------
         let cfi = ColumnFamilyImpl::from(&column_family);
-        if cfi.borrow().dropped() {
+        if cfi.dropped() {
             return Err(Status::corrupted(format!("column family: {} has dropped",
-                                                 cfi.borrow().name())));
+                                                 cfi.name())));
         }
 
         let mut versions = self.versions.lock().unwrap();
-        while cfi.borrow().background_progress() {
+        while cfi.background_progress() {
             // Waiting for all background progress done
-            todo!()
+            versions = cfi.background_cv.wait(versions).unwrap();
         }
         let mut patch = VersionPatch::default();
-        patch.drop_column_family(cfi.borrow().id());
+        patch.drop_column_family(cfi.id());
 
-        let cf_opts = cfi.borrow().options().clone();
+        let cf_opts = cfi.options().clone();
         from_io_result(versions.log_and_apply(cf_opts, patch))?;
-        from_io_result(cfi.borrow_mut().uninstall(&self.env))?;
+        from_io_result(cfi.uninstall(&self.env))?;
         Ok(())
         //--------------------------unlock version-set----------------------------------------------
     }
@@ -530,7 +723,7 @@ impl DB for DBImpl {
             .borrow().column_family_impls()
             .iter()
             .map(|x| (**x).clone())
-            .filter(|x| !x.borrow().dropped() && x.borrow().initialized())
+            .filter(|x| !x.dropped() && x.initialized())
             .map(|x| ColumnFamilyHandle::new(&x, &self.versions))
             .collect();
         cfs.sort_by(|a, b| a.id().cmp(&b.id()));
@@ -596,6 +789,12 @@ impl Drop for DBImpl {
             worker.join_handle.join().unwrap();
             drop(worker.tx);
         };
+
+        if let Some(worker) = self.compaction_worker.take() {
+            worker.tx.send(WorkerCommand::Exit).unwrap();
+            worker.join_handle.join().unwrap();
+            drop(worker.tx);
+        }
         println!("drop it! DBImpl");
     }
 }
@@ -630,8 +829,7 @@ impl WritingHandler {
     fn get_memory_table(&self, cf_id: u32) -> Arc<MemoryTable> {
         let cfs = self.column_families.borrow();
         let cfi = cfs.get_column_family_by_id(cf_id).unwrap().clone();
-        let borrowed_cfi = cfi.borrow();
-        borrowed_cfi.mutable.clone()
+        cfi.mutable().clone()
     }
 
     fn sequence_number(&self) -> u64 { self.last_sequence_number + self.sequence_number_count.get() }
@@ -659,13 +857,14 @@ impl WriteBatchStub for WritingHandler {
 struct Get {
     memory_tables: Vec<Arc<MemoryTable>>,
     last_sequence_number: u64,
-    cfi: Arc<RefCell<ColumnFamilyImpl>>,
+    cfi: Arc<ColumnFamilyImpl>,
     //version: Arc<Version>,
 }
 
 #[cfg(test)]
 mod tests {
     use crate::env::JunkFilesCleaner;
+
     use super::*;
 
     #[test]

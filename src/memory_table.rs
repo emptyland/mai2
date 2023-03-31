@@ -1,9 +1,11 @@
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::cmp::Ordering;
 use std::ops::DerefMut;
 use std::ptr::addr_of;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::{AcqRel, Acquire};
 
 use crate::{iterator, mai2, skip_list};
 use crate::arena::{Arena, ScopedMemory};
@@ -16,6 +18,8 @@ use crate::status::Status;
 pub struct MemoryTable {
     arena: Rc<RefCell<Arena>>,
     table: SkipList<KeyBundle, KeyComparator>,
+    associated_file_number: Cell<u64>,
+    n_entries: AtomicUsize,
 }
 
 struct KeyComparator {
@@ -36,6 +40,8 @@ impl MemoryTable {
         Self {
             arena: arena.clone(),
             table,
+            associated_file_number: Cell::new(0),
+            n_entries: AtomicUsize::new(0)
         }
     }
 
@@ -43,8 +49,8 @@ impl MemoryTable {
         Arc::new(Self::new(internal_key_cmp))
     }
 
-    pub fn iter(this: Arc<RefCell<MemoryTable>>) -> IteratorImpl {
-        let table_ptr = addr_of!(this.borrow().table);
+    pub fn iter(this: Arc<MemoryTable>) -> IteratorImpl {
+        let table_ptr = addr_of!(this.table);
         IteratorImpl {
             owns: this.clone(),
             status: Status::Ok,
@@ -58,6 +64,7 @@ impl MemoryTable {
             KeyBundle::new(arena.deref_mut(), tag, sequence_number, key, value)
         };
 
+        self.n_entries.fetch_add(1, AcqRel);
         self.table.insert(&internal_key)
     }
 
@@ -80,12 +87,24 @@ impl MemoryTable {
     }
 
     pub fn approximate_memory_usage(&self) -> usize {
-        todo!()
+        self.arena.borrow().use_in_bytes
+    }
+
+    pub fn associate_file_number_to(&self, file_number: u64) {
+        self.associated_file_number.set(file_number);
+    }
+
+    pub fn associated_file_number(&self) -> u64 {
+        self.associated_file_number.get()
+    }
+
+    pub fn number_of_entries(&self) -> usize {
+        self.n_entries.load(Acquire)
     }
 }
 
 pub struct IteratorImpl {
-    owns: Arc<RefCell<MemoryTable>>,
+    owns: Arc<MemoryTable>,
     status: Status,
     iter: skip_list::IteratorImpl<KeyBundle, KeyComparator>,
 }
@@ -155,7 +174,7 @@ mod tests {
 
     #[test]
     fn sanity() {
-        let mut table = MemoryTable::new(default_internal_key_cmp());
+        let table = MemoryTable::new(default_internal_key_cmp());
 
         table.insert("aaa".as_bytes(), "boo".as_bytes(), 1, Tag::KEY);
         table.insert("aaa".as_bytes(), "obo".as_bytes(), 2, Tag::KEY);

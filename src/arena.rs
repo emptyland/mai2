@@ -1,6 +1,7 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::iter;
+use std::mem::size_of;
 use std::ptr::{addr_of_mut, NonNull, slice_from_raw_parts_mut};
 use std::rc::Rc;
 
@@ -11,6 +12,8 @@ pub trait Allocator {
 #[derive(Debug)]
 pub struct Arena {
     pages: Option<NonNull<Page>>,
+    pub rss_in_bytes: usize,
+    pub use_in_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -23,7 +26,7 @@ struct Page {
 
 impl Arena {
     pub fn new() -> Self {
-        Arena { pages: None }
+        Arena { pages: None, rss_in_bytes: 0, use_in_bytes: 0 }
     }
 
     pub fn new_rc() -> Rc<RefCell<Self>> {
@@ -51,15 +54,20 @@ impl Allocator for Arena {
             Some(mut head) => unsafe {
                 let chunk = head.as_mut().allocate(layout);
                 match chunk {
-                    Some(ptr) => Ok(ptr),
+                    Some(ptr) => {
+                        self.use_in_bytes += layout.size();
+                        Ok(ptr)
+                    },
                     None => {
                         self.pages = Page::new(self.pages);
+                        self.rss_in_bytes += size_of::<Page>();
                         self.allocate(layout)
                     }
                 }
             }
             None => {
                 self.pages = Page::new(self.pages);
+                self.rss_in_bytes += size_of::<Page>();
                 self.allocate(layout)
             }
         }

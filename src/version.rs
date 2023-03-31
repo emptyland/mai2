@@ -32,7 +32,7 @@ pub struct VersionSet {
 
     last_sequence_number: u64,
     next_file_number: u64,
-    prev_log_number: u64,
+    pub prev_log_number: u64,
     pub redo_log_number: u64,
     manifest_file_number: u64,
     column_families: Arc<RefCell<ColumnFamilySet>>,
@@ -103,7 +103,7 @@ impl VersionSet {
                 let id = patch.cf_deletion;
                 assert_ne!(0, id);
                 let cfi = self.ensure_column_family_impl(id);
-                cfi.borrow_mut().drop_it();
+                cfi.drop_it();
             }
 
             if patch.has_file_creation() || patch.has_file_deletion() {
@@ -113,7 +113,7 @@ impl VersionSet {
                     .apply(&patch)
                     .build();
                 Self::finalize(&mut version);
-                builder.cf.unwrap().borrow_mut().append(version);
+                builder.cf.unwrap().append(version);
             }
 
             if patch.has_compaction_point() {
@@ -121,13 +121,13 @@ impl VersionSet {
                 let level = patch.compaction_point.level as usize;
                 let compaction_key = &patch.compaction_point.key;
                 let cfi = self.ensure_column_family_impl(id);
-                cfi.borrow_mut().set_compaction_point(level, compaction_key.clone());
+                cfi.set_compaction_point(level, compaction_key.clone());
             }
 
             if patch.has_redo_log() {
                 let id = patch.redo_log.cf_id;
                 let cfi = self.ensure_column_family_impl(id);
-                cfi.borrow_mut().set_redo_log_number(patch.redo_log.number);
+                cfi.set_redo_log_number(patch.redo_log.number);
             }
 
             if patch.has_last_sequence_number() {
@@ -157,7 +157,7 @@ impl VersionSet {
         Ok(history)
     }
 
-    fn ensure_column_family_impl(&self, id: u32) -> Arc<RefCell<ColumnFamilyImpl>> {
+    fn ensure_column_family_impl(&self, id: u32) -> Arc<ColumnFamilyImpl> {
         let cfs = self.column_families().borrow();
         let cfi = cfs.get_column_family_by_id(id);
         cfi.unwrap().clone()
@@ -217,10 +217,9 @@ impl VersionSet {
 
         for cfi in borrowed_cfs.column_family_impls() {
             let mut patch = VersionPatch::default();
-            let borrowed_cif = cfi.borrow();
-            patch.create_column_family(borrowed_cif.id(), borrowed_cif.name().clone(),
-                                       borrowed_cif.internal_key_cmp.user_cmp.name());
-            patch.set_redo_log(borrowed_cif.id(), borrowed_cif.redo_log_number());
+            patch.create_column_family(cfi.id(), cfi.name().clone(),
+                                       cfi.internal_key_cmp.user_cmp.name());
+            patch.set_redo_log(cfi.id(), cfi.redo_log_number());
 
             // TODO: write level files
 
@@ -270,21 +269,20 @@ impl VersionSet {
         if patch.has_redo_log() {
             let column_families = self.column_families().borrow_mut();
             let id = patch.redo_log.cf_id;
-            let cf = column_families.get_column_family_by_id(id).unwrap();
-            let mut borrowed_cf = cf.borrow_mut();
-            assert!(patch.redo_log.number >= borrowed_cf.redo_log_number());
+            let cfi = column_families.get_column_family_by_id(id).unwrap();
+            assert!(patch.redo_log.number >= cfi.redo_log_number());
             assert!(patch.redo_log.number < self.next_file_number);
-            borrowed_cf.set_redo_log_number(patch.redo_log.number);
+            cfi.set_redo_log_number(patch.redo_log.number);
         }
 
         if patch.has_column_family_deletion() {
-            let cf = {
+            let cfi = {
                 let column_families = self.column_families().borrow_mut();
                 let id = patch.cf_deletion;
                 assert_ne!(id, 0);
                 column_families.get_column_family_by_id(id).unwrap().clone()
             };
-            cf.borrow_mut().drop_it();
+            cfi.drop_it();
         }
 
         if matches!(self.log, None) {
@@ -300,7 +298,7 @@ impl VersionSet {
             builder.apply(&patch);
             let mut version = builder.build();
             Self::finalize(&mut version);
-            builder.cf.unwrap().borrow_mut().append(version);
+            builder.cf.unwrap().append(version);
         }
 
         self.redo_log_number = patch.redo_log_number();
@@ -660,16 +658,16 @@ impl VersionPatch {
             size: file_size,
             ctime,
         });
-        self.create_file_by_file_metadata(cf_id, level, &file_metadata);
+        self.create_file_by_file_metadata(cf_id, level, file_metadata);
     }
 
     pub fn create_file_by_file_metadata(&mut self, cf_id: u32, level: i32,
-                                        metadata: &Arc<FileMetadata>) {
+                                        metadata: Arc<FileMetadata>) {
         self.set_field(patch::Field::FileCreation);
         self.file_creation.push(patch::FileCreation {
             cf_id,
             level,
-            metadata: metadata.clone(),
+            metadata,
         });
     }
 
@@ -781,14 +779,14 @@ impl VersionPatch {
 
 #[derive(Debug)]
 pub struct Version {
-    owns: Weak<RefCell<ColumnFamilyImpl>>,
+    pub owns: Weak<ColumnFamilyImpl>,
     compaction_level: i32,
-    compaction_score: f64,
+    pub compaction_score: f64,
     files: [Vec<Arc<FileMetadata>>; config::MAX_LEVEL],
 }
 
 impl Version {
-    pub fn new(owns: Weak<RefCell<ColumnFamilyImpl>>) -> Self {
+    pub fn new(owns: Weak<ColumnFamilyImpl>) -> Self {
         Self {
             owns,
             compaction_level: -1,
@@ -825,7 +823,7 @@ impl Version {
 pub struct VersionBuilder {
     cfs: Arc<RefCell<ColumnFamilySet>>,
     levels: [FileEntry; config::MAX_LEVEL],
-    pub cf: Option<Arc<RefCell<ColumnFamilyImpl>>>,
+    pub cf: Option<Arc<ColumnFamilyImpl>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -840,14 +838,14 @@ impl VersionBuilder {
 
         let mut version = Version::new(Arc::downgrade(&cfi));
         for i in 0..config::MAX_LEVEL {
-            for file_metadata in cfi.borrow().current().level_files(i) {
+            for file_metadata in cfi.current().level_files(i) {
                 if !self.levels[i].deletion.contains(&file_metadata.number) {
                     version.files[i].push(file_metadata.clone())
                 }
             }
             self.levels[i].deletion.clear();
 
-            Self::sort_files_metadata(&mut self.levels[i].creation, &cfi.borrow().internal_key_cmp);
+            Self::sort_files_metadata(&mut self.levels[i].creation, &cfi.internal_key_cmp);
             for file_metadata in &self.levels[i].creation {
                 version.files[i].push(file_metadata.clone());
             }
@@ -892,7 +890,7 @@ impl VersionBuilder {
 
     fn try_get_column_family_impl(&mut self, cf_id: u32) {
         match self.cf.as_ref() {
-            Some(cfi) => assert_eq!(cfi.borrow().id(), cf_id),
+            Some(cfi) => assert_eq!(cfi.id(), cf_id),
             None => self.cf = Some(self.cfs
                 .borrow().get_column_family_by_id(cf_id)
                 .unwrap().clone())

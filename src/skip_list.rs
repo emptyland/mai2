@@ -294,7 +294,7 @@ mod tests {
         let key = KeyBundle::for_key_value(arena.borrow_mut().deref_mut(), 1,
                                            "111".as_bytes(), "a".as_bytes());
         let cmp = KeyComparator {};
-        let mut map = SkipList::new(arena, cmp);
+        let map = SkipList::new(arena, cmp);
         map.insert(&key);
     }
 
@@ -336,7 +336,7 @@ mod tests {
     fn iterate() {
         let arena = Arena::new_rc();
         let cmp = IntComparator {};
-        let mut map = SkipList::new(arena, cmp);
+        let map = SkipList::new(arena, cmp);
         map.insert(&1);
 
         let mut iter = IteratorImpl::new(&map);
@@ -354,7 +354,7 @@ mod tests {
     fn iterate_more() {
         let arena = Arena::new_rc();
         let cmp = IntComparator {};
-        let mut map = SkipList::new(arena, cmp);
+        let map = SkipList::new(arena, cmp);
         for i in 0..100 {
             map.insert(&i);
         }

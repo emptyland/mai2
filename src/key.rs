@@ -1,4 +1,4 @@
-use std::alloc::{dealloc, Layout};
+use std::alloc::Layout;
 use std::cmp::Ordering;
 use std::fmt::{Debug, Formatter};
 use std::io::Write;
@@ -189,7 +189,7 @@ impl Debug for KeyBundle {
 }
 
 impl PartialEq<Self> for KeyBundle {
-    fn eq(&self, other: &Self) -> bool {
+    fn eq(&self, _other: &Self) -> bool {
         false
     }
 }

@@ -18,6 +18,7 @@ mod iterator;
 mod config;
 mod snapshot;
 mod queue;
+mod sst;
 
 fn main() {
     println!("ok")

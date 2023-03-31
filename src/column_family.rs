@@ -1,16 +1,19 @@
-use std::{array, io};
+use std::{array, io, iter};
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::max;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::current;
 
 use crate::comparator::Comparator;
-use crate::config;
+use crate::{config, mai2};
+use crate::config::MAX_LEVEL;
 use crate::env::Env;
 use crate::key::InternalKeyComparator;
 use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME};
@@ -26,16 +29,18 @@ pub struct ColumnFamilyImpl {
     owns: Weak<RefCell<ColumnFamilySet>>,
     dropped: AtomicBool,
     pub internal_key_cmp: InternalKeyComparator,
-    initialized: bool,
+    initialized: Cell<bool>,
     background_progress: AtomicBool,
-    redo_log_number: u64,
+    pub background_result: Cell<mai2::Result<()>>,
+    pub background_cv: Condvar,
+    redo_log_number: Cell<u64>,
 
-    history: Vec<Version>,
+    history: Cell<Vec<Arc<Version>>>,
     current_version_index: usize,
 
-    compaction_points: [Vec<u8>; config::MAX_LEVEL],
+    compaction_points: Cell<Vec<Vec<u8>>>,
 
-    pub mutable: Arc<MemoryTable>,
+    mutable: Cell<Arc<MemoryTable>>,
     pub immutable_pipeline: Arc<NonBlockingQueue<Arc<MemoryTable>>>,
     // TODO:
 }
@@ -52,7 +57,7 @@ impl Debug for ColumnFamilyImpl {
 
 impl ColumnFamilyImpl {
     fn new_dummy(name: String, id: u32, options: ColumnFamilyOptions, owns: Weak<RefCell<ColumnFamilySet>>)
-                 -> Arc<RefCell<ColumnFamilyImpl>> {
+                 -> Arc<ColumnFamilyImpl> {
         let ikc = options.user_comparator.clone();
         let internal_key_cmp = InternalKeyComparator::new(ikc);
         let cfi = ColumnFamilyImpl {
@@ -62,36 +67,38 @@ impl ColumnFamilyImpl {
             owns,
             dropped: AtomicBool::from(false),
             internal_key_cmp: internal_key_cmp.clone(),
-            initialized: false,
+            initialized: Cell::new(false),
             background_progress: AtomicBool::new(false),
-            redo_log_number: 0,
-            history: Vec::new(),
+            background_result: Cell::new(Ok(())),
+            background_cv: Condvar::new(),
+            redo_log_number: Cell::new(0),
+            history: Cell::new(Vec::new()),
             current_version_index: 0,
-            mutable: MemoryTable::new_rc(internal_key_cmp.clone()),
+            mutable: Cell::new(MemoryTable::new_rc(internal_key_cmp.clone())),
             immutable_pipeline: Arc::new(NonBlockingQueue::new()),
-            compaction_points: array::from_fn(|_| Vec::new()),
+            compaction_points: Cell::new(Vec::from_iter(iter::repeat(Vec::new()).take(MAX_LEVEL))),
 
         };
-        Arc::new(RefCell::new(cfi))
+        Arc::new(cfi)
     }
 
     #[inline]
-    pub fn from(cf: &Arc<dyn ColumnFamily>) -> Arc<RefCell<Self>> {
+    pub fn from(cf: &Arc<dyn ColumnFamily>) -> Arc<Self> {
         let handle = cf.as_any().downcast_ref::<ColumnFamilyHandle>().unwrap();
         handle.core().clone()
     }
 
-    pub fn install(&mut self, env: &Arc<dyn Env>) -> io::Result<()> {
+    pub fn install(&self, env: &Arc<dyn Env>) -> io::Result<()> {
         assert!(!self.initialized());
 
         let cf_path = self.get_work_path(env);
         env.make_dir(cf_path.as_path())?;
 
-        self.initialized = true;
+        self.initialized.set(true);
         Ok(())
     }
 
-    pub fn uninstall(&mut self, env: &Arc<dyn Env>) -> io::Result<()> {
+    pub fn uninstall(&self, env: &Arc<dyn Env>) -> io::Result<()> {
         assert!(self.initialized());
         assert!(!self.background_progress());
         assert!(self.dropped());
@@ -99,14 +106,26 @@ impl ColumnFamilyImpl {
         let work_path = self.get_work_path(env);
         let owns = self.owns.upgrade().unwrap();
         env.delete_file(work_path.as_path(), true)?;
-        self.initialized = false;
+        self.initialized.set(false);
         Ok(())
     }
 
-    pub fn append(&mut self, version: Version) { self.history.push(version); }
+    pub fn make_immutable_pipeline(&self, redo_log_number: u64) {
+        let immutable = self.mutable.replace(MemoryTable::new_rc(self.internal_key_cmp.clone()));
+        immutable.associate_file_number_to(redo_log_number);
+        self.immutable_pipeline.add(immutable);
+    }
 
-    pub fn set_compaction_point(&mut self, level: usize, key: Vec<u8>) {
-        self.compaction_points[level] = key;
+    pub fn append(&self, version: Version) {
+        let mut history = self.history.take();
+        history.push(Arc::new(version));
+        self.history.set(history);
+    }
+
+    pub fn set_compaction_point(&self, level: usize, key: Vec<u8>) {
+        let mut cps = self.compaction_points.take();
+        cps[level] = key;
+        self.compaction_points.set(cps);
     }
 
     pub fn get_work_path(&self, env: &Arc<dyn Env>) -> PathBuf {
@@ -120,8 +139,11 @@ impl ColumnFamilyImpl {
         }
     }
 
-    pub fn current(&self) -> &Version {
-        self.history.get(self.current_version_index).unwrap()
+    pub fn current(&self) -> Arc<Version> {
+        let history = self.history.take();
+        let rv = history.get(self.current_version_index).unwrap().clone();
+        self.history.set(history);
+        rv
     }
 
     pub const fn id(&self) -> u32 { self.id }
@@ -132,17 +154,31 @@ impl ColumnFamilyImpl {
 
     pub fn dropped(&self) -> bool { self.dropped.load(Ordering::Acquire) }
 
-    pub fn initialized(&self) -> bool { self.initialized }
+    pub fn initialized(&self) -> bool { self.initialized.get() }
 
     pub fn background_progress(&self) -> bool { self.background_progress.load(Ordering::Relaxed) }
 
-    pub fn redo_log_number(&self) -> u64 { self.redo_log_number }
+    pub fn set_background_progress(&self, in_progress: bool) {
+        self.background_progress.store(in_progress, Ordering::Relaxed)
+    }
 
-    pub fn set_redo_log_number(&mut self, number: u64) { self.redo_log_number = number; }
+    pub fn set_background_result(&self, rs: mai2::Result<()>) {
+        self.background_result.set(rs);
+    }
+
+    pub fn redo_log_number(&self) -> u64 { self.redo_log_number.get() }
+
+    pub fn set_redo_log_number(&self, number: u64) { self.redo_log_number.set(number); }
 
     pub fn internal_key_cmp(&self) -> &dyn Comparator { &self.internal_key_cmp }
 
-    pub fn drop_it(&mut self) {
+    pub fn need_compaction(&self) -> bool { self.current().compaction_score >= 1.0 }
+
+    pub fn mutable(&self) -> &Arc<MemoryTable> {
+        unsafe {&*self.mutable.as_ptr()}
+    }
+
+    pub fn drop_it(&self) {
         assert_ne!(0, self.id(), "don't drop default column family");
         assert!(!self.dropped(), "don't drop again");
         self.dropped.store(true, Ordering::Release);
@@ -169,13 +205,13 @@ pub struct ColumnFamilyHandle {
     id: u32,
     name: String,
     mutex: Arc<Mutex<VersionSet>>,
-    core: Arc<RefCell<ColumnFamilyImpl>>,
+    core: Arc<ColumnFamilyImpl>,
 }
 
 impl ColumnFamilyHandle {
-    pub fn new(core: &Arc<RefCell<ColumnFamilyImpl>>, mutex: &Arc<Mutex<VersionSet>>) -> Arc<dyn ColumnFamily> {
-        let id = core.borrow().id();
-        let name = core.borrow().name.clone();
+    pub fn new(core: &Arc<ColumnFamilyImpl>, mutex: &Arc<Mutex<VersionSet>>) -> Arc<dyn ColumnFamily> {
+        let id = core.id();
+        let name = core.name.clone();
         Arc::new(ColumnFamilyHandle {
             db: 0 as *const u8,
             id,
@@ -185,7 +221,7 @@ impl ColumnFamilyHandle {
         })
     }
 
-    pub fn core(&self) -> &Arc<RefCell<ColumnFamilyImpl>> {
+    pub fn core(&self) -> &Arc<ColumnFamilyImpl> {
         &self.core
     }
 }
@@ -209,12 +245,12 @@ impl ColumnFamily for ColumnFamilyHandle {
 
     fn get_descriptor(&self) -> Result<ColumnFamilyDescriptor, Status> {
         let _locking = self.mutex.lock().unwrap();
-        if self.core().borrow().dropped() {
+        if self.core().dropped() {
             Err(Status::Corruption(String::from("Column family is dropped!")))
         } else {
             Ok(ColumnFamilyDescriptor {
                 name: self.name(),
-                options: self.core().borrow().options().clone(),
+                options: self.core().options().clone(),
             })
         }
     }
@@ -225,9 +261,9 @@ pub struct ColumnFamilySet {
     owns: Weak<Mutex<VersionSet>>,
     pub abs_db_path: PathBuf,
     max_column_family_id: u32,
-    default_column_family: Option<Arc<RefCell<ColumnFamilyImpl>>>,
-    pub column_families: HashMap<u32, Arc<RefCell<ColumnFamilyImpl>>>,
-    column_family_names: HashMap<String, Arc<RefCell<ColumnFamilyImpl>>>,
+    default_column_family: Option<Arc<ColumnFamilyImpl>>,
+    pub column_families: HashMap<u32, Arc<ColumnFamilyImpl>>,
+    column_family_names: HashMap<String, Arc<ColumnFamilyImpl>>,
 
 }
 
@@ -246,7 +282,7 @@ impl ColumnFamilySet {
     }
 
     // fn new_column_family_dummy(this: &Arc<RefCell<Self>>, name: String, options: ColumnFamilyOptions)
-    //     -> Arc<RefCell<ColumnFamilyImpl>> {
+    //     -> Arc<ColumnFamilyImpl> {
     //     let cf = ColumnFamilyImpl::new_dummy(name,
     //                                          this.borrow_mut().next_column_family_id(),
     //                                          options, Arc::downgrade(this));
@@ -255,16 +291,16 @@ impl ColumnFamilySet {
     // }
 
     pub fn new_column_family(this: &Arc<RefCell<Self>>, id: u32, name: String, options: ColumnFamilyOptions)
-                             -> Arc<RefCell<ColumnFamilyImpl>> {
+                             -> Arc<ColumnFamilyImpl> {
         // TODO:
         let cf = ColumnFamilyImpl::new_dummy(name, id, options, Arc::downgrade(this));
         let mut borrowed_this = this.borrow_mut();
 
-        assert!(borrowed_this.get_column_family_by_id(cf.borrow().id()).is_none());
-        borrowed_this.column_families.insert(cf.borrow().id(), cf.clone());
+        assert!(borrowed_this.get_column_family_by_id(cf.id()).is_none());
+        borrowed_this.column_families.insert(cf.id(), cf.clone());
 
-        assert!(borrowed_this.get_column_family_by_name(cf.borrow().name()).is_none());
-        borrowed_this.column_family_names.insert(cf.borrow().name().clone(), cf.clone());
+        assert!(borrowed_this.get_column_family_by_name(cf.name()).is_none());
+        borrowed_this.column_family_names.insert(cf.name().clone(), cf.clone());
 
         borrowed_this.update_max_column_family_id(id);
         if id == 0 {
@@ -273,7 +309,7 @@ impl ColumnFamilySet {
         cf
     }
 
-    pub fn default_column_family(&self) -> Arc<RefCell<ColumnFamilyImpl>> {
+    pub fn default_column_family(&self) -> Arc<ColumnFamilyImpl> {
         self.default_column_family.clone().unwrap().clone()
     }
 
@@ -291,11 +327,11 @@ impl ColumnFamilySet {
         self.column_family_names.remove(cfi.name());
     }
 
-    pub fn get_column_family_by_id(&self, id: u32) -> Option<&Arc<RefCell<ColumnFamilyImpl>>> {
+    pub fn get_column_family_by_id(&self, id: u32) -> Option<&Arc<ColumnFamilyImpl>> {
         self.column_families.get(&id)
     }
 
-    pub fn get_column_family_by_name(&self, name: &String) -> Option<&Arc<RefCell<ColumnFamilyImpl>>> {
+    pub fn get_column_family_by_name(&self, name: &String) -> Option<&Arc<ColumnFamilyImpl>> {
         self.column_family_names.get(name)
     }
 
@@ -303,7 +339,7 @@ impl ColumnFamilySet {
         self.max_column_family_id = max(self.max_column_family_id, new_id);
     }
 
-    pub fn column_family_impls(&self) -> Vec<&Arc<RefCell<ColumnFamilyImpl>>> {
+    pub fn column_family_impls(&self) -> Vec<&Arc<ColumnFamilyImpl>> {
         self.column_families.values()
             .enumerate()
             .map(|x| x.1)

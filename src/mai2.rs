@@ -51,7 +51,7 @@ pub struct ColumnFamilyOptions {
     pub user_comparator: Rc<dyn Comparator>,
     pub block_size: u64,
     pub write_buf_size: usize,
-    pub block_restart_interval: i32,
+    pub block_restart_interval: usize,
     pub dir: String,
 }
 
