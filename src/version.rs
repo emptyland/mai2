@@ -1,3 +1,6 @@
+use num_enum::TryFromPrimitive;
+use patch::CFCreation;
+use patch::FileCreation;
 use std::{array, io};
 use std::cell::RefCell;
 use std::cmp::{max, Ordering};
@@ -8,11 +11,6 @@ use std::path::{Path, PathBuf};
 use std::ptr::addr_of_mut;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-
-use num_enum::TryFromPrimitive;
-
-use patch::CFCreation;
-use patch::FileCreation;
 
 use crate::{config, files, wal};
 use crate::column_family::{ColumnFamilyImpl, ColumnFamilySet};
@@ -365,12 +363,11 @@ pub struct FileMetadata {
 }
 
 mod patch {
+    use num_enum::TryFromPrimitive;
     use std::io::Write;
     use std::mem::size_of;
     use std::slice;
     use std::sync::Arc;
-
-    use num_enum::TryFromPrimitive;
 
     use crate::marshal::Encode;
     use crate::version::FileMetadata;

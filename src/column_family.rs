@@ -11,8 +11,8 @@ use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::current;
 
-use crate::comparator::Comparator;
 use crate::{config, mai2};
+use crate::comparator::Comparator;
 use crate::config::MAX_LEVEL;
 use crate::env::Env;
 use crate::key::InternalKeyComparator;
@@ -175,7 +175,7 @@ impl ColumnFamilyImpl {
     pub fn need_compaction(&self) -> bool { self.current().compaction_score >= 1.0 }
 
     pub fn mutable(&self) -> &Arc<MemoryTable> {
-        unsafe {&*self.mutable.as_ptr()}
+        unsafe { &*self.mutable.as_ptr() }
     }
 
     pub fn drop_it(&self) {

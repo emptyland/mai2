@@ -1,5 +1,6 @@
 use std::fmt::Write;
 use std::str::FromStr;
+
 use crate::files::Kind::Unknown;
 
 const LOCK_NAME: &str = "LOCK";
@@ -47,7 +48,7 @@ pub enum Kind {
     SstTable,
     Manifest,
     Current,
-    Lock
+    Lock,
 }
 
 pub fn parse_name(name: &String) -> (Kind, u64) {
@@ -71,7 +72,7 @@ pub fn parse_name(name: &String) -> (Kind, u64) {
 fn parse_fixed_postfix_name(name: &String, kind: Kind) -> (Kind, u64) {
     if let Some((part1, _)) = name.split_once(".") {
         match u64::from_str(part1) {
-            Err(_) =>(Unknown, 0),
+            Err(_) => (Unknown, 0),
             Ok(n) => (kind, n)
         }
     } else {
@@ -83,7 +84,7 @@ fn parse_fixed_prefix_name(name: &String, prefix: &str, kind: Kind) -> (Kind, u6
     if let Some((part1, postfix)) = name.split_once("-") {
         assert_eq!(part1, prefix);
         match u64::from_str(postfix) {
-            Err(_) =>(Unknown, 0),
+            Err(_) => (Unknown, 0),
             Ok(n) => (kind, n)
         }
     } else {

@@ -2,27 +2,27 @@ use std::any::Any;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::sync::{Arc, Weak};
+
 use crate::mai2::Snapshot;
 
 pub struct SnapshotSet {
     snapshots: Cell<Vec<Arc<SnapshotImpl>>>,
-    sequence_numbers: Cell<HashSet<u64>>
+    sequence_numbers: Cell<HashSet<u64>>,
 }
 
 impl SnapshotSet {
-
     pub fn new() -> Arc<SnapshotSet> {
-        Arc::new(Self{
+        Arc::new(Self {
             snapshots: Cell::new(Vec::new()),
             sequence_numbers: Cell::new(HashSet::new()),
         })
     }
 
     pub fn new_snapshot(this: &Arc<SnapshotSet>, sequence_number: u64, ts: u64) -> Arc<dyn Snapshot> {
-        let snapshot = Arc::new(SnapshotImpl{
+        let snapshot = Arc::new(SnapshotImpl {
             sequence_number,
             ts,
-            owns: Arc::downgrade(this)
+            owns: Arc::downgrade(this),
         });
         let mut container = this.snapshots.take();
         let mut numbers = this.sequence_numbers.take();
@@ -40,7 +40,7 @@ impl SnapshotSet {
 
         let container = self.snapshots.take();
         self.snapshots.set(container.iter()
-            .filter(|x|{
+            .filter(|x| {
                 (*x).sequence_number != snapshot_impl.sequence_number
             })
             .map(|x| {
@@ -70,7 +70,7 @@ impl SnapshotSet {
 pub struct SnapshotImpl {
     pub sequence_number: u64,
     ts: u64,
-    owns: Weak<SnapshotSet>
+    owns: Weak<SnapshotSet>,
 }
 
 impl SnapshotImpl {

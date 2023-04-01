@@ -5,7 +5,7 @@ pub struct NonBlockingQueue<T> {
     queue: Mutex<VecDeque<T>>,
 }
 
-impl <T: Clone> NonBlockingQueue<T> {
+impl<T: Clone> NonBlockingQueue<T> {
     pub fn new() -> Self {
         Self {
             queue: Mutex::new(VecDeque::new())

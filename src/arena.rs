@@ -57,7 +57,7 @@ impl Allocator for Arena {
                     Some(ptr) => {
                         self.use_in_bytes += layout.size();
                         Ok(ptr)
-                    },
+                    }
                     None => {
                         self.pages = Page::new(self.pages);
                         self.rss_in_bytes += size_of::<Page>();

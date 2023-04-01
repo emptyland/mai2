@@ -1,11 +1,10 @@
+use crc::{Crc, CRC_32_ISCSI};
+use num_enum::TryFromPrimitive;
 use std::cell::RefCell;
 use std::io;
 use std::io::ErrorKind::UnexpectedEof;
 use std::rc::Rc;
 use std::sync::Arc;
-
-use crc::{Crc, CRC_32_ISCSI};
-use num_enum::TryFromPrimitive;
 
 use crate::env::{SequentialFile, WritableFile};
 use crate::marshal;
@@ -181,7 +180,7 @@ impl LogReader {
                 Ok(RecordType::Zero)
             } else {
                 Err(e)
-            }
+            };
         }
         let checksum = rs?;
         let len = self.file_reader.read_fixed_u16()? as usize;

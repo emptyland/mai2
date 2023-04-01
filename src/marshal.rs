@@ -204,7 +204,7 @@ impl FileWriter {
 
 pub struct FileReader {
     file: Rc<RefCell<dyn SequentialFile>>,
-    eof: Cell<bool>
+    eof: Cell<bool>,
 }
 
 impl FileReader {

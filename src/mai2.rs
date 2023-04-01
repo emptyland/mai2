@@ -1,6 +1,6 @@
+use std::{io, iter};
 use std::any::Any;
 use std::cell::RefCell;
-use std::{io, iter};
 use std::io::Write;
 use std::mem::size_of;
 use std::rc::Rc;
@@ -152,7 +152,7 @@ pub struct ReadOptions {
 
 #[derive(Clone, Default)]
 pub struct WriteOptions {
-    pub sync: bool
+    pub sync: bool,
 }
 
 
@@ -174,7 +174,7 @@ pub const REDO_HEADER_SIZE: usize = size_of::<u64>() + size_of::<u32>();
 #[derive(Default, Clone, Debug)]
 pub struct WriteBatch {
     redo: Vec<u8>,
-    pub number_of_ops: usize
+    pub number_of_ops: usize,
 }
 
 pub trait WriteBatchStub {
@@ -188,7 +188,7 @@ impl WriteBatch {
         buf.extend(iter::repeat(0).take(REDO_HEADER_SIZE));
         Self {
             redo: buf,
-            number_of_ops: 0
+            number_of_ops: 0,
         }
     }
 
@@ -240,15 +240,13 @@ impl WriteBatch {
                 0 => {
                     let value: Vec<u8> = decoder.read_from(buf).unwrap();
                     stub.did_insert(cf_id, key.as_slice(), value.as_slice())
-                },
+                }
                 1 => stub.did_delete(cf_id, key.as_slice()),
                 _ => unreachable!()
             }
         }
     }
 }
-
-
 
 
 pub trait DB: Send + Sync {

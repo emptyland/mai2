@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::io;
 use std::sync::Arc;
+
 use crate::env::WritableFile;
 use crate::key::InternalKeyComparator;
 use crate::marshal::FileWriter;
@@ -34,7 +35,7 @@ struct TableProperties {
     largest_key: Vec<u8>,
 }
 
-impl <'a> SSTBuilder<'a> {
+impl<'a> SSTBuilder<'a> {
     pub fn new(internal_key_cmp: &'a InternalKeyComparator, file: Arc<RefCell<dyn WritableFile>>,
                block_size: u64, n_restart: usize, approximated_n_entries: usize) -> Self {
         Self {
@@ -43,12 +44,12 @@ impl <'a> SSTBuilder<'a> {
             block_size,
             n_restart,
             approximated_n_entries,
-            has_seen_first_key:false,
-            is_last_level:false,
+            has_seen_first_key: false,
+            is_last_level: false,
             properties: Default::default(),
-            block_builder: DataBlockBuilder{},
-            index_builder: DataBlockBuilder{},
-            filter_builder: FilterBlockBuilder{},
+            block_builder: DataBlockBuilder {},
+            index_builder: DataBlockBuilder {},
+            filter_builder: FilterBlockBuilder {},
         }
     }
 

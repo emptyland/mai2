@@ -72,7 +72,7 @@ pub trait Env {
         let mut borrowed_rf = rf.borrow_mut();
         let mut buf = Vec::new();
         borrowed_rf.read_to_end(&mut buf)?;
-        return Ok(buf)
+        return Ok(buf);
     }
 
     fn read_to_string(&self, path: &Path) -> io::Result<String> {

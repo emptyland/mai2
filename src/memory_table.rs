@@ -41,7 +41,7 @@ impl MemoryTable {
             arena: arena.clone(),
             table,
             associated_file_number: Cell::new(0),
-            n_entries: AtomicUsize::new(0)
+            n_entries: AtomicUsize::new(0),
         }
     }
 
