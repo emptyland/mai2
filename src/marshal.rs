@@ -32,6 +32,14 @@ impl Encode<u64> for u64 {
     }
 }
 
+impl Encode<&[u8]> for &[u8] {
+    fn write_to(&self, buf: &mut Vec<u8>) -> usize {
+        let mut n = (self.len() as u32).write_to(buf);
+        n += buf.write(self).unwrap();
+        n
+    }
+}
+
 impl Encode<String> for String {
     fn write_to(&self, buf: &mut Vec<u8>) -> usize {
         let mut n = (self.len() as u32).write_to(buf);
@@ -177,6 +185,10 @@ impl FileWriter {
         self.write(&value.to_le_bytes())
     }
 
+    pub fn write_fixed_u64(&self, value: u64) -> io::Result<usize> {
+        self.write(&value.to_le_bytes())
+    }
+
     pub fn write_varint_u32(&self, value: u32) -> io::Result<usize> {
         let mut buf = Vec::new();
         Varint::<u32>::encode(value, &mut buf);
@@ -198,7 +210,12 @@ impl FileWriter {
     }
 
     pub fn truncate(&self, size: u64) -> io::Result<()> {
-        todo!()
+        self.file.borrow_mut().truncate(size)
+    }
+
+    pub fn file_size(&self) -> io::Result<u64> {
+        let len = self.file.borrow().get_file_size()?;
+        return Ok(len as u64)
     }
 }
 

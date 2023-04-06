@@ -599,7 +599,7 @@ impl DBImpl {
         let file_path = paths::table_file_by_cf(cfi.get_work_path(&self.env).as_path(), file_number);
         let file = self.env.new_writable_file(file_path.as_path(), false)?;
 
-        let builder = SSTBuilder::new(&cfi.internal_key_cmp, file, cfi.options().block_size,
+        let mut builder = SSTBuilder::new(&cfi.internal_key_cmp, file, cfi.options().block_size,
                                       cfi.options().block_restart_interval,
                                       memory_table.number_of_entries());
 
@@ -607,7 +607,7 @@ impl DBImpl {
         let mut largest_key = Vec::new();
         for (key, value) in MemoryTable::iter(memory_table) {
             if let Err(e) = builder.add(&key, &value) {
-                builder.abandon();
+                builder.abandon()?;
                 return Err(e);
             }
 
@@ -624,7 +624,7 @@ impl DBImpl {
             number: file_number,
             smallest_key,
             largest_key,
-            size: builder.file_size(),
+            size: builder.file_size()?,
             ctime: self.env.current_time_mills(),
         };
         patch.create_file_by_file_metadata(cfi.id(), 0, Arc::new(metadata));

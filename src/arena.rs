@@ -2,8 +2,11 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::iter;
 use std::mem::size_of;
-use std::ptr::{addr_of_mut, NonNull, slice_from_raw_parts_mut};
+use std::ptr::{addr_of_mut, NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
 use std::rc::Rc;
+
+const NORMAL_PAGE_SIZE: usize = 16 * 1024;
+const LARGE_PAGE_THRESHOLD_SIZE: usize = NORMAL_PAGE_SIZE / 2;
 
 pub trait Allocator {
     fn allocate(&mut self, layout: Layout) -> Result<NonNull<[u8]>, ()>;
@@ -11,29 +14,36 @@ pub trait Allocator {
 
 #[derive(Debug)]
 pub struct Arena {
-    pages: Option<NonNull<Page>>,
+    pages: Option<NonNull<NormalPage>>,
+    large: Option<NonNull<LargePage>>,
     pub rss_in_bytes: usize,
     pub use_in_bytes: usize,
 }
 
 #[derive(Debug)]
-struct Page {
-    next: Option<NonNull<Page>>,
+struct NormalPage {
+    next: Option<NonNull<NormalPage>>,
     free: *mut u8,
     remaining: usize,
-    chunk: [u8; 16 * 1024],
+    chunk: [u8; NORMAL_PAGE_SIZE],
+}
+
+#[derive(Debug)]
+struct LargePage {
+    next: Option<NonNull<LargePage>>,
+    size: usize,
 }
 
 impl Arena {
     pub fn new() -> Self {
-        Arena { pages: None, rss_in_bytes: 0, use_in_bytes: 0 }
+        Arena { pages: None, large: None, rss_in_bytes: 0, use_in_bytes: 0 }
     }
 
     pub fn new_rc() -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self::new()))
     }
 
-    pub fn pages_count(&self) -> i32 {
+    pub fn normal_pages_count(&self) -> i32 {
         let mut head = &self.pages;
         let mut count = 0;
         loop {
@@ -46,10 +56,25 @@ impl Arena {
             }
         }
     }
+
+    fn allocate_large(&mut self, layout: Layout) -> Result<NonNull<[u8]>, ()> {
+        self.large = unsafe { LargePage::new(self.large, layout) };
+        self.use_in_bytes += layout.size();
+        self.rss_in_bytes += layout.size() + size_of::<LargePage>();
+        let free = unsafe {
+            let chunk = self.large.unwrap().as_ptr() as *mut u8;
+            let free = round_up(chunk, layout.align() as i64);
+            NonNull::new(slice_from_raw_parts_mut(free, layout.size())).unwrap()
+        };
+        Ok(free)
+    }
 }
 
 impl Allocator for Arena {
     fn allocate(&mut self, layout: Layout) -> Result<NonNull<[u8]>, ()> {
+        if layout.size() + layout.align() > LARGE_PAGE_THRESHOLD_SIZE {
+            return self.allocate_large(layout.clone());
+        }
         match self.pages {
             Some(mut head) => unsafe {
                 let chunk = head.as_mut().allocate(layout);
@@ -59,15 +84,15 @@ impl Allocator for Arena {
                         Ok(ptr)
                     }
                     None => {
-                        self.pages = Page::new(self.pages);
-                        self.rss_in_bytes += size_of::<Page>();
+                        self.pages = NormalPage::new(self.pages);
+                        self.rss_in_bytes += size_of::<NormalPage>();
                         self.allocate(layout)
                     }
                 }
             }
             None => {
-                self.pages = Page::new(self.pages);
-                self.rss_in_bytes += size_of::<Page>();
+                self.pages = NormalPage::new(self.pages);
+                self.rss_in_bytes += size_of::<NormalPage>();
                 self.allocate(layout)
             }
         }
@@ -81,7 +106,17 @@ impl Drop for Arena {
             match head {
                 Some(page) => unsafe {
                     self.pages = page.as_ref().next;
-                    Page::free(page)
+                    NormalPage::free(page)
+                },
+                None => break
+            }
+        }
+        loop {
+            let head = self.large;
+            match head {
+                Some(page) => unsafe {
+                    self.large = page.as_ref().next;
+                    LargePage::free(page)
                 },
                 None => break
             }
@@ -89,11 +124,11 @@ impl Drop for Arena {
     }
 }
 
-impl Page {
-    pub fn new(next: Option<NonNull<Page>>) -> Option<NonNull<Page>> {
-        let layout = Layout::new::<Page>();
+impl NormalPage {
+    pub fn new(next: Option<NonNull<NormalPage>>) -> Option<NonNull<NormalPage>> {
+        let layout = Layout::new::<NormalPage>();
         unsafe {
-            let page = NonNull::new(alloc(layout) as *mut Page);
+            let page = NonNull::new(alloc(layout) as *mut NormalPage);
             if let Some(none_null) = page {
                 let mut naked_page = none_null.as_ptr();
                 (*naked_page).next = next;
@@ -104,8 +139,8 @@ impl Page {
         }
     }
 
-    pub unsafe fn free(page: NonNull<Page>) {
-        let layout = Layout::new::<Page>();
+    pub unsafe fn free(page: NonNull<NormalPage>) {
+        let layout = Layout::new::<NormalPage>();
         dealloc(page.as_ptr() as *mut u8, layout);
     }
 
@@ -120,6 +155,29 @@ impl Page {
             self.free = aligned.add(layout.size());
         }
         NonNull::new(slice_from_raw_parts_mut(aligned, layout.size()))
+    }
+}
+
+impl LargePage {
+    pub unsafe fn new(next: Option<NonNull<Self>>, payload_layout: Layout) -> Option<NonNull<Self>> {
+        let page_layout = Layout::new::<Self>();
+        let layout = Layout::from_size_align(page_layout.size() +
+                                                 payload_layout.size() +
+                                                 payload_layout.align(), page_layout.align()).unwrap();
+        let page = NonNull::new(alloc(layout) as *mut LargePage);
+        if let Some(none_null) = page {
+            let mut naked_page = none_null.as_ptr();
+            (*naked_page).next = next;
+            (*naked_page).size = layout.size();
+        }
+        page
+    }
+
+    pub unsafe fn free(page: NonNull<Self>) {
+        let page_layout = Layout::new::<Self>();
+        let layout = Layout::from_size_align(page_layout.size() +
+                                                 page.as_ref().size, page_layout.align()).unwrap();
+        dealloc(page.as_ptr() as *mut u8, layout);
     }
 }
 
@@ -181,7 +239,7 @@ mod tests {
             chunk.as_mut().write(&s).unwrap();
             assert_eq!(s, chunk.as_ref());
         }
-        assert_eq!(1, arena.pages_count());
+        assert_eq!(1, arena.normal_pages_count());
     }
 
     #[test]

@@ -110,6 +110,7 @@ pub trait WritableFile: io::Write {
     fn positioned_append(&mut self, position: u64, buf: &[u8]) -> io::Result<usize>;
     fn sync(&mut self) -> io::Result<()>;
     fn get_file_size(&self) -> io::Result<usize>;
+    fn truncate(&mut self, size: u64) -> io::Result<()>;
 }
 
 pub trait RandomAccessFile {
@@ -223,6 +224,10 @@ impl WritableFile for WritableFileImpl {
         let md = self.file.metadata()?;
         Ok(md.len() as usize)
     }
+
+    fn truncate(&mut self, size: u64) -> io::Result<()> {
+        self.file.set_len(size)
+    }
 }
 
 impl Drop for WritableFileImpl {
@@ -324,6 +329,11 @@ impl WritableFile for MemoryWritableFile {
 
     fn get_file_size(&self) -> io::Result<usize> {
         Ok(self.buf.len())
+    }
+
+    fn truncate(&mut self, size: u64) -> io::Result<()> {
+        self.buf.clear();
+        Ok(())
     }
 }
 

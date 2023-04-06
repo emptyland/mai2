@@ -15,3 +15,12 @@ pub fn max_size_for_level(level: usize) -> u64 {
     }
     size
 }
+
+pub fn round_down(x: usize, m: i64) -> usize {
+    (x as u64 & -m as u64) as usize
+}
+
+// return RoundDown<T>(static_cast<T>(x + m - 1), m);
+pub fn round_up(x: usize, m: i64) -> usize {
+    round_down((x as i64 + m - 1) as usize, m)
+}

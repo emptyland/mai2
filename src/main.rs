@@ -19,6 +19,7 @@ mod config;
 mod snapshot;
 mod queue;
 mod sst;
+mod cache;
 
 fn main() {
     println!("ok")
