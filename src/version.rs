@@ -19,7 +19,7 @@ use crate::config::max_size_for_level;
 use crate::env::{Env, WritableFile};
 use crate::key::InternalKeyComparator;
 use crate::mai2::{ColumnFamilyOptions, Options};
-use crate::marshal::{Decode, Decoder, Encode};
+use crate::marshal::{VarintDecode, Decoder, Encode};
 use crate::wal::{LogReader, LogWriter};
 
 pub struct VersionSet {

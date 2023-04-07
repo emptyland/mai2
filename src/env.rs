@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zstd::zstd_safe::WriteBuf;
 
 pub trait Env {
     fn new_sequential_file(&self, path: &Path) -> io::Result<Rc<RefCell<dyn SequentialFile>>>;
@@ -375,6 +376,28 @@ impl SequentialFile for MemorySequentialFile {
         let skipped_len = min(self.remaining(), bytes);
         self.offset += skipped_len;
         Ok(skipped_len as u64)
+    }
+
+    fn get_file_size(&self) -> io::Result<usize> {
+        Ok(self.buf.len())
+    }
+}
+
+pub struct MemoryRandomAccessFile {
+    pub buf: Vec<u8>
+}
+
+impl RandomAccessFile for MemoryRandomAccessFile {
+    fn positioned_read(&mut self, position: u64, mut buf: &mut [u8]) -> io::Result<usize> {
+        if position > self.buf.len() as u64 {
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "not enough data"))
+        } else {
+            let real_bytes = min(buf.len(), self.buf.len() - position as usize);
+            let src = &self.buf.as_slice()[position as usize..position as usize + real_bytes];
+            buf.write(src)?;
+            //
+            Ok(real_bytes)
+        }
     }
 
     fn get_file_size(&self) -> io::Result<usize> {

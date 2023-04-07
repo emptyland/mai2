@@ -1,7 +1,7 @@
 use core::slice;
 use std::cell::{Cell, Ref, RefCell};
 use std::io;
-use std::io::Write;
+use std::io::{copy, Write};
 use std::mem::size_of;
 use std::ptr::{addr_of, addr_of_mut};
 use std::rc::Rc;
@@ -56,8 +56,12 @@ impl Encode<Vec<u8>> for Vec<u8> {
     }
 }
 
-pub trait Decode<T> {
+pub trait VarintDecode<T> {
     fn read_from(&mut self, buf: &[u8]) -> io::Result<T>;
+}
+
+pub trait FixedDecode<T> {
+    fn read_fixed(&mut self, buf: &[u8]) -> io::Result<T>;
 }
 
 pub struct Decoder {
@@ -93,14 +97,14 @@ impl Decoder {
     }
 }
 
-impl Decode<u8> for Decoder {
+impl VarintDecode<u8> for Decoder {
     fn read_from(&mut self, buf: &[u8]) -> io::Result<u8> {
         let slice = self.take_slice(buf, 1)?;
         Ok(slice[0])
     }
 }
 
-impl Decode<i32> for Decoder {
+impl VarintDecode<i32> for Decoder {
     fn read_from(&mut self, buf: &[u8]) -> io::Result<i32> {
         let (rs, n) = Varint::<i32>::decode(&buf[self.offset..])?;
         self.offset += n;
@@ -108,7 +112,7 @@ impl Decode<i32> for Decoder {
     }
 }
 
-impl Decode<u32> for Decoder {
+impl VarintDecode<u32> for Decoder {
     fn read_from(&mut self, buf: &[u8]) -> io::Result<u32> {
         let (rs, n) = Varint::<u32>::decode(&buf[self.offset..])?;
         self.offset += n;
@@ -116,7 +120,16 @@ impl Decode<u32> for Decoder {
     }
 }
 
-impl Decode<i64> for Decoder {
+impl FixedDecode<u32> for Decoder {
+    fn read_fixed(&mut self, buf: &[u8]) -> io::Result<u32> {
+        let mut le_bytes: [u8;4] = [0;4];
+        let src = self.take_slice(buf, le_bytes.len())?;
+        Write::write(&mut &mut le_bytes[..], src)?;
+        Ok(u32::from_le_bytes(le_bytes))
+    }
+}
+
+impl VarintDecode<i64> for Decoder {
     fn read_from(&mut self, buf: &[u8]) -> io::Result<i64> {
         let (rs, n) = Varint::<i64>::decode(&buf[self.offset..])?;
         self.offset += n;
@@ -124,7 +137,7 @@ impl Decode<i64> for Decoder {
     }
 }
 
-impl Decode<u64> for Decoder {
+impl VarintDecode<u64> for Decoder {
     fn read_from(&mut self, buf: &[u8]) -> io::Result<u64> {
         let (rs, n) = Varint::<u64>::decode(&buf[self.offset..])?;
         self.offset += n;
@@ -132,7 +145,7 @@ impl Decode<u64> for Decoder {
     }
 }
 
-impl Decode<String> for Decoder {
+impl VarintDecode<String> for Decoder {
     fn read_from(&mut self, buf: &[u8]) -> io::Result<String> {
         let len: u32 = self.read_from(buf)?;
         let data = self.take_slice(buf, len as usize)?;
@@ -140,7 +153,7 @@ impl Decode<String> for Decoder {
     }
 }
 
-impl Decode<Vec<u8>> for Decoder {
+impl VarintDecode<Vec<u8>> for Decoder {
     fn read_from(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
         let len: u32 = self.read_from(buf)?;
         Ok(Vec::from(self.take_slice(buf, len as usize)?))
@@ -148,7 +161,7 @@ impl Decode<Vec<u8>> for Decoder {
 }
 
 pub struct FileWriter {
-    file: Arc<RefCell<dyn WritableFile>>,
+    pub file: Arc<RefCell<dyn WritableFile>>,
 }
 
 static DUMMY: [u8; 64] = [0; 64];
@@ -287,6 +300,6 @@ mod tests {
         let mut decoder = Decoder::new();
         assert_eq!(1u32, decoder.read_from(rdb).unwrap());
         assert_eq!(2u32, decoder.read_from(rdb).unwrap());
-        assert_eq!(String::from("123456"), <Decoder as Decode<String>>::read_from(&mut decoder, rdb).unwrap());
+        assert_eq!(String::from("123456"), <Decoder as VarintDecode<String>>::read_from(&mut decoder, rdb).unwrap());
     }
 }

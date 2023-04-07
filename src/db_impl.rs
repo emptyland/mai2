@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::thread::JoinHandle;
 
-use crate::{config, files, mai2, sst, wal};
+use crate::{config, files, mai2, sst_builder, wal};
 use crate::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
 use crate::comparator::Comparator;
 use crate::env::{Env, WritableFile};
@@ -20,7 +20,7 @@ use crate::key::Tag;
 use crate::mai2::*;
 use crate::memory_table::MemoryTable;
 use crate::snapshot::{SnapshotImpl, SnapshotSet};
-use crate::sst::SSTBuilder;
+use crate::sst_builder::SSTBuilder;
 use crate::status::{Corrupting, Status};
 use crate::status::Status::Corruption;
 use crate::version::{FileMetadata, Version, VersionPatch, VersionSet};

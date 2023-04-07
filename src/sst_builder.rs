@@ -12,9 +12,9 @@ use crate::arena::round_up;
 use crate::comparator::Comparator;
 use crate::config;
 
-use crate::env::WritableFile;
+use crate::env::{MemoryWritableFile, WritableFile};
 use crate::key::{InternalKey, InternalKeyComparator, KeyBundle};
-use crate::marshal::{Decode, Decoder, Encode, FileWriter};
+use crate::marshal::{VarintDecode, Decoder, Encode, FileWriter};
 
 const SST_MAGIC_NUMBER: u32 = 0x74737300;
 
@@ -63,7 +63,7 @@ impl TableProperties {
 
     pub fn marshal_to(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.push(if self.last_level {1} else {0});
+        buf.push(if self.last_level { 1 } else { 0 });
         self.block_size.write_to(&mut buf);
         self.n_entries.write_to(&mut buf);
         self.index_position.write_to(&mut buf);
@@ -105,8 +105,8 @@ impl<'a> SSTBuilder<'a> {
             has_seen_first_key: false,
             is_last_level: false,
             properties: TableProperties::new(block_size),
-            block_builder: DataBlockBuilder::default(),
-            index_builder: DataBlockBuilder::default(),
+            block_builder: DataBlockBuilder::new(n_restart as i32),
+            index_builder: DataBlockBuilder::new(n_restart as i32),
             filter_builder: FilterBlockBuilder::new(),
         }
     }
@@ -225,11 +225,15 @@ impl<'a> SSTBuilder<'a> {
 
         let checksum = digest.finalize();
         let offset = self.written_in_bytes; //self.writer
-        let handle = BlockHandle{offset, size: 4 + block.len() as u64};
+        let handle = BlockHandle { offset, size: 4 + block.len() as u64 };
         self.written_in_bytes += self.writer.write_fixed_u32(checksum)? as u64;
         self.written_in_bytes += self.writer.write_varint_u32(block.len() as u32)? as u64;
         self.written_in_bytes += self.writer.write(block)? as u64;
         Ok(handle)
+    }
+
+    fn test_owns_file(&self) -> Arc<RefCell<dyn WritableFile>> {
+        self.writer.file.clone()
     }
 }
 
@@ -263,10 +267,15 @@ struct DataBlockBuilder {
     last_key: Vec<u8>,
     n_restart: i32,
     count: i32,
-    has_finished: bool
+    has_finished: bool,
 }
 
 impl DataBlockBuilder {
+    pub fn new(n_restart: i32) -> Self {
+        let mut this = Self::default();
+        this.n_restart = n_restart;
+        this
+    }
 
     pub fn reset(&mut self) {
         self.buf.clear();
@@ -326,7 +335,7 @@ impl DataBlockBuilder {
         let n = min(input.len(), self.last_key.len());
         for i in 0..n {
             if self.last_key[i] != input[i] {
-                return i
+                return i;
             }
         }
         n
@@ -464,6 +473,10 @@ pub fn bkdr_hash(input: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+    use crate::arena::Arena;
+    use crate::comparator::BitwiseComparator;
+    use crate::env::MemoryWritableFile;
     use super::*;
 
     #[test]
@@ -473,5 +486,48 @@ mod tests {
         assert_ne!(rs_hash(input), sdbm_hash(input));
         assert_ne!(rs_hash(input), elf_hash(input));
         assert_ne!(bkdr_hash(input), elf_hash(input));
+    }
+
+    #[test]
+    fn sanity() -> io::Result<()> {
+        let internal_key_cmp = internal_key_cmp();
+        let mut builder = new_memory_builder(&internal_key_cmp, 3);
+        let mut arena = Arena::new();
+        add_keys(&mut builder,
+                 &[("a", "1"), ("b", "2"), ("c", "3"), ],
+                 1, &mut arena)?;
+        builder.finish()?;
+
+        let file = builder.test_owns_file().clone();
+        let borrowed_file = file.borrow();
+        let mem = borrowed_file.as_any().downcast_ref::<MemoryWritableFile>().unwrap();
+        assert_eq!(1145, mem.buf().len());
+        dbg!(mem.buf());
+        Ok(())
+    }
+
+    fn add_keys(builder: &mut SSTBuilder, kvs: &[(&str, &str)], sequence_number: u64, arena: &mut Arena) -> io::Result<()> {
+        let mut sn = sequence_number;
+        for (k, v) in kvs {
+            let internal_key = KeyBundle::for_key(arena, sn, k.as_bytes());
+            builder.add(internal_key.key(), v.as_bytes())?;
+            sn += 1;
+        }
+        Ok(())
+    }
+
+    fn new_memory_builder(internal_key_cmp: &InternalKeyComparator, n_entries: usize) -> SSTBuilder {
+        let file = MemoryWritableFile::new();
+
+        SSTBuilder::new(internal_key_cmp,
+                        Arc::new(RefCell::new(file)),
+                        512,
+                        4,
+                        n_entries)
+    }
+
+    fn internal_key_cmp() -> InternalKeyComparator {
+        let cmp = Rc::new(BitwiseComparator {});
+        InternalKeyComparator::new(cmp)
     }
 }
