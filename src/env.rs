@@ -387,6 +387,16 @@ pub struct MemoryRandomAccessFile {
     pub buf: Vec<u8>
 }
 
+impl MemoryRandomAccessFile {
+    pub fn new(buf: Vec<u8>) -> Self {
+        Self { buf }
+    }
+
+    pub fn new_rc(buf: Vec<u8>) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self::new(buf)))
+    }
+}
+
 impl RandomAccessFile for MemoryRandomAccessFile {
     fn positioned_read(&mut self, position: u64, mut buf: &mut [u8]) -> io::Result<usize> {
         if position > self.buf.len() as u64 {

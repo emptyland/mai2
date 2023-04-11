@@ -14,9 +14,9 @@ use crate::config;
 
 use crate::env::{MemoryWritableFile, WritableFile};
 use crate::key::{InternalKey, InternalKeyComparator, KeyBundle};
-use crate::marshal::{VarintDecode, Decoder, Encode, FileWriter};
+use crate::marshal::{VarintDecode, Decoder, VarintEncode, FileWriter, FixedEncode};
 
-const SST_MAGIC_NUMBER: u32 = 0x74737300;
+pub const SST_MAGIC_NUMBER: u32 = 0x74737300;
 
 pub struct SSTBuilder<'a> {
     internal_key_cmp: &'a InternalKeyComparator,
@@ -35,17 +35,17 @@ pub struct SSTBuilder<'a> {
 }
 
 #[derive(Clone, Debug, Default)]
-struct TableProperties {
-    last_level: bool,
-    block_size: u64,
-    n_entries: u32,
-    index_position: u64,
-    index_size: u64,
-    filter_position: u64,
-    filter_size: u64,
-    last_version: u64,
-    smallest_key: Vec<u8>,
-    largest_key: Vec<u8>,
+pub struct TableProperties {
+    pub last_level: bool,
+    pub block_size: u64,
+    pub n_entries: u32,
+    pub index_position: u64,
+    pub index_size: u64,
+    pub filter_position: u64,
+    pub filter_size: u64,
+    pub last_version: u64,
+    pub smallest_key: Vec<u8>,
+    pub largest_key: Vec<u8>,
 }
 
 impl TableProperties {
@@ -89,6 +89,14 @@ impl TableProperties {
         self.last_version = decoder.read_from(buf).unwrap();
         self.smallest_key = decoder.read_from(buf).unwrap();
         self.largest_key = decoder.read_from(buf).unwrap();
+    }
+
+    pub fn index_handle(&self) -> BlockHandle {
+        BlockHandle::new(self.index_position, self.index_size)
+    }
+
+    pub fn filter_handle(&self) -> BlockHandle {
+        BlockHandle::new(self.filter_position, self.filter_size)
     }
 }
 
@@ -232,18 +240,22 @@ impl<'a> SSTBuilder<'a> {
         Ok(handle)
     }
 
-    fn test_owns_file(&self) -> Arc<RefCell<dyn WritableFile>> {
+    pub fn test_owns_file(&self) -> Arc<RefCell<dyn WritableFile>> {
         self.writer.file.clone()
     }
 }
 
 #[derive(Debug, Default)]
-struct BlockHandle {
-    offset: u64,
-    size: u64,
+pub struct BlockHandle {
+    pub offset: u64,
+    pub size: u64,
 }
 
 impl BlockHandle {
+    pub fn new(offset: u64, size: u64) -> Self {
+        Self { offset, size }
+    }
+
     pub fn from_unmarshal(buf: &[u8]) -> Self {
         let mut decoder = Decoder::new();
         Self {
@@ -316,9 +328,9 @@ impl DataBlockBuilder {
             return None;
         }
         for offset in self.restarts.iter() {
-            (*offset).write_to(&mut self.buf);
+            (*offset).write_fixed(&mut self.buf);
         }
-        (self.restarts.len() as u32).write_to(&mut self.buf);
+        (self.restarts.len() as u32).write_fixed(&mut self.buf);
         self.has_finished = true;
         Some(replace(&mut self.buf, Default::default()))
     }
@@ -472,7 +484,7 @@ pub fn bkdr_hash(input: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::rc::Rc;
     use crate::arena::Arena;
     use crate::comparator::BitwiseComparator;
@@ -501,12 +513,12 @@ mod tests {
         let file = builder.test_owns_file().clone();
         let borrowed_file = file.borrow();
         let mem = borrowed_file.as_any().downcast_ref::<MemoryWritableFile>().unwrap();
-        assert_eq!(1145, mem.buf().len());
+        assert_eq!(1157, mem.buf().len());
         dbg!(mem.buf());
         Ok(())
     }
 
-    fn add_keys(builder: &mut SSTBuilder, kvs: &[(&str, &str)], sequence_number: u64, arena: &mut Arena) -> io::Result<()> {
+    pub fn add_keys(builder: &mut SSTBuilder, kvs: &[(&str, &str)], sequence_number: u64, arena: &mut Arena) -> io::Result<()> {
         let mut sn = sequence_number;
         for (k, v) in kvs {
             let internal_key = KeyBundle::for_key(arena, sn, k.as_bytes());
@@ -516,7 +528,7 @@ mod tests {
         Ok(())
     }
 
-    fn new_memory_builder(internal_key_cmp: &InternalKeyComparator, n_entries: usize) -> SSTBuilder {
+    pub fn new_memory_builder(internal_key_cmp: &InternalKeyComparator, n_entries: usize) -> SSTBuilder {
         let file = MemoryWritableFile::new();
 
         SSTBuilder::new(internal_key_cmp,
@@ -526,7 +538,7 @@ mod tests {
                         n_entries)
     }
 
-    fn internal_key_cmp() -> InternalKeyComparator {
+    pub fn internal_key_cmp() -> InternalKeyComparator {
         let cmp = Rc::new(BitwiseComparator {});
         InternalKeyComparator::new(cmp)
     }

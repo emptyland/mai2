@@ -13,3 +13,4 @@ Cargo.lock
 /tests/*.txt
 /tests/*.sst
 /tests/*.dat
+.idea

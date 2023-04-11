@@ -19,7 +19,7 @@ use crate::config::max_size_for_level;
 use crate::env::{Env, WritableFile};
 use crate::key::InternalKeyComparator;
 use crate::mai2::{ColumnFamilyOptions, Options};
-use crate::marshal::{VarintDecode, Decoder, Encode};
+use crate::marshal::{VarintDecode, Decoder, VarintEncode};
 use crate::wal::{LogReader, LogWriter};
 
 pub struct VersionSet {
@@ -369,7 +369,7 @@ mod patch {
     use std::slice;
     use std::sync::Arc;
 
-    use crate::marshal::Encode;
+    use crate::marshal::VarintEncode;
     use crate::version::FileMetadata;
 
     #[derive(Debug, Default, Clone)]
@@ -431,7 +431,7 @@ mod patch {
 
     pub const MAX_FIELDS: usize = Field::MaxFields as usize;
 
-    impl Encode<RedoLog> for RedoLog {
+    impl VarintEncode<RedoLog> for RedoLog {
         fn write_to(&self, buf: &mut Vec<u8>) -> usize {
             let mut size = 0;
             size += self.cf_id.write_to(buf);
@@ -440,7 +440,7 @@ mod patch {
         }
     }
 
-    impl Encode<CFCreation> for CFCreation {
+    impl VarintEncode<CFCreation> for CFCreation {
         fn write_to(&self, buf: &mut Vec<u8>) -> usize {
             let mut size = 0;
             size += self.cf_id.write_to(buf);
@@ -450,7 +450,7 @@ mod patch {
         }
     }
 
-    impl Encode<CompactionPoint> for CompactionPoint {
+    impl VarintEncode<CompactionPoint> for CompactionPoint {
         fn write_to(&self, buf: &mut Vec<u8>) -> usize {
             let mut size = 0;
             size += self.cf_id.write_to(buf);
@@ -460,7 +460,7 @@ mod patch {
         }
     }
 
-    impl Encode<FileCreation> for FileCreation {
+    impl VarintEncode<FileCreation> for FileCreation {
         fn write_to(&self, buf: &mut Vec<u8>) -> usize {
             let mut size = 0;
             size += self.cf_id.write_to(buf);
@@ -474,7 +474,7 @@ mod patch {
         }
     }
 
-    impl Encode<FileDeletion> for FileDeletion {
+    impl VarintEncode<FileDeletion> for FileDeletion {
         fn write_to(&self, buf: &mut Vec<u8>) -> usize {
             let mut size = self.cf_id.write_to(buf);
             size += self.level.write_to(buf);
@@ -483,7 +483,7 @@ mod patch {
         }
     }
 
-    impl Encode<Field> for Field {
+    impl VarintEncode<Field> for Field {
         fn write_to(&self, buf: &mut Vec<u8>) -> usize {
             buf.push(self.clone() as u8);
             size_of::<Self>()

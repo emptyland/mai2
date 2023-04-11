@@ -1,17 +1,19 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::hash::Hash;
-use std::{io, iter};
+use std::{io, iter, slice};
+use std::io::Write;
 use std::mem::{size_of, size_of_val};
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
-use std::ptr::{addr_of_mut, NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
+use std::ptr::{addr_of, addr_of_mut, NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 use crc::{Crc, CRC_32_ISCSI};
 use lru::LruCache;
 use crate::env::{Env, RandomAccessFile};
 use crate::marshal::{Decoder, FixedDecode, VarintDecode};
+use crate::sst_builder::BlockHandle;
 use crate::varint::MAX_VARINT32_LEN;
 
 pub struct TableCache {
@@ -29,7 +31,7 @@ impl BlockCache {
     pub fn new(n_stripes: usize, limit_in_bytes: usize) -> Self {
         let mut stripes = Vec::new();
         for _ in 0..n_stripes {
-            let cache = CacheShard::<(u64, u64)>::new(limit_in_bytes, 1024);
+            let cache = CacheShard::<(u64, u64)>::new(limit_in_bytes, 64);
             stripes.push(Mutex::new(cache));
         }
         Self {
@@ -38,7 +40,7 @@ impl BlockCache {
         }
     }
 
-    pub fn get(&mut self, file: &mut dyn RandomAccessFile, file_number: u64, offset: u64, checksum_verify: bool) -> io::Result<Block> {
+    pub fn get(&self, file: &mut dyn RandomAccessFile, file_number: u64, offset: u64, checksum_verify: bool) -> io::Result<Block> {
         let shard = self.get_shard(file_number);
         let mut lru = shard.lock().unwrap();
         let mut rs: Option<io::Result<Block>> = None;
@@ -52,6 +54,12 @@ impl BlockCache {
             }
         });
         if rs.is_some() { rs.unwrap() } else { Ok(block) }
+    }
+
+    pub fn invalidate(&self, file_number: u64) {
+        let shard = self.get_shard(file_number);
+        let mut lru = shard.lock().unwrap();
+        lru.lru.clear();
     }
 
     fn load_block(file: &mut dyn RandomAccessFile, offset: u64, checksum_verify: bool) -> io::Result<Block> {
@@ -78,9 +86,9 @@ impl BlockCache {
         Ok(block)
     }
 
-    pub fn get_shard(&mut self, file_number: u64) -> &Mutex<CacheShard<(u64, u64)>> {
+    pub fn get_shard(&self, file_number: u64) -> &Mutex<CacheShard<(u64, u64)>> {
         let len = self.stripes.len();
-        &mut self.stripes[file_number as usize % len]
+        &self.stripes[file_number as usize % len]
     }
 }
 
@@ -111,6 +119,17 @@ impl<T: Clone + Hash + Eq> CacheShard<T> {
     pub fn get_or_insert<F>(&mut self, key: &T, mut load: F) -> Block
         where F: FnMut() -> Block {
         self.lru.get_or_insert(key.clone(), || { load() }).clone()
+    }
+}
+
+pub struct Pinned<'a> {
+    owns: Block,
+    value: &'a [u8]
+}
+
+impl <'a> Pinned<'a> {
+    pub fn new(owns: Block, value: &'a [u8]) -> Self {
+        Self { owns, value }
     }
 }
 
@@ -193,6 +212,20 @@ impl BlockHeader {
         size_of_val(self) + self.payload().len()
     }
 
+    pub fn restarts(&self) -> &[u32] {
+        let restarts_len = {
+            let mut buf:[u8;4] = [0;4];
+            let src = &self.payload()[self.payload().len() - 4..self.payload().len()];
+            (&mut buf[..]).write(src).unwrap();
+            u32::from_le_bytes(buf)
+        } as usize;
+        unsafe {
+            let end =  addr_of!(self.payload()[self.payload().len() - 1]).add(1);
+            let restarts_addr = end.sub(4).sub(restarts_len * 4) as *const u32;
+            slice::from_raw_parts(restarts_addr, restarts_len)
+        }
+    }
+
     pub fn payload(&self) -> &[u8] {
         unsafe { self.payload.as_ref() }
     }
@@ -216,5 +249,12 @@ mod tests {
         let block = Block::new(0);
         assert_eq!(0, block.payload().len());
         assert_eq!(24, block.rss_size());
+    }
+
+    #[test]
+    fn block_cache() {
+        let cache = BlockCache::new(7, 10000);
+        assert_eq!(7, cache.stripes.len());
+        assert_eq!(10000, cache.limit_in_bytes);
     }
 }

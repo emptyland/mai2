@@ -7,32 +7,50 @@ use std::ptr::{addr_of, addr_of_mut};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::env::{SequentialFile, WritableFile};
+use crate::env::{RandomAccessFile, SequentialFile, WritableFile};
 use crate::varint::{MAX_VARINT32_LEN, Varint, zig_zag32_encode};
 
-pub trait Encode<T: Sized> {
+pub trait VarintEncode<T: Sized> {
     fn write_to(&self, buf: &mut Vec<u8>) -> usize;
 }
 
-impl Encode<i32> for i32 {
+pub trait FixedEncode<T: Sized> {
+    fn write_fixed(&self, buf: &mut Vec<u8>) -> usize;
+}
+
+impl VarintEncode<i32> for i32 {
     fn write_to(&self, buf: &mut Vec<u8>) -> usize {
         zig_zag32_encode(*self).write_to(buf)
     }
 }
 
-impl Encode<u32> for u32 {
+impl VarintEncode<u32> for u32 {
     fn write_to(&self, buf: &mut Vec<u8>) -> usize {
         Varint::<u32>::encode(*self, buf)
     }
 }
 
-impl Encode<u64> for u64 {
+impl FixedEncode<u32> for u32 {
+    fn write_fixed(&self, buf: &mut Vec<u8>) -> usize {
+        buf.write(&self.to_le_bytes()).unwrap();
+        4
+    }
+}
+
+impl VarintEncode<u64> for u64 {
     fn write_to(&self, buf: &mut Vec<u8>) -> usize {
         Varint::<u64>::encode(*self, buf)
     }
 }
 
-impl Encode<&[u8]> for &[u8] {
+impl FixedEncode<u64> for u64 {
+    fn write_fixed(&self, buf: &mut Vec<u8>) -> usize {
+        buf.write(&self.to_le_bytes()).unwrap();
+        8
+    }
+}
+
+impl VarintEncode<&[u8]> for &[u8] {
     fn write_to(&self, buf: &mut Vec<u8>) -> usize {
         let mut n = (self.len() as u32).write_to(buf);
         n += buf.write(self).unwrap();
@@ -40,7 +58,7 @@ impl Encode<&[u8]> for &[u8] {
     }
 }
 
-impl Encode<String> for String {
+impl VarintEncode<String> for String {
     fn write_to(&self, buf: &mut Vec<u8>) -> usize {
         let mut n = (self.len() as u32).write_to(buf);
         n += buf.write(self.as_bytes()).unwrap();
@@ -48,7 +66,7 @@ impl Encode<String> for String {
     }
 }
 
-impl Encode<Vec<u8>> for Vec<u8> {
+impl VarintEncode<Vec<u8>> for Vec<u8> {
     fn write_to(&self, buf: &mut Vec<u8>) -> usize {
         let mut n = (self.len() as u32).write_to(buf);
         n += buf.write(self.as_slice()).unwrap();
@@ -281,6 +299,33 @@ impl FileReader {
     }
 
     pub fn eof(&self) -> bool { self.eof.get() }
+}
+
+pub struct RandomAccessFileReader {
+    file: Rc<RefCell<dyn RandomAccessFile>>,
+
+}
+
+impl RandomAccessFileReader {
+    pub fn new(file: Rc<RefCell<dyn RandomAccessFile>>) -> Self {
+        Self { file }
+    }
+
+    pub fn read(&self, position: u64, buf: &mut [u8]) -> io::Result<usize> {
+        self.file.borrow_mut().positioned_read(position, buf)
+    }
+
+    pub fn read_fixed32(&self, position: u64) -> io::Result<u32> {
+        let mut buf: [u8;4] = [0;4];
+        self.read(position, &mut buf[..])?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    pub fn read_fixed64(&self, position: u64) -> io::Result<u64> {
+        let mut buf: [u8;8] = [0;8];
+        self.read(position, &mut buf[..])?;
+        Ok(u64::from_le_bytes(buf))
+    }
 }
 
 #[cfg(test)]

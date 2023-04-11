@@ -10,7 +10,7 @@ use crate::comparator::{BitwiseComparator, Comparator};
 use crate::config;
 use crate::env::{Env, EnvImpl};
 use crate::key::Tag;
-use crate::marshal::{VarintDecode, Decoder, Encode};
+use crate::marshal::{VarintDecode, Decoder, VarintEncode};
 use crate::status::{Corrupting, Status};
 
 pub type Result<T> = std::result::Result<T, Status>;
