@@ -1,34 +1,35 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::{io, iter};
 use std::cmp::Ordering::Equal;
+use std::ffi::c_void;
 use std::io::Write;
-use std::marker::PhantomData;
+use std::iter::Iterator;
+use std::mem::size_of_val;
 use std::ops::DerefMut;
-use std::process::id;
-use std::ptr::{addr_of, addr_of_mut, NonNull};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::thread::current;
 use crc::{Crc, CRC_32_ISCSI};
-use crate::cache::{Block, BlockCache, Pinned};
+use crate::cache::{Block, BlockCache};
 use crate::comparator::Comparator;
 use crate::env::RandomAccessFile;
-use crate::{iterator, key, mai2};
-use crate::iterator::Iterator;
-use crate::key::{InternalKey, InternalKeyComparator, Tag};
-use crate::mai2::{from_io_result, ReadOptions};
+use crate::{iterator, mai2, utils};
+use crate::iterator::{Direction, Iterator as MaiIterator};
+use crate::key::{InternalKey, InternalKeyComparator, KeyBundle, Tag};
+use crate::mai2::{from_io_result, PinnableValue, ReadOptions};
 use crate::marshal::{Decoder, RandomAccessFileReader, VarintDecode};
 use crate::sst_builder::{BlockHandle, SST_MAGIC_NUMBER, TableProperties};
 use crate::status::{Corrupting, Status};
 use crate::varint::{MAX_VARINT32_LEN, Varint};
 
 pub struct SSTReader {
+    //this: Weak<SSTReader>,
     file: Rc<RefCell<dyn RandomAccessFile>>,
     file_number: u64,
     file_size: u64,
     checksum_verify: bool,
     block_cache: Arc<BlockCache>,
     table_properties: TableProperties,
+    keys_filter: Option<KeyBloomFilter>,
     // TODO:
 }
 
@@ -42,6 +43,7 @@ impl SSTReader {
             checksum_verify,
             block_cache,
             table_properties: Default::default(),
+            keys_filter: None,
         }.prepare()
     }
 
@@ -72,12 +74,25 @@ impl SSTReader {
 
         // filter
         let filter_bits = self.read_block(self.table_properties.filter_handle())?;
+        assert_eq!(filter_bits.len() % 4, 0);
+        let mut filter_buckets = Vec::new();
+        for i in 0..filter_bits.len() / 4 {
+            let mut buf: [u8; 4] = [0; 4];
+            (&mut buf[..]).write(&filter_bits[i * 4..i * 4 + 4]).unwrap();
+            filter_buckets.push(u32::from_le_bytes(buf));
+        }
         drop(filter_bits);
+
+        self.keys_filter = Some(KeyBloomFilter::new(filter_buckets));
         Ok(self)
     }
 
-    pub fn get(&self, read_opts: &ReadOptions, internal_key_cmp: &InternalKeyComparator,
-               target: &[u8]) -> mai2::Result<(Vec<u8>, Tag)> {
+    pub fn keys_filter(&self) -> &KeyBloomFilter {
+        self.keys_filter.as_ref().unwrap()
+    }
+
+    pub fn get(&self, _read_opts: &ReadOptions, internal_key_cmp: &InternalKeyComparator,
+               target: &[u8]) -> mai2::Result<(PinnableValue, Tag)> {
         let mut index_iter = from_io_result(self.new_index_iter(internal_key_cmp))?;
         index_iter.seek(target);
         if index_iter.status() != Status::Ok {
@@ -104,7 +119,17 @@ impl SSTReader {
             .compare(internal_key.user_key, InternalKey::extract_user_key(target)) != Equal {
             Err(Status::NotFound)?;
         }
-        Ok((block_iter.value().into(), internal_key.tag))
+        let value = PinnableValue::from_block(&block_iter.block, block_iter.value());
+        Ok((value, internal_key.tag))
+    }
+
+    pub fn new_iterator(this: &Rc<Self>, read_opts: &ReadOptions,
+                        internal_key_cmp: &InternalKeyComparator) -> io::Result<IteratorImpl> {
+        let iter = IteratorImpl::new(internal_key_cmp,
+                                     this.new_index_iter(internal_key_cmp)?,
+                                     read_opts.verify_checksum,
+                                     this);
+        Ok(iter)
     }
 
     fn new_index_iter(&self, internal_key_cmp: &InternalKeyComparator) -> io::Result<BlockIterator> {
@@ -116,7 +141,7 @@ impl SSTReader {
     }
 
     fn new_block_iter(&self, internal_key_cmp: &InternalKeyComparator, handle: BlockHandle)
-        -> io::Result<BlockIterator> {
+                      -> io::Result<BlockIterator> {
         let block = self.block_cache.get(self.file.borrow_mut().deref_mut(),
                                          self.file_number,
                                          handle.offset,
@@ -158,14 +183,204 @@ impl Drop for SSTReader {
     }
 }
 
+pub struct KeyBloomFilter {
+    bits: Vec<u32>,
+    n_bits: usize,
+}
+
+impl KeyBloomFilter {
+    pub fn new(bits: Vec<u32>) -> Self {
+        let n_bits = bits.len() * 32;
+        Self {
+            bits,
+            n_bits,
+        }
+    }
+
+    pub fn may_exists(&self, key: &[u8]) -> bool {
+        for hash in utils::BLOOM_FILTER_HASHES_ORDER {
+            let h = hash(key) as usize;
+            if !self.test_bit(h % self.n_bits) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    pub fn ensure_not_exists(&self, key: &[u8]) -> bool { !self.may_exists(key) }
+
+    pub fn used_memory_in_bytes(&self) -> usize {
+        size_of_val(self) + self.bits.len() * 4
+    }
+
+    fn test_bit(&self, i: usize) -> bool {
+        self.bits[i / 32] & (1u32 << (i % 32)) != 0
+    }
+}
+
+pub struct IteratorImpl {
+    owns: Rc<SSTReader>,
+    internal_key_cmp: InternalKeyComparator,
+    index_iter: BlockIterator,
+    checksum_verify: bool,
+    block_iter: Option<BlockIterator>,
+    saved_key: Vec<u8>,
+    direction: Direction,
+    status: Status,
+}
+
+impl IteratorImpl {
+    pub fn new(internal_key_cmp: &InternalKeyComparator, index_iter: BlockIterator,
+               checksum_verify: bool, owns: &Rc<SSTReader>) -> Self {
+        Self {
+            owns: owns.clone(),
+            internal_key_cmp: internal_key_cmp.clone(),
+            index_iter,
+            checksum_verify,
+            block_iter: None,
+            saved_key: Default::default(),
+            direction: Direction::Forward,
+            status: Status::Ok,
+        }
+    }
+
+    fn seek_to_block(&mut self, handle: BlockHandle, to_first: bool) {
+        let rs = self.owns.new_block_iter(&self.internal_key_cmp, handle);
+        if let Err(e) = rs {
+            self.status = Status::corrupted(e.to_string());
+            return;
+        }
+        self.block_iter = Some(rs.unwrap());
+
+        if to_first {
+            self.block_iter_mut().seek_to_first();
+        } else {
+            self.block_iter_mut().seek_to_last();
+        }
+    }
+
+    fn save_key_if_needed(&mut self) {
+        if self.valid() && self.owns.table_properties.last_level {
+            self.saved_key = InternalKey::from_key(self.block_iter().key(), 0, Tag::Key);
+        }
+    }
+
+    fn block_iter(&self) -> &BlockIterator {
+        self.block_iter.as_ref().unwrap()
+    }
+
+    fn block_iter_mut(&mut self) -> &mut BlockIterator {
+        self.block_iter.as_mut().unwrap()
+    }
+}
+
+impl iter::Iterator for IteratorImpl {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        todo!()
+    }
+}
+
+impl iterator::Iterator for IteratorImpl {
+    fn valid(&self) -> bool {
+        self.status == Status::Ok &&
+            self.index_iter.valid() &&
+            self.block_iter.is_some() &&
+            self.block_iter().valid()
+    }
+
+    fn seek_to_first(&mut self) {
+        self.index_iter.seek_to_first();
+        self.direction = Direction::Forward;
+
+        if self.index_iter.valid() {
+            let handle = BlockHandle::from_unmarshal(self.index_iter.value());
+            self.seek_to_block(handle, true);
+        }
+        self.save_key_if_needed();
+    }
+
+    fn seek_to_last(&mut self) {
+        self.index_iter.seek_to_last();
+        self.direction = Direction::Reserve;
+
+        if self.index_iter.valid() {
+            let handle = BlockHandle::from_unmarshal(self.index_iter.value());
+            self.seek_to_block(handle, false);
+        }
+    }
+
+    fn seek(&mut self, key: &[u8]) {
+        self.direction = Direction::Forward;
+        self.index_iter.seek(key);
+        if !self.index_iter.valid() {
+            return;
+        }
+
+        let handle = BlockHandle::from_unmarshal(self.index_iter.value());
+        self.seek_to_block(handle, true);
+        if !self.block_iter().valid() {
+            self.status = Status::NotFound;
+        }
+        self.save_key_if_needed();
+    }
+
+    fn move_next(&mut self) {
+        assert!(self.valid());
+        self.direction = Direction::Forward;
+        //iterator::Iterator::next(self.block_iter_mut());
+        self.block_iter_mut().move_next();
+
+        if !self.block_iter().valid() {
+            //iterator::Iterator::next(&mut self.index_iter);
+            self.index_iter.move_next();
+            if self.index_iter.valid() {
+                let handle = BlockHandle::from_unmarshal(self.index_iter.value());
+                self.seek_to_block(handle, true);
+            }
+        }
+        self.save_key_if_needed();
+    }
+
+    fn move_prev(&mut self) {
+        assert!(self.valid());
+        self.direction = Direction::Reserve;
+        self.block_iter_mut().move_prev();
+
+        if !self.block_iter().valid() {
+            self.index_iter.move_prev();
+            if self.index_iter.valid() {
+                let handle = BlockHandle::from_unmarshal(self.index_iter.value());
+                self.seek_to_block(handle, false);
+            }
+        }
+        self.save_key_if_needed();
+    }
+
+    fn key(&self) -> &[u8] {
+        assert!(self.valid());
+        if self.owns.table_properties.last_level {
+            &self.saved_key
+        } else {
+            self.block_iter().key()
+        }
+    }
+
+    fn value(&self) -> &[u8] {
+        assert!(self.valid());
+        self.block_iter().value()
+    }
+
+    fn status(&self) -> Status { self.status.clone() }
+}
+
 pub struct BlockIterator {
     internal_key_cmp: InternalKeyComparator,
     block: Block,
     //restarts: &'a [u32],
-    current_restart: usize,
-    current_local: usize,
-    key: Vec<u8>,
-    value: Vec<u8>,
+    current_restart: isize,
+    current_local: isize,
     local: Vec<(Vec<u8>, *const [u8])>,
     status: Status,
 }
@@ -179,8 +394,6 @@ impl BlockIterator {
             //restarts,
             current_local: 0,
             current_restart: 0,
-            key: Default::default(),
-            value: Default::default(),
             local: Default::default(),
             //status: Cell::new(Status::Ok),
             status: Status::Ok,
@@ -198,7 +411,7 @@ impl BlockIterator {
         self.local.clear();
         let mut p = restarts[i] as usize;
         let end = if i == restarts.len() - 1 {
-            self.block.payload().len()
+            self.block.data().len()
         } else {
             restarts[i + 1] as usize
         };
@@ -246,8 +459,8 @@ impl iter::Iterator for BlockIterator {
 impl iterator::Iterator for BlockIterator {
     fn valid(&self) -> bool {
         return self.status == Status::Ok &&
-            self.current_restart < self.block.restarts().len() &&
-            self.current_local < self.local.len();
+            self.current_restart >= 0 && self.current_restart < self.block.restarts().len() as isize &&
+            self.current_restart >= 0 && self.current_local < self.local.len() as isize;
     }
 
     fn seek_to_first(&mut self) {
@@ -258,8 +471,8 @@ impl iterator::Iterator for BlockIterator {
 
     fn seek_to_last(&mut self) {
         self.prepare_read(self.block.restarts().len() - 1);
-        self.current_restart = self.block.restarts().len() - 1;
-        self.current_local = self.local.len() - 1;
+        self.current_restart = self.block.restarts().len() as isize - 1;
+        self.current_local = self.local.len() as isize - 1;
     }
 
     fn seek(&mut self, target: &[u8]) {
@@ -272,7 +485,7 @@ impl iterator::Iterator for BlockIterator {
 
             let rs = self.read(&[], self.restart(it));
             if let Err(e) = rs {
-                self.status = Status::corrupted(dbg!(&e).to_string());
+                self.status = Status::corrupted(e.to_string());
                 return;
             }
 
@@ -302,8 +515,8 @@ impl iterator::Iterator for BlockIterator {
 
             for idx in 0..self.local.len() {
                 if !self.internal_key_cmp.lt(&self.local[idx].0, target) {
-                    self.current_local = idx;
-                    self.current_restart = first;
+                    self.current_local = idx as isize;
+                    self.current_restart = first as isize;
                     return;
                 }
             }
@@ -311,11 +524,11 @@ impl iterator::Iterator for BlockIterator {
         self.status = Status::NotFound;
     }
 
-    fn next(&mut self) {
-        if self.current_local >= self.local.len() - 1 {
-            if self.current_restart < self.block.restarts().len() - 1 {
+    fn move_next(&mut self) {
+        if self.current_local >= self.local.len() as isize - 1 {
+            if self.current_restart < self.block.restarts().len() as isize - 1 {
                 self.current_restart += 1;
-                self.prepare_read(self.current_restart);
+                self.prepare_read(self.current_restart as usize);
             } else {
                 self.current_restart += 1;
             }
@@ -325,26 +538,26 @@ impl iterator::Iterator for BlockIterator {
         self.current_local += 1;
     }
 
-    fn prev(&mut self) {
+    fn move_prev(&mut self) {
         if self.current_local == 0 {
             if self.current_restart > 0 {
                 self.current_restart -= 1;
-                self.prepare_read(self.current_restart);
+                self.prepare_read(self.current_restart as usize);
             } else {
                 self.current_restart -= 1;
             }
-            self.current_local = self.local.len() - 1;
+            self.current_local = self.local.len() as isize - 1;
             return;
         }
         self.current_local -= 1;
     }
 
     fn key(&self) -> &[u8] {
-        &self.local[self.current_local].0
+        &self.local[self.current_local as usize].0
     }
 
     fn value(&self) -> &[u8] {
-        unsafe { &*self.local[self.current_local].1 }
+        unsafe { &*self.local[self.current_local as usize].1 }
     }
 
     fn status(&self) -> Status { self.status.clone() }
@@ -354,7 +567,6 @@ impl iterator::Iterator for BlockIterator {
 mod tests {
     use crate::arena::Arena;
     use crate::env::{MemoryRandomAccessFile, MemoryWritableFile};
-    use crate::key::KeyBundle;
     use super::*;
     use crate::sst_builder::tests::*;
 
@@ -374,11 +586,139 @@ mod tests {
 
         let rd_opts = ReadOptions::default();
         let internal_key_cmp = internal_key_cmp();
-        let mut arena = Arena::new();
-        let internal_key = KeyBundle::for_key(&mut arena,  4, "bbb".as_bytes());
-        let rv = reader.get(&rd_opts, &internal_key_cmp, internal_key.key());
+        let rv = reader.get(&rd_opts, &internal_key_cmp,
+                            &InternalKey::from_str_key("bbb", 3));
         assert!(rv.is_ok());
-        assert_eq!("2".as_bytes(), rv.unwrap().0.as_slice());
+        assert_eq!("2".as_bytes(), rv.unwrap().0.value());
+        Ok(())
+    }
+
+    #[test]
+    fn get_keys() -> io::Result<()> {
+        let chunk = build_sst_memory_chunk(&[
+            ("aaa", "1"),
+            ("bbb", "2"),
+            ("ccc", "3"),
+        ], 1)?;
+        let reader = new_sst_memory_reader(chunk)?;
+
+        let rd_opts = ReadOptions::default();
+        let internal_key_cmp = internal_key_cmp();
+
+        {
+            let key = InternalKey::from_str_key("aaa", 1);
+            let (value, tag) = reader.get(&rd_opts, &internal_key_cmp,
+                                          &key).unwrap();
+            assert_eq!("1".as_bytes(), value.value());
+            assert_eq!(Tag::Key, tag);
+        }
+
+        {
+            let key = InternalKey::from_str_key("aaa", 4);
+            let (value, tag) = reader.get(&rd_opts, &internal_key_cmp,
+                                          &key).unwrap();
+            assert_eq!("1".as_bytes(), value.value());
+            assert_eq!(Tag::Key, tag);
+        }
+
+        {
+            let key = InternalKey::from_str_key("bbb", 4);
+            let (value, tag) = reader.get(&rd_opts, &internal_key_cmp,
+                                          &key).unwrap();
+
+            assert_eq!("2".as_bytes(), value.value());
+            assert_eq!(Tag::Key, tag);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn iterate_move_next() -> io::Result<()> {
+        let chunk = build_sst_memory_chunk(&[
+            ("aaa", "1"),
+            ("bbb", "2"),
+            ("ccc", "3"),
+            ("ddd", "4"),
+            ("eee", "5"),
+        ], 1)?;
+        let reader = Rc::new(new_sst_memory_reader(chunk)?);
+        let rd_opts = ReadOptions::default();
+        let internal_key_cmp = internal_key_cmp();
+        let mut iter = SSTReader::new_iterator(&reader, &rd_opts, &internal_key_cmp)?;
+        iter.seek_to_first();
+        assert!(iter.valid());
+        assert_eq!("aaa".as_bytes(), InternalKey::extract_user_key(iter.key()));
+        assert_eq!("1".as_bytes(), iter.value());
+
+        iter.move_next();
+        assert!(iter.valid());
+        assert_eq!("bbb".as_bytes(), InternalKey::extract_user_key(iter.key()));
+        assert_eq!("2".as_bytes(), iter.value());
+
+        iter.move_next();
+        assert!(iter.valid());
+        assert_eq!("ccc".as_bytes(), InternalKey::extract_user_key(iter.key()));
+        assert_eq!("3".as_bytes(), iter.value());
+
+        iter.move_next();
+        assert!(iter.valid());
+        assert_eq!("ddd".as_bytes(), InternalKey::extract_user_key(iter.key()));
+        assert_eq!("4".as_bytes(), iter.value());
+
+        iter.move_next();
+        assert!(iter.valid());
+        assert_eq!("eee".as_bytes(), InternalKey::extract_user_key(iter.key()));
+        assert_eq!("5".as_bytes(), iter.value());
+
+        iter.move_next();
+        assert!(!iter.valid());
+
+        Ok(())
+    }
+
+    #[test]
+    fn iterate_move_prev() -> io::Result<()> {
+        let chunk = build_sst_memory_chunk(&[
+            ("aaa", "1"),
+            ("bbb", "2"),
+            ("ccc", "3"),
+        ], 1)?;
+        let reader = Rc::new(new_sst_memory_reader(chunk)?);
+        let rd_opts = ReadOptions::default();
+        let internal_key_cmp = internal_key_cmp();
+        let mut iter = SSTReader::new_iterator(&reader, &rd_opts, &internal_key_cmp)?;
+        {
+            iter.seek_to_last();
+            assert!(iter.valid());
+            let key = InternalKey::parse(iter.key());
+            assert_eq!("ccc".as_bytes(), key.user_key);
+            assert_eq!(3, key.sequence_number);
+            assert_eq!(Tag::Key, key.tag);
+            assert_eq!("3".as_bytes(), iter.value());
+        }
+
+        {
+            iter.move_prev();
+            assert!(iter.valid());
+            let key = InternalKey::parse(iter.key());
+            assert_eq!("bbb".as_bytes(), key.user_key);
+            assert_eq!(2, key.sequence_number);
+            assert_eq!(Tag::Key, key.tag);
+            assert_eq!("2".as_bytes(), iter.value());
+        }
+
+        {
+            iter.move_prev();
+            assert!(iter.valid());
+            let key = InternalKey::parse(iter.key());
+            assert_eq!("aaa".as_bytes(), key.user_key);
+            assert_eq!(1, key.sequence_number);
+            assert_eq!(Tag::Key, key.tag);
+            assert_eq!("1".as_bytes(), iter.value());
+        }
+
+        iter.move_prev();
+        assert!(!iter.valid());
         Ok(())
     }
 

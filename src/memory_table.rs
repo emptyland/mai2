@@ -70,7 +70,7 @@ impl MemoryTable {
 
     pub fn get(&self, key: &[u8], sequence_number: u64) -> mai2::Result<(&[u8], Tag)> {
         let mut chunk = ScopedMemory::new();
-        let internal_key = KeyBundle::for_key(&mut chunk, sequence_number, key);
+        let internal_key = KeyBundle::from_key(&mut chunk, sequence_number, key);
         let mut iter = skip_list::IteratorImpl::new(&self.table);
         iter.seek(&internal_key);
 
@@ -139,17 +139,17 @@ impl iterator::Iterator for IteratorImpl {
     fn seek(&mut self, key: &[u8]) {
         let unpacked_key = InternalKey::parse(key);
         let mut chunk = ScopedMemory::new();
-        let internal_key = KeyBundle::for_key(&mut chunk,
-                                              unpacked_key.sequence_number,
-                                              unpacked_key.user_key);
+        let internal_key = KeyBundle::from_key(&mut chunk,
+                                               unpacked_key.sequence_number,
+                                               unpacked_key.user_key);
         self.iter.seek(&internal_key);
     }
 
-    fn next(&mut self) {
+    fn move_next(&mut self) {
         self.iter.next();
     }
 
-    fn prev(&mut self) {
+    fn move_prev(&mut self) {
         todo!()
     }
 
@@ -176,20 +176,20 @@ mod tests {
     fn sanity() {
         let table = MemoryTable::new(default_internal_key_cmp());
 
-        table.insert("aaa".as_bytes(), "boo".as_bytes(), 1, Tag::KEY);
-        table.insert("aaa".as_bytes(), "obo".as_bytes(), 2, Tag::KEY);
-        table.insert("aaa".as_bytes(), "bbb".as_bytes(), 3, Tag::DELETION);
+        table.insert("aaa".as_bytes(), "boo".as_bytes(), 1, Tag::Key);
+        table.insert("aaa".as_bytes(), "obo".as_bytes(), 2, Tag::Key);
+        table.insert("aaa".as_bytes(), "bbb".as_bytes(), 3, Tag::Deletion);
 
         {
             let (value, tag) = table.get("aaa".as_bytes(), 1).unwrap();
             assert_eq!("boo", String::from_utf8_lossy(value));
-            assert_eq!(Tag::KEY, tag);
+            assert_eq!(Tag::Key, tag);
         }
 
         {
             let (value, tag) = table.get("aaa".as_bytes(), 2).unwrap();
             assert_eq!("obo", String::from_utf8_lossy(value));
-            assert_eq!(Tag::KEY, tag);
+            assert_eq!(Tag::Key, tag);
         }
     }
 
@@ -199,7 +199,7 @@ mod tests {
         let mut table = Rc::new(core);
 
         let rf = Rc::get_mut(&mut table).unwrap();
-        rf.insert("aaa".as_bytes(), "boo".as_bytes(), 1, Tag::KEY);
+        rf.insert("aaa".as_bytes(), "boo".as_bytes(), 1, Tag::Key);
 
         //Rc::make_mut(&mut table);
     }

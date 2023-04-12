@@ -1,16 +1,18 @@
 use std::{io, iter};
 use std::any::Any;
-use std::cell::RefCell;
 use std::io::Write;
 use std::mem::size_of;
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
+use crate::cache::Block;
 
 use crate::comparator::{BitwiseComparator, Comparator};
-use crate::config;
 use crate::env::{Env, EnvImpl};
 use crate::key::Tag;
 use crate::marshal::{VarintDecode, Decoder, VarintEncode};
+use crate::memory_table::MemoryTable;
+use crate::sst_reader::BlockIterator;
 use crate::status::{Corrupting, Status};
 
 pub type Result<T> = std::result::Result<T, Status>;
@@ -208,7 +210,7 @@ impl WriteBatch {
 
     pub fn insert(&mut self, cf: &Arc<dyn ColumnFamily>, key: &[u8], value: &[u8]) {
         cf.id().write_to(&mut self.redo);
-        self.redo.push(Tag::KEY.to_byte());
+        self.redo.push(Tag::Key.to_byte());
         (key.len() as u32).write_to(&mut self.redo);
         self.redo.write(key).unwrap();
         (value.len() as u32).write_to(&mut self.redo);
@@ -217,7 +219,7 @@ impl WriteBatch {
 
     pub fn delete(&mut self, cf: &Arc<dyn ColumnFamily>, key: &[u8]) {
         cf.id().write_to(&mut self.redo);
-        self.redo.push(Tag::DELETION.to_byte());
+        self.redo.push(Tag::Deletion.to_byte());
         (key.len() as u32).write_to(&mut self.redo);
         self.redo.write(key).unwrap();
     }
@@ -274,11 +276,59 @@ pub trait DB: Send + Sync {
     fn write(&self, options: &WriteOptions, updates: WriteBatch) -> Result<()>;
 
     fn get(&self, options: &ReadOptions, column_family: &Arc<dyn ColumnFamily>,
-           key: &[u8]) -> Result<Vec<u8>>;
+           key: &[u8]) -> Result<Vec<u8>> {
+        let value = self.get_pinnable(options, column_family, key)?;
+        Ok(value.to_vec())
+    }
+
+    fn get_pinnable(&self, options: &ReadOptions, column_family: &Arc<dyn ColumnFamily>,
+           key: &[u8]) -> Result<PinnableValue>;
 
     fn get_snapshot(&self) -> Arc<dyn Snapshot>;
 
     fn release_snapshot(&self, snapshot: Arc<dyn Snapshot>);
+}
+
+pub struct PinnableValue {
+    owns: PinnableOwnership,
+    addr: *const [u8]
+
+}
+
+enum PinnableOwnership {
+    Block(Block),
+    Table(Arc<MemoryTable>)
+}
+
+impl PinnableValue {
+
+    pub fn from_block(block: &Block, value: &[u8]) -> Self {
+        Self {
+            owns: PinnableOwnership::Block(block.clone()),
+            addr: value as *const [u8]
+        }
+    }
+
+    pub fn from_memory_table(table: &Arc<MemoryTable>, value: &[u8]) -> Self {
+        Self {
+            owns: PinnableOwnership::Table(table.clone()),
+            addr: value as *const [u8]
+        }
+    }
+
+    pub fn value(&self) -> &[u8] {
+        unsafe { &*self.addr }
+    }
+
+    pub fn to_vec(self) -> Vec<u8> {
+        self.value().into()
+    }
+}
+
+impl Into<Vec<u8>> for PinnableValue {
+    fn into(self) -> Vec<u8> {
+        self.value().into()
+    }
 }
 
 #[inline]

@@ -290,8 +290,8 @@ mod tests {
     #[test]
     fn sanity() {
         let arena = Arena::new_rc();
-        let key = KeyBundle::for_key_value(arena.borrow_mut().deref_mut(), 1,
-                                           "111".as_bytes(), "a".as_bytes());
+        let key = KeyBundle::from_key_value(arena.borrow_mut().deref_mut(), 1,
+                                            "111".as_bytes(), "a".as_bytes());
         let cmp = KeyComparator {};
         let map = SkipList::new(arena, cmp);
         map.insert(&key);
@@ -306,14 +306,14 @@ mod tests {
         for i in 0..100 {
             //let mut borrowed = arena.borrow_mut();
             let s = format!("{:03}", i);
-            let key = KeyBundle::for_key_value(arena.borrow_mut().deref_mut(), 1, s.as_bytes(), "a".as_bytes());
+            let key = KeyBundle::from_key_value(arena.borrow_mut().deref_mut(), 1, s.as_bytes(), "a".as_bytes());
             map.insert(&key);
         }
 
         let mut i = 0;
         for bundle in map.iter() {
             assert_eq!(1, bundle.sequence_number());
-            assert_eq!(Tag::KEY, bundle.tag());
+            assert_eq!(Tag::Key, bundle.tag());
 
             let s = std::str::from_utf8(bundle.user_key()).unwrap();
             let z = format!("{:03}", i);

@@ -21,6 +21,7 @@ mod queue;
 mod cache;
 mod sst_builder;
 mod sst_reader;
+mod utils;
 
 fn main() {
     println!("ok")

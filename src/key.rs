@@ -23,57 +23,57 @@ struct KeyHeader {
 #[derive(Debug)]
 #[derive(PartialEq)]
 pub enum Tag {
-    KEY,
-    DELETION,
+    Key,
+    Deletion,
 }
 
 impl Tag {
     fn to_flag(&self) -> u64 {
         match self {
-            Tag::KEY => 0,
-            Tag::DELETION => 1u64 << 63
+            Tag::Key => 0,
+            Tag::Deletion => 1u64 << 63
         }
     }
 
     pub fn to_byte(&self) -> u8 {
         match self {
-            Tag::KEY => 0,
-            Tag::DELETION => 1
+            Tag::Key => 0,
+            Tag::Deletion => 1
         }
     }
 }
 
 impl KeyBundle {
     pub fn new(arena: &mut dyn Allocator, tag: Tag, sequence_number: u64, key: &[u8], value: &[u8]) -> Self {
-        let kb = Self::for_uninitialized(arena, sequence_number, tag, key.len(), value.len());
+        let kb = Self::new_uninitialized(arena, sequence_number, tag, key.len(), value.len());
         kb.user_key_mut().write(key).unwrap();
         kb.value_mut().write(value).unwrap();
         kb
     }
 
-    pub fn for_key_value(arena: &mut dyn Allocator, sequence_number: u64, key: &[u8], value: &[u8]) -> Self {
-        let kb = Self::for_uninitialized(arena, sequence_number, Tag::KEY,
+    pub fn from_key_value(arena: &mut dyn Allocator, sequence_number: u64, key: &[u8], value: &[u8]) -> Self {
+        let kb = Self::new_uninitialized(arena, sequence_number, Tag::Key,
                                          key.len(), value.len());
         kb.user_key_mut().write(key).unwrap();
         kb.value_mut().write(value).unwrap();
         kb
     }
 
-    pub fn for_key(arena: &mut dyn Allocator, sequence_number: u64, key: &[u8]) -> Self {
-        let kb = Self::for_uninitialized(arena, sequence_number, Tag::KEY,
+    pub fn from_key(arena: &mut dyn Allocator, sequence_number: u64, key: &[u8]) -> Self {
+        let kb = Self::new_uninitialized(arena, sequence_number, Tag::Key,
                                          key.len(), 0);
         kb.user_key_mut().write(key).unwrap();
         kb
     }
 
-    pub fn for_deletion(arena: &mut dyn Allocator, sequence_number: u64, key: &[u8]) -> Self {
-        let kb = Self::for_uninitialized(arena, sequence_number, Tag::DELETION,
+    pub fn from_deletion(arena: &mut dyn Allocator, sequence_number: u64, key: &[u8]) -> Self {
+        let kb = Self::new_uninitialized(arena, sequence_number, Tag::Deletion,
                                          key.len(), 0);
         kb.user_key_mut().write(key).unwrap();
         kb
     }
 
-    fn for_uninitialized(arena: &mut dyn Allocator, sequence_number: u64, tag: Tag, user_key_size: usize, value_size: usize) -> Self {
+    fn new_uninitialized(arena: &mut dyn Allocator, sequence_number: u64, tag: Tag, user_key_size: usize, value_size: usize) -> Self {
         let mut header;
         unsafe {
             let chunk = arena.allocate(Self::build_layout(user_key_size + TAG_SIZE + value_size));
@@ -229,12 +229,24 @@ impl InternalKey<'_> {
         Self {
             sequence_number: tail & ((1u64 << 63) - 1),
             tag: if (tail & (1u64 << 63)) != 0 {
-                Tag::DELETION
+                Tag::Deletion
             } else {
-                Tag::KEY
+                Tag::Key
             },
             user_key,
         }
+    }
+
+    pub fn from_str_key(user_key: &str, sequence_number: u64) -> Vec<u8> {
+        Self::from_key(user_key.as_bytes(), sequence_number, Tag::Key)
+    }
+
+    pub fn from_key(user_key: &[u8], sequence_number: u64, tag: Tag) -> Vec<u8> {
+        let mut key = Vec::default();
+        key.append(&mut user_key.to_vec());
+        let tail = (sequence_number | tag.to_flag()).to_le_bytes();
+        key.append(&mut tail.to_vec());
+        key
     }
 
     pub fn extract_user_key(key: &[u8]) -> &[u8] { &key[..key.len() - TAG_SIZE] }
@@ -245,9 +257,9 @@ impl InternalKey<'_> {
         let tail = u64::from_le_bytes(buf);
         let sequence_number = tail & ((1u64 << 63) - 1);
         if (tail & (1u64 << 63)) != 0 {
-            (Tag::DELETION, sequence_number)
+            (Tag::Deletion, sequence_number)
         } else {
-            (Tag::KEY, sequence_number)
+            (Tag::Key, sequence_number)
         }
     }
 }
@@ -299,9 +311,9 @@ mod tests {
         let mut arena = Arena::new();
         let k = "hello";
         let v = "world";
-        let bundle = KeyBundle::for_key_value(&mut arena, 1, k.as_bytes(),
-                                              v.as_bytes());
-        assert!(matches!(bundle.tag(), Tag::KEY));
+        let bundle = KeyBundle::from_key_value(&mut arena, 1, k.as_bytes(),
+                                               v.as_bytes());
+        assert!(matches!(bundle.tag(), Tag::Key));
         assert_eq!(1, bundle.sequence_number());
         assert_eq!(k.as_bytes(), bundle.user_key());
         assert_eq!(v.as_bytes(), bundle.value());
@@ -310,27 +322,27 @@ mod tests {
     #[test]
     fn compare() {
         let mut arena = Arena::new();
-        let b1 = KeyBundle::for_key_value(&mut arena, 1, "111".as_bytes(),
-                                          "".as_bytes());
-        let b2 = KeyBundle::for_key_value(&mut arena, 2, "112".as_bytes(),
-                                          "".as_bytes());
+        let b1 = KeyBundle::from_key_value(&mut arena, 1, "111".as_bytes(),
+                                           "".as_bytes());
+        let b2 = KeyBundle::from_key_value(&mut arena, 2, "112".as_bytes(),
+                                           "".as_bytes());
         assert!(b1 < b2);
         assert!(b1 <= b2);
 
-        let b3 = KeyBundle::for_key_value(&mut arena, 1, "222".as_bytes(),
-                                          "".as_bytes());
-        let b4 = KeyBundle::for_key_value(&mut arena, 2, "222".as_bytes(),
-                                          "1".as_bytes());
+        let b3 = KeyBundle::from_key_value(&mut arena, 1, "222".as_bytes(),
+                                           "".as_bytes());
+        let b4 = KeyBundle::from_key_value(&mut arena, 2, "222".as_bytes(),
+                                           "1".as_bytes());
         assert!(b3 > b4);
     }
 
     #[test]
     fn internal_key_compare() {
         let mut arena = Arena::new();
-        let b1 = KeyBundle::for_key_value(&mut arena, 1, "111".as_bytes(),
-                                          "1".as_bytes());
-        let b2 = KeyBundle::for_key_value(&mut arena, 2, "111".as_bytes(),
-                                          "2".as_bytes());
+        let b1 = KeyBundle::from_key_value(&mut arena, 1, "111".as_bytes(),
+                                           "1".as_bytes());
+        let b2 = KeyBundle::from_key_value(&mut arena, 2, "111".as_bytes(),
+                                           "2".as_bytes());
         let user_cmp = Rc::new(BitwiseComparator {});
         let cmp = InternalKeyComparator::new(user_cmp);
         assert_eq!(Ordering::Greater, cmp.compare(b1.key(), b2.key()));

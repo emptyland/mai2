@@ -739,17 +739,17 @@ impl DB for DBImpl {
         self.write_impl(options, updates)
     }
 
-    fn get(&self, options: &ReadOptions, column_family: &Arc<dyn ColumnFamily>, key: &[u8])
-           -> mai2::Result<Vec<u8>> {
+    fn get_pinnable(&self, options: &ReadOptions, column_family: &Arc<dyn ColumnFamily>, key: &[u8])
+           -> mai2::Result<PinnableValue> {
         let get = self.prepare_for_get(options, column_family)?;
         //-------------------------------------Lock-free--------------------------------------------
         for table in &get.memory_tables {
             match table.get(key, get.last_sequence_number) {
                 Ok((value, tag)) =>
-                    return if tag == Tag::DELETION {
+                    return if tag == Tag::Deletion {
                         Err(Status::NotFound)
                     } else {
-                        Ok(value.to_vec())
+                        Ok(PinnableValue::from_memory_table(table, value))
                     },
                 Err(_) => ()
             }
@@ -843,13 +843,13 @@ impl WritingHandler {
 impl WriteBatchStub for WritingHandler {
     fn did_insert(&self, cf_id: u32, key: &[u8], value: &[u8]) {
         let table = self.get_memory_table(cf_id);
-        table.insert(key, value, self.sequence_number(), Tag::KEY);
+        table.insert(key, value, self.sequence_number(), Tag::Key);
         self.advance(key.len() + size_of::<u32>() + size_of::<u64>() + value.len());
     }
 
     fn did_delete(&self, cf_id: u32, key: &[u8]) {
         let table = self.get_memory_table(cf_id);
-        table.insert(key, "".as_bytes(), self.sequence_number(), Tag::DELETION);
+        table.insert(key, "".as_bytes(), self.sequence_number(), Tag::Deletion);
         self.advance(key.len() + size_of::<u32>() + size_of::<u64>());
     }
 }

@@ -1,19 +1,16 @@
 use std::cell::RefCell;
 use std::{io, iter, slice};
-use std::arch::x86_64::_mm_aesdeclast_si128;
 use std::cmp::min;
 use std::io::Write;
 use std::mem::{replace, size_of, size_of_val};
-use std::num::Wrapping;
 use std::ptr::{addr_of, slice_from_raw_parts};
 use std::sync::Arc;
 use crc::{Crc, CRC_32_ISCSI};
-use crate::arena::round_up;
 use crate::comparator::Comparator;
-use crate::config;
+use crate::{config, utils};
 
-use crate::env::{MemoryWritableFile, WritableFile};
-use crate::key::{InternalKey, InternalKeyComparator, KeyBundle};
+use crate::env::WritableFile;
+use crate::key::{InternalKey, InternalKeyComparator};
 use crate::marshal::{VarintDecode, Decoder, VarintEncode, FileWriter, FixedEncode};
 
 pub const SST_MAGIC_NUMBER: u32 = 0x74737300;
@@ -336,7 +333,7 @@ impl DataBlockBuilder {
     }
 
     pub fn current_size_estimate(&self) -> usize {
-        self.buf.len() + self.restarts.len() + size_of::<u32>() * 2
+        self.buf.len() + self.restarts.len() * 4 + size_of::<u32>() * 2
     }
 
     pub fn is_empty(&self) -> bool {
@@ -357,21 +354,13 @@ impl DataBlockBuilder {
 const BLOOM_FILTER_SIZE_LIMIT: usize = 10 * config::MB;
 
 struct FilterBlockBuilder {
-    pub bits: Vec<u32>,
-    hashes: [fn(&[u8]) -> u32; 5],
+    pub bits: Vec<u32>
 }
 
 impl FilterBlockBuilder {
     pub fn new() -> Self {
         Self {
-            bits: Default::default(),
-            hashes: [
-                js_hash,
-                sdbm_hash,
-                rs_hash,
-                elf_hash,
-                bkdr_hash,
-            ],
+            bits: Default::default()
         }
     }
 
@@ -388,13 +377,13 @@ impl FilterBlockBuilder {
     pub fn is_empty(&self) -> bool { self.bits.is_empty() }
 
     pub fn add_key(&mut self, key: &[u8]) {
-        for hash in self.hashes {
+        for hash in utils::BLOOM_FILTER_HASHES_ORDER {
             self.set_bit(hash(key) % self.size_in_bits());
         }
     }
 
     pub fn maybe_exists(&self, key: &[u8]) -> bool {
-        for hash in self.hashes {
+        for hash in utils::BLOOM_FILTER_HASHES_ORDER {
             if !self.test_bit(hash(key) % self.size_in_bits()) {
                 return false;
             }
@@ -431,64 +420,14 @@ impl FilterBlockBuilder {
     }
 }
 
-pub fn js_hash(input: &[u8]) -> u32 {
-    let mut hash = Wrapping(1315423911u32);
-    for b in input {
-        hash ^= (hash << 5) + Wrapping(*b as u32) + (hash >> 2);
-    }
-    hash.0
-}
-
-pub fn sdbm_hash(input: &[u8]) -> u32 {
-    let mut hash = Wrapping(0u32);
-    for item in input {
-        let c = Wrapping(*item as u32);
-        hash = Wrapping(65599) * hash + c;
-        hash = c + (hash << 6) + (hash << 16) - hash;
-    }
-    hash.0
-}
-
-pub fn rs_hash(input: &[u8]) -> u32 {
-    let mut a = Wrapping(63689);
-    let b = Wrapping(378551);
-    let mut hash = Wrapping(0);
-    for c in input {
-        hash = hash * a + Wrapping(*c as u32);
-        a *= b;
-    }
-    hash.0
-}
-
-pub fn elf_hash(input: &[u8]) -> u32 {
-    let mut hash = Wrapping(0);
-    let mut x = Wrapping(0);
-    for c in input {
-        hash = (hash << 4) + Wrapping(*c as u32);
-        x = hash & Wrapping(0xF0000000);
-        if x != Wrapping(0) {
-            hash ^= x >> 24;
-            hash &= !x;
-        }
-    }
-    hash.0
-}
-
-pub fn bkdr_hash(input: &[u8]) -> u32 {
-    let seed = Wrapping(131);
-    let mut hash = Wrapping(0);
-    for c in input {
-        hash = hash * seed + Wrapping(*c as u32);
-    }
-    hash.0
-}
-
 #[cfg(test)]
 pub mod tests {
     use std::rc::Rc;
     use crate::arena::Arena;
     use crate::comparator::BitwiseComparator;
     use crate::env::MemoryWritableFile;
+    use crate::key::KeyBundle;
+    use crate::utils::*;
     use super::*;
 
     #[test]
@@ -521,7 +460,7 @@ pub mod tests {
     pub fn add_keys(builder: &mut SSTBuilder, kvs: &[(&str, &str)], sequence_number: u64, arena: &mut Arena) -> io::Result<()> {
         let mut sn = sequence_number;
         for (k, v) in kvs {
-            let internal_key = KeyBundle::for_key(arena, sn, k.as_bytes());
+            let internal_key = KeyBundle::from_key(arena, sn, k.as_bytes());
             builder.add(internal_key.key(), v.as_bytes())?;
             sn += 1;
         }

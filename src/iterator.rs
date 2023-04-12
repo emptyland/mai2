@@ -6,11 +6,17 @@ pub trait Iterator: std::iter::Iterator {
     fn seek_to_last(&mut self);
     fn seek(&mut self, key: &[u8]);
 
-    fn next(&mut self);
-    fn prev(&mut self);
+    fn move_next(&mut self);
+    fn move_prev(&mut self);
 
     fn key(&self) -> &[u8];
     fn value(&self) -> &[u8];
 
     fn status(&self) -> Status;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Direction {
+    Forward,
+    Reserve,
 }

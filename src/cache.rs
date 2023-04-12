@@ -122,17 +122,6 @@ impl<T: Clone + Hash + Eq> CacheShard<T> {
     }
 }
 
-pub struct Pinned<'a> {
-    owns: Block,
-    value: &'a [u8]
-}
-
-impl <'a> Pinned<'a> {
-    pub fn new(owns: Block, value: &'a [u8]) -> Self {
-        Self { owns, value }
-    }
-}
-
 pub struct Block {
     naked: NonNull<BlockHeader>
 }
@@ -180,7 +169,7 @@ impl DerefMut for Block {
 
 impl Drop for Block {
     fn drop(&mut self) {
-        dbg!(self.refs.load(Ordering::Relaxed));
+        //dbg!(self.refs.load(Ordering::Relaxed));
         if self.refs.fetch_sub(1, Ordering::Relaxed) == 1 {
             unsafe { BlockHeader::free(self.naked) };
         }
@@ -224,6 +213,12 @@ impl BlockHeader {
             let restarts_addr = end.sub(4).sub(restarts_len * 4) as *const u32;
             slice::from_raw_parts(restarts_addr, restarts_len)
         }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        let restarts = self.restarts();
+        let end_pos = self.payload().len() - (restarts.len() * 4 + 4);
+        &self.payload()[..end_pos]
     }
 
     pub fn payload(&self) -> &[u8] {
