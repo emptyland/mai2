@@ -5,12 +5,12 @@ use std::mem::size_of;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
-use crate::cache::Block;
 
+use crate::cache::Block;
 use crate::comparator::{BitwiseComparator, Comparator};
 use crate::env::{Env, EnvImpl};
 use crate::key::Tag;
-use crate::marshal::{VarintDecode, Decoder, VarintEncode};
+use crate::marshal::{Decoder, VarintDecode, VarintEncode};
 use crate::memory_table::MemoryTable;
 use crate::sst_reader::BlockIterator;
 use crate::status::{Corrupting, Status};
@@ -114,7 +114,7 @@ pub struct Options {
     pub create_if_missing: bool,
     pub create_missing_column_families: bool,
     pub error_if_exists: bool,
-    pub max_open_files: u32,
+    pub max_open_files: usize,
     pub max_total_wal_size: usize,
     pub block_cache_capacity: usize,
 }
@@ -282,7 +282,7 @@ pub trait DB: Send + Sync {
     }
 
     fn get_pinnable(&self, options: &ReadOptions, column_family: &Arc<dyn ColumnFamily>,
-           key: &[u8]) -> Result<PinnableValue>;
+                    key: &[u8]) -> Result<PinnableValue>;
 
     fn get_snapshot(&self) -> Arc<dyn Snapshot>;
 
@@ -291,28 +291,26 @@ pub trait DB: Send + Sync {
 
 pub struct PinnableValue {
     owns: PinnableOwnership,
-    addr: *const [u8]
-
+    addr: *const [u8],
 }
 
 enum PinnableOwnership {
     Block(Block),
-    Table(Arc<MemoryTable>)
+    Table(Arc<MemoryTable>),
 }
 
 impl PinnableValue {
-
     pub fn from_block(block: &Block, value: &[u8]) -> Self {
         Self {
             owns: PinnableOwnership::Block(block.clone()),
-            addr: value as *const [u8]
+            addr: value as *const [u8],
         }
     }
 
     pub fn from_memory_table(table: &Arc<MemoryTable>, value: &[u8]) -> Self {
         Self {
             owns: PinnableOwnership::Table(table.clone()),
-            addr: value as *const [u8]
+            addr: value as *const [u8],
         }
     }
 

@@ -252,7 +252,7 @@ impl InternalKey<'_> {
     pub fn extract_user_key(key: &[u8]) -> &[u8] { &key[..key.len() - TAG_SIZE] }
 
     pub fn extract_tag(key: &[u8]) -> (Tag, u64) {
-        let mut buf:[u8;8] = [0;8];
+        let mut buf: [u8; 8] = [0; 8];
         (&mut buf[..]).write(&key[key.len() - TAG_SIZE..]).unwrap();
         let tail = u64::from_le_bytes(buf);
         let sequence_number = tail & ((1u64 << 63) - 1);

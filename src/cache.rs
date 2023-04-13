@@ -1,25 +1,97 @@
-use std::alloc::{alloc, dealloc, Layout};
-use std::hash::Hash;
 use std::{io, iter, slice};
+use std::alloc::{alloc, dealloc, Layout};
+use std::cell::RefCell;
+use std::fmt::Error;
+use std::hash::Hash;
 use std::io::Write;
 use std::mem::{size_of, size_of_val};
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::{addr_of, addr_of_mut, NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
+
 use crc::{Crc, CRC_32_ISCSI};
 use lru::LruCache;
+
+use crate::column_family::ColumnFamilyImpl;
 use crate::env::{Env, RandomAccessFile};
+use crate::key::Tag;
+use crate::mai2;
+use crate::mai2::{from_io_result, PinnableValue, ReadOptions};
 use crate::marshal::{Decoder, FixedDecode, VarintDecode};
-use crate::sst_builder::BlockHandle;
+use crate::sst_builder::{BlockHandle, TableProperties};
+use crate::sst_reader::{KeyBloomFilter, SSTReader};
 use crate::varint::MAX_VARINT32_LEN;
 
 pub struct TableCache {
     abs_db_path: PathBuf,
     env: Arc<dyn Env>,
-    //block_cache: BlockCache<'static>,
+    pub block_cache: Arc<BlockCache>,
+    lru: Mutex<LruCache<u64, Rc<TableEntry>>>,
+}
+
+struct TableEntry {
+    cf_id: u32,
+    file_path: PathBuf,
+    file: Rc<RefCell<dyn RandomAccessFile>>,
+    table: Arc<SSTReader>,
+}
+
+impl TableCache {
+    pub fn new(abs_db_path: &Path, env: &Arc<dyn Env>, max_open_files: usize,
+               block_cache_capacity: usize) -> Self {
+        Self {
+            abs_db_path: abs_db_path.to_path_buf(),
+            env: env.clone(),
+            block_cache: Arc::new(BlockCache::new(7, block_cache_capacity)),
+            lru: Mutex::new(LruCache::new(NonZeroUsize::new(max_open_files).unwrap())),
+        }
+    }
+
+    pub fn get(&self, read_opts: &ReadOptions, cfi: &ColumnFamilyImpl, file_number: u64, key: &[u8])
+               -> mai2::Result<(PinnableValue, Tag)> {
+        let entry = from_io_result(self.get_or_insert(cfi, file_number, 0))?;
+        entry.table.get(read_opts, &cfi.internal_key_cmp, key)
+    }
+
+    pub fn get_reader(&self, cfi: &ColumnFamilyImpl, file_number: u64) -> io::Result<Arc<SSTReader>> {
+        let entry = self.get_or_insert(cfi, file_number, 0)?;
+        Ok(entry.table.clone())
+    }
+
+    fn get_or_insert(&self, cfi: &ColumnFamilyImpl,
+                     file_number: u64,
+                     file_size: u64) -> io::Result<Rc<TableEntry>> {
+        let mut lru = self.lru.lock().unwrap();
+
+        let rv = lru.get(&file_number);
+        if let Some(entry) = rv {
+            Ok(entry.clone())
+        } else {
+            let entry = Rc::new(self.load(cfi, file_number, file_size)?);
+            lru.push(file_number, entry.clone());
+            Ok(entry)
+        }
+    }
+
+    fn load(&self, cfi: &ColumnFamilyImpl, file_number: u64, mut file_size: u64) -> io::Result<TableEntry> {
+        let file_path = cfi.get_table_file_path(&self.env, file_number);
+        let file = self.env.new_random_access_file(&file_path)?;
+        if file_size == 0 {
+            file_size = file.borrow().get_file_size()? as u64;
+        }
+        let table = SSTReader::new(file.clone(), file_number, file_size,
+                                   true, self.block_cache.clone())?;
+        Ok(TableEntry {
+            cf_id: 0,
+            file_path,
+            file,
+            table: Arc::new(table),
+        })
+    }
 }
 
 pub struct BlockCache {
@@ -123,7 +195,7 @@ impl<T: Clone + Hash + Eq> CacheShard<T> {
 }
 
 pub struct Block {
-    naked: NonNull<BlockHeader>
+    naked: NonNull<BlockHeader>,
 }
 
 impl Block {
@@ -182,7 +254,6 @@ pub struct BlockHeader {
 }
 
 impl BlockHeader {
-
     unsafe fn new(len: usize) -> NonNull<BlockHeader> {
         let chunk = alloc(Self::make_layout(len));
         let mut header = NonNull::<Self>::new(chunk as *mut Self).unwrap();
@@ -203,13 +274,13 @@ impl BlockHeader {
 
     pub fn restarts(&self) -> &[u32] {
         let restarts_len = {
-            let mut buf:[u8;4] = [0;4];
+            let mut buf: [u8; 4] = [0; 4];
             let src = &self.payload()[self.payload().len() - 4..self.payload().len()];
             (&mut buf[..]).write(src).unwrap();
             u32::from_le_bytes(buf)
         } as usize;
         unsafe {
-            let end =  addr_of!(self.payload()[self.payload().len() - 1]).add(1);
+            let end = addr_of!(self.payload()[self.payload().len() - 1]).add(1);
             let restarts_addr = end.sub(4).sub(restarts_len * 4) as *const u32;
             slice::from_raw_parts(restarts_addr, restarts_len)
         }

@@ -1,5 +1,5 @@
-use std::cell::RefCell;
 use std::{io, iter};
+use std::cell::RefCell;
 use std::cmp::Ordering::Equal;
 use std::ffi::c_void;
 use std::io::Write;
@@ -8,11 +8,13 @@ use std::mem::size_of_val;
 use std::ops::DerefMut;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+
 use crc::{Crc, CRC_32_ISCSI};
+
+use crate::{iterator, mai2, utils};
 use crate::cache::{Block, BlockCache};
 use crate::comparator::Comparator;
 use crate::env::RandomAccessFile;
-use crate::{iterator, mai2, utils};
 use crate::iterator::{Direction, Iterator as MaiIterator};
 use crate::key::{InternalKey, InternalKeyComparator, KeyBundle, Tag};
 use crate::mai2::{from_io_result, PinnableValue, ReadOptions};
@@ -28,7 +30,7 @@ pub struct SSTReader {
     file_size: u64,
     checksum_verify: bool,
     block_cache: Arc<BlockCache>,
-    table_properties: TableProperties,
+    pub table_properties: TableProperties,
     keys_filter: Option<KeyBloomFilter>,
     // TODO:
 }
@@ -93,6 +95,11 @@ impl SSTReader {
 
     pub fn get(&self, _read_opts: &ReadOptions, internal_key_cmp: &InternalKeyComparator,
                target: &[u8]) -> mai2::Result<(PinnableValue, Tag)> {
+        let user_key = InternalKey::extract_user_key(target);
+        if self.keys_filter().ensure_not_exists(user_key) {
+            return Err(Status::NotFound);
+        }
+
         let mut index_iter = from_io_result(self.new_index_iter(internal_key_cmp))?;
         index_iter.seek(target);
         if index_iter.status() != Status::Ok {
@@ -123,7 +130,7 @@ impl SSTReader {
         Ok((value, internal_key.tag))
     }
 
-    pub fn new_iterator(this: &Rc<Self>, read_opts: &ReadOptions,
+    pub fn new_iterator(this: &Arc<Self>, read_opts: &ReadOptions,
                         internal_key_cmp: &InternalKeyComparator) -> io::Result<IteratorImpl> {
         let iter = IteratorImpl::new(internal_key_cmp,
                                      this.new_index_iter(internal_key_cmp)?,
@@ -219,7 +226,7 @@ impl KeyBloomFilter {
 }
 
 pub struct IteratorImpl {
-    owns: Rc<SSTReader>,
+    owns: Arc<SSTReader>,
     internal_key_cmp: InternalKeyComparator,
     index_iter: BlockIterator,
     checksum_verify: bool,
@@ -231,7 +238,7 @@ pub struct IteratorImpl {
 
 impl IteratorImpl {
     pub fn new(internal_key_cmp: &InternalKeyComparator, index_iter: BlockIterator,
-               checksum_verify: bool, owns: &Rc<SSTReader>) -> Self {
+               checksum_verify: bool, owns: &Arc<SSTReader>) -> Self {
         Self {
             owns: owns.clone(),
             internal_key_cmp: internal_key_cmp.clone(),
@@ -567,8 +574,9 @@ impl iterator::Iterator for BlockIterator {
 mod tests {
     use crate::arena::Arena;
     use crate::env::{MemoryRandomAccessFile, MemoryWritableFile};
-    use super::*;
     use crate::sst_builder::tests::*;
+
+    use super::*;
 
     #[test]
     fn sanity() -> io::Result<()> {
@@ -641,7 +649,7 @@ mod tests {
             ("ddd", "4"),
             ("eee", "5"),
         ], 1)?;
-        let reader = Rc::new(new_sst_memory_reader(chunk)?);
+        let reader = Arc::new(new_sst_memory_reader(chunk)?);
         let rd_opts = ReadOptions::default();
         let internal_key_cmp = internal_key_cmp();
         let mut iter = SSTReader::new_iterator(&reader, &rd_opts, &internal_key_cmp)?;
@@ -683,7 +691,7 @@ mod tests {
             ("bbb", "2"),
             ("ccc", "3"),
         ], 1)?;
-        let reader = Rc::new(new_sst_memory_reader(chunk)?);
+        let reader = Arc::new(new_sst_memory_reader(chunk)?);
         let rd_opts = ReadOptions::default();
         let internal_key_cmp = internal_key_cmp();
         let mut iter = SSTReader::new_iterator(&reader, &rd_opts, &internal_key_cmp)?;

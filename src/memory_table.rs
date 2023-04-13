@@ -123,7 +123,7 @@ impl std::iter::Iterator for IteratorImpl {
     }
 }
 
-impl iterator::Iterator for IteratorImpl {
+impl Iterator for IteratorImpl {
     fn valid(&self) -> bool {
         self.iter.valid()
     }

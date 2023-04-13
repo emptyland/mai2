@@ -1,17 +1,18 @@
-use std::cell::RefCell;
 use std::{io, iter, slice};
+use std::cell::RefCell;
 use std::cmp::min;
 use std::io::Write;
 use std::mem::{replace, size_of, size_of_val};
 use std::ptr::{addr_of, slice_from_raw_parts};
 use std::sync::Arc;
-use crc::{Crc, CRC_32_ISCSI};
-use crate::comparator::Comparator;
-use crate::{config, utils};
 
+use crc::{Crc, CRC_32_ISCSI};
+
+use crate::{config, utils};
+use crate::comparator::Comparator;
 use crate::env::WritableFile;
 use crate::key::{InternalKey, InternalKeyComparator};
-use crate::marshal::{VarintDecode, Decoder, VarintEncode, FileWriter, FixedEncode};
+use crate::marshal::{Decoder, FileWriter, FixedEncode, VarintDecode, VarintEncode};
 
 pub const SST_MAGIC_NUMBER: u32 = 0x74737300;
 
@@ -171,6 +172,7 @@ impl<'a> SSTBuilder<'a> {
 
         let filter_handle = {
             let bits = self.filter_builder.finish();
+            assert!(!bits.is_empty());
             let ptr = addr_of!(bits[0]) as *const u8;
             let buf = unsafe {
                 slice::from_raw_parts(ptr, bits.len() * size_of_val(&bits[0]))
@@ -354,7 +356,7 @@ impl DataBlockBuilder {
 const BLOOM_FILTER_SIZE_LIMIT: usize = 10 * config::MB;
 
 struct FilterBlockBuilder {
-    pub bits: Vec<u32>
+    pub bits: Vec<u32>,
 }
 
 impl FilterBlockBuilder {
@@ -423,11 +425,13 @@ impl FilterBlockBuilder {
 #[cfg(test)]
 pub mod tests {
     use std::rc::Rc;
+
     use crate::arena::Arena;
     use crate::comparator::BitwiseComparator;
     use crate::env::MemoryWritableFile;
     use crate::key::KeyBundle;
     use crate::utils::*;
+
     use super::*;
 
     #[test]
@@ -453,7 +457,7 @@ pub mod tests {
         let borrowed_file = file.borrow();
         let mem = borrowed_file.as_any().downcast_ref::<MemoryWritableFile>().unwrap();
         assert_eq!(1157, mem.buf().len());
-        dbg!(mem.buf());
+        //dbg!(mem.buf());
         Ok(())
     }
 

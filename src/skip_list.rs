@@ -1,4 +1,3 @@
-use rand::prelude::*;
 use std::{cmp, ptr};
 use std::alloc::{alloc, Layout};
 use std::cell::RefCell;
@@ -7,6 +6,8 @@ use std::ops::DerefMut;
 use std::ptr::{addr_of, NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+
+use rand::prelude::*;
 
 use crate::arena::{Allocator, Arena};
 

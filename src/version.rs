@@ -1,25 +1,32 @@
-use num_enum::TryFromPrimitive;
-use patch::CFCreation;
-use patch::FileCreation;
 use std::{array, io};
 use std::cell::RefCell;
 use std::cmp::{max, Ordering};
 use std::collections::{BTreeSet, HashMap};
 use std::collections::hash_map::Iter;
 use std::fs::{File, read};
+use std::io::Read;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::ptr::addr_of_mut;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use crate::{config, files, wal};
+use num_enum::TryFromPrimitive;
+
+use patch::CFCreation;
+use patch::FileCreation;
+
+use crate::{config, files, mai2, wal};
+use crate::cache::TableCache;
 use crate::column_family::{ColumnFamilyImpl, ColumnFamilySet};
 use crate::comparator::Comparator;
 use crate::config::max_size_for_level;
 use crate::env::{Env, WritableFile};
-use crate::key::InternalKeyComparator;
-use crate::mai2::{ColumnFamilyOptions, Options};
-use crate::marshal::{VarintDecode, Decoder, VarintEncode};
+use crate::key::{InternalKey, InternalKeyComparator, Tag};
+use crate::mai2::{ColumnFamilyOptions, Options, PinnableValue, ReadOptions};
+use crate::marshal::{Decoder, VarintDecode, VarintEncode};
+use crate::status::Status;
+use crate::status::Status::NotFound;
 use crate::wal::{LogReader, LogWriter};
 
 pub struct VersionSet {
@@ -363,11 +370,12 @@ pub struct FileMetadata {
 }
 
 mod patch {
-    use num_enum::TryFromPrimitive;
     use std::io::Write;
     use std::mem::size_of;
     use std::slice;
     use std::sync::Arc;
+
+    use num_enum::TryFromPrimitive;
 
     use crate::marshal::VarintEncode;
     use crate::version::FileMetadata;
@@ -814,6 +822,55 @@ impl Version {
 
     pub fn number_of_level_files(&self, level: usize) -> usize {
         self.level_files(level).len()
+    }
+
+    pub fn get(&self, read_opts: &ReadOptions, key: &[u8], sequence_number: u64, cache: &TableCache) ->
+    mai2::Result<(PinnableValue, Tag)> {
+        let internal_key = InternalKey::from_key(key, sequence_number, Tag::Key);
+        let owns = self.owns.upgrade().unwrap();
+        let internal_key_cmp = &owns.internal_key_cmp;
+        let mut level0_files: Vec<Arc<FileMetadata>> = self.level_files(0)
+            .iter()
+            .cloned()
+            .filter(|x| {
+                internal_key_cmp.ge(&internal_key, &x.smallest_key) ||
+                    internal_key_cmp.le(&internal_key, &x.largest_key)
+            })
+            .collect();
+        level0_files.sort_by_key(|x| { x.ctime });
+        level0_files.reverse();
+
+        // Try find key in level-0 files
+        for target_file in &level0_files {
+            let rs = cache.get(read_opts, owns.deref(), target_file.number,
+                               &internal_key);
+            if let Err(status) = &rs {
+                if *status != NotFound {
+                    rs?;
+                }
+                continue;
+            }
+            return rs;
+        }
+
+        // Try find key in level-1~MAX_LEVEL files
+        for i in 1..config::MAX_LEVEL {
+            for target_file in self.level_files(i) {
+                if internal_key_cmp.ge(&internal_key, &target_file.smallest_key) &&
+                    internal_key_cmp.le(&internal_key, &target_file.largest_key) {
+                    let rs = cache.get(read_opts, owns.deref(), target_file.number,
+                                       &internal_key);
+                    if let Err(status) = &rs {
+                        if *status != NotFound {
+                            rs?;
+                        }
+                        continue;
+                    }
+                    return rs;
+                }
+            }
+        }
+        Err(Status::NotFound)
     }
 }
 

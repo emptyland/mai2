@@ -2,7 +2,7 @@ use std::{io, thread};
 use std::cell::{Cell, RefCell};
 use std::collections::btree_set::BTreeSet;
 use std::collections::HashMap;
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -11,18 +11,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::thread::JoinHandle;
 
-use crate::{config, files, mai2, sst_builder, wal};
+use crate::{config, files, mai2, wal};
+use crate::cache::TableCache;
 use crate::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
 use crate::comparator::Comparator;
 use crate::env::{Env, WritableFile};
 use crate::files::{Kind, paths};
+use crate::iterator::Iterator;
 use crate::key::Tag;
 use crate::mai2::*;
 use crate::memory_table::MemoryTable;
 use crate::snapshot::{SnapshotImpl, SnapshotSet};
 use crate::sst_builder::SSTBuilder;
 use crate::status::{Corrupting, Status};
-use crate::status::Status::Corruption;
 use crate::version::{FileMetadata, Version, VersionPatch, VersionSet};
 use crate::wal::{LogReader, LogWriter};
 
@@ -33,6 +34,7 @@ pub struct DBImpl {
     options: Options,
     env: Arc<dyn Env>,
     versions: Arc<Mutex<VersionSet>>,
+    table_cache: TableCache,
     default_column_family: Option<Arc<dyn ColumnFamily>>,
     redo_log: Cell<Option<WALDescriptor>>,
     redo_log_number: Cell<u64>,
@@ -71,7 +73,8 @@ impl DBImpl {
         let env = options.env.clone();
         let abs_db_path = DBImpl::make_abs_db_path(&options.core.dir, &name, &env)?;
         let versions = VersionSet::new(abs_db_path.clone(), &options);
-
+        let table_cache = TableCache::new(&abs_db_path, &env, options.max_open_files,
+                                          options.block_cache_capacity);
         let mut db = DBImpl {
             db_name: name.clone(),
             abs_db_path,
@@ -79,6 +82,7 @@ impl DBImpl {
             options,
             env: env.clone(),
             versions: versions.clone(),
+            table_cache,
             background_active: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             total_wal_size: AtomicU64::new(0),
@@ -517,9 +521,9 @@ impl DBImpl {
                             } else {
                                 break;
                             };
+
                             db.background_active.store(true, Ordering::Release);
                             cfi.set_background_progress(true);
-
 
                             if !db.shutting_down.load(Ordering::Acquire) {
                                 let mutex = db.versions.clone();
@@ -551,7 +555,7 @@ impl DBImpl {
         if cfi.immutable_pipeline.is_not_empty() {
             let rs = self.compact_memory_table(cfi, mutex.deref(), locking);
             if let Err(e) = rs {
-                cfi.set_background_result(Err(e));
+                cfi.set_background_result(Err(dbg!(e)));
                 return;
             }
             locking = rs.unwrap();
@@ -600,24 +604,28 @@ impl DBImpl {
         let file = self.env.new_writable_file(file_path.as_path(), false)?;
 
         let mut builder = SSTBuilder::new(&cfi.internal_key_cmp, file, cfi.options().block_size,
-                                      cfi.options().block_restart_interval,
-                                      memory_table.number_of_entries());
+                                          cfi.options().block_restart_interval,
+                                          memory_table.number_of_entries());
 
         let mut smallest_key = Vec::new();
         let mut largest_key = Vec::new();
-        for (key, value) in MemoryTable::iter(memory_table) {
-            if let Err(e) = builder.add(&key, &value) {
+        let mut iter = MemoryTable::iter(memory_table);
+        iter.seek_to_first();
+        while iter.valid() {
+            if let Err(e) = builder.add(iter.key(), iter.value()) {
                 builder.abandon()?;
                 return Err(e);
             }
 
-            if smallest_key.is_empty() || cfi.internal_key_cmp.lt(&key, &smallest_key) {
-                smallest_key = key.clone();
+            if smallest_key.is_empty() || cfi.internal_key_cmp.lt(iter.key(), &smallest_key) {
+                smallest_key = iter.key().to_vec();
             }
-            if largest_key.is_empty() || cfi.internal_key_cmp.gt(&key, &largest_key) {
-                largest_key = key.clone();
+            if largest_key.is_empty() || cfi.internal_key_cmp.gt(iter.key(), &largest_key) {
+                largest_key = iter.key().to_vec();
             }
+            iter.move_next();
         }
+
         builder.finish()?;
 
         let metadata = FileMetadata {
@@ -660,14 +668,37 @@ impl DBImpl {
         let mut memory_tables = Vec::new();
         memory_tables.push(cfi.mutable().clone());
         memory_tables.append(&mut cfi.immutable_pipeline.peek_all());
-        // TODO: get current version
 
         //------------------------------unlock version-set------------------------------------------
         Ok(Get {
             last_sequence_number,
             memory_tables,
             cfi: cfi.clone(),
+            version: cfi.current(),
         })
+    }
+
+    fn _test_force_dump_immutable_table(&self, cf: &Arc<dyn ColumnFamily>, sync: bool) -> Result<()> {
+        let cfi = ColumnFamilyImpl::from(cf);
+        let mutex = self.versions.clone();
+        {
+            let mut versions = mutex.lock().unwrap();
+            assert_eq!(0, versions.prev_log_number);
+            self.renew_log_file(&mut versions)?;
+
+            let mut patch = VersionPatch::default();
+            patch.set_redo_log_number(self.redo_log_number.get());
+            from_io_result(versions.log_and_apply(self.options.core.clone(), patch))?;
+
+            cfi.make_immutable_pipeline(self.redo_log_number.get());
+            self.maybe_schedule_compacting(&cfi, &versions);
+        }
+
+        if sync {
+            let lock = mutex.lock().unwrap();
+            let _unused = cfi.background_cv.wait(lock).unwrap();
+        }
+        Ok(())
     }
 }
 
@@ -740,7 +771,7 @@ impl DB for DBImpl {
     }
 
     fn get_pinnable(&self, options: &ReadOptions, column_family: &Arc<dyn ColumnFamily>, key: &[u8])
-           -> mai2::Result<PinnableValue> {
+                    -> mai2::Result<PinnableValue> {
         let get = self.prepare_for_get(options, column_family)?;
         //-------------------------------------Lock-free--------------------------------------------
         for table in &get.memory_tables {
@@ -755,7 +786,14 @@ impl DB for DBImpl {
             }
         }
 
-        Err(Status::NotFound)
+        match get.version.get(options, key, get.last_sequence_number, &self.table_cache) {
+            Err(e) => Err(e),
+            Ok((value, tag)) => if tag == Tag::Deletion {
+                Err(Status::NotFound)
+            } else {
+                Ok(value)
+            }
+        }
     }
 
     fn get_snapshot(&self) -> Arc<dyn Snapshot> {
@@ -858,7 +896,7 @@ struct Get {
     memory_tables: Vec<Arc<MemoryTable>>,
     last_sequence_number: u64,
     cfi: Arc<ColumnFamilyImpl>,
-    //version: Arc<Version>,
+    version: Arc<Version>,
 }
 
 #[cfg(test)]
@@ -1034,20 +1072,51 @@ mod tests {
             assert!(maybe_cf0.is_some());
             let cf1 = maybe_cf0.unwrap();
 
-            check_key_value_pairs(&db, &cf0,
-                                  &vec!["1111", "3333", "4444"],
-                                  &vec!["a", "b", "c"])?;
-            check_key_value_pairs(&db, &cf1, &vec!["2222"], &vec!["cc"])?;
+            check_key_value_pairs(&db, &cf0, &[("1111", "a"), ("3333", "b"), ("4444", "c")])?;
+            check_key_value_pairs(&db, &cf1, &[("2222", "cc")])?;
+            //check_key_value_pairs(&db, &cf1, &[("2222, "")])?;
         }
         Ok(())
     }
 
-    fn check_key_value_pairs(db: &Arc<DBImpl>, cf: &Arc<dyn ColumnFamily>, keys: &[&str], values: &[&str]) -> Result<()> {
-        assert_eq!(keys.len(), values.len());
+    #[test]
+    fn dump_level0_sst() -> Result<()> {
+        let pairs = [
+            ("1111", "a"),
+            ("3333", "b"),
+            ("4444", "c"),
+            ("2222", "cc"),
+        ];
+        let _junk = JunkFilesCleaner::new("tests/db6");
+        let db = open_test_db("db6")?;
+        let cf0 = db.default_column_family();
+
+        insert_key_value_pairs(&db, &cf0, &pairs)?;
+
+        db._test_force_dump_immutable_table(&cf0, true)?;
+
         let rd_opts = ReadOptions::default();
-        for i in 0..keys.len() {
-            let v = db.get(&rd_opts, &cf, keys[i].as_bytes())?;
-            assert_eq!(values[i].as_bytes(), v.as_slice());
+        let value = db.get(&rd_opts, &cf0, "1111".as_bytes())?;
+        assert_eq!("a".as_bytes(), value);
+
+        check_key_value_pairs(&db, &cf0, &pairs)?;
+
+        Ok(())
+    }
+
+    fn insert_key_value_pairs(db: &Arc<DBImpl>, cf: &Arc<dyn ColumnFamily>, pairs: &[(&str, &str)]) -> Result<()> {
+        let wr_opts = WriteOptions::default();
+        for (key, value) in pairs {
+            db.insert(&wr_opts, &cf, key.as_bytes(), value.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn check_key_value_pairs(db: &Arc<DBImpl>, cf: &Arc<dyn ColumnFamily>, pairs: &[(&str, &str)]) -> Result<()> {
+        let rd_opts = ReadOptions::default();
+        for (key, value) in pairs {
+            let v = db.get(&rd_opts, &cf, key.as_bytes())?;
+            assert_eq!(value.as_bytes(), v.as_slice());
         }
         Ok(())
     }

@@ -1,5 +1,4 @@
 use std::{env, fs, io};
-use std::alloc::System;
 use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::min;
@@ -9,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use zstd::zstd_safe::WriteBuf;
 
 pub trait Env {
     fn new_sequential_file(&self, path: &Path) -> io::Result<Rc<RefCell<dyn SequentialFile>>>;
@@ -384,7 +382,7 @@ impl SequentialFile for MemorySequentialFile {
 }
 
 pub struct MemoryRandomAccessFile {
-    pub buf: Vec<u8>
+    pub buf: Vec<u8>,
 }
 
 impl MemoryRandomAccessFile {

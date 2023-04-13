@@ -140,7 +140,7 @@ impl VarintDecode<u32> for Decoder {
 
 impl FixedDecode<u32> for Decoder {
     fn read_fixed(&mut self, buf: &[u8]) -> io::Result<u32> {
-        let mut le_bytes: [u8;4] = [0;4];
+        let mut le_bytes: [u8; 4] = [0; 4];
         let src = self.take_slice(buf, le_bytes.len())?;
         Write::write(&mut &mut le_bytes[..], src)?;
         Ok(u32::from_le_bytes(le_bytes))
@@ -246,7 +246,7 @@ impl FileWriter {
 
     pub fn file_size(&self) -> io::Result<u64> {
         let len = self.file.borrow().get_file_size()?;
-        return Ok(len as u64)
+        return Ok(len as u64);
     }
 }
 
@@ -316,13 +316,13 @@ impl RandomAccessFileReader {
     }
 
     pub fn read_fixed32(&self, position: u64) -> io::Result<u32> {
-        let mut buf: [u8;4] = [0;4];
+        let mut buf: [u8; 4] = [0; 4];
         self.read(position, &mut buf[..])?;
         Ok(u32::from_le_bytes(buf))
     }
 
     pub fn read_fixed64(&self, position: u64) -> io::Result<u64> {
-        let mut buf: [u8;8] = [0;8];
+        let mut buf: [u8; 8] = [0; 8];
         self.read(position, &mut buf[..])?;
         Ok(u64::from_le_bytes(buf))
     }
