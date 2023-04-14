@@ -5,6 +5,8 @@ use std::mem::size_of;
 use std::ptr::{addr_of_mut, NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
 use std::rc::Rc;
 
+use crate::utils::round_up;
+
 const NORMAL_PAGE_SIZE: usize = 16 * 1024;
 const LARGE_PAGE_THRESHOLD_SIZE: usize = NORMAL_PAGE_SIZE / 2;
 
@@ -61,7 +63,7 @@ impl Arena {
         self.large = unsafe { LargePage::new(self.large, layout) };
         self.use_in_bytes += layout.size();
         self.rss_in_bytes += layout.size() + size_of::<LargePage>();
-        let free = unsafe {
+        let free = {
             let chunk = self.large.unwrap().as_ptr() as *mut u8;
             let free = round_up(chunk, layout.align() as i64);
             NonNull::new(slice_from_raw_parts_mut(free, layout.size())).unwrap()
@@ -153,7 +155,12 @@ impl NormalPage {
         }
         unsafe {
             self.free = aligned.add(layout.size());
+
+            let base = self as *mut Self as *mut u8;
+            let limit = base.add(size_of::<Self>());
+            assert!(self.free > base && self.free <= limit);
         }
+        self.remaining -= layout.size() + padding_size;
         NonNull::new(slice_from_raw_parts_mut(aligned, layout.size()))
     }
 }
@@ -211,15 +218,6 @@ impl Allocator for ScopedMemory {
             None => Err(())
         }
     }
-}
-
-pub fn round_down<T>(x: *mut T, m: i64) -> *mut T {
-    (x as u64 & -m as u64) as *mut T
-}
-
-// return RoundDown<T>(static_cast<T>(x + m - 1), m);
-pub fn round_up<T>(x: *mut T, m: i64) -> *mut T {
-    round_down((x as i64 + m - 1) as *mut T, m)
 }
 
 

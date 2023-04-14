@@ -1,3 +1,4 @@
+use std::{cmp, slice};
 use std::alloc::Layout;
 use std::cell::RefCell;
 use std::io::Write;
@@ -5,9 +6,10 @@ use std::mem::size_of;
 use std::ops::DerefMut;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::{cmp, slice};
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+
 use rand::random;
+
 use crate::arena::{Allocator, Arena};
 use crate::key::{InternalKey, Tag, TAG_SIZE};
 use crate::skip_list::{BRANCHING, Comparing, MAX_HEIGHT};
@@ -199,6 +201,7 @@ impl<'a> InlineNode<'a> {
         let next_len_in_bytes = size_of::<AtomicPtr<Self>>() * height;
         let layout = Self::layout(next_len_in_bytes + payload_len);
         let chunk = arena.allocate(layout).unwrap();
+        assert_eq!(layout.size(), chunk.as_ref().len());
         let mut node = NonNull::new(chunk.as_ptr() as *mut Self).unwrap();
         node.as_mut().height = height;
         assert!(key_len <= payload_len);
@@ -280,9 +283,9 @@ impl<'a> InlineNode<'a> {
         slice::from_raw_parts_mut(payload_addr, Self::internal_key(this).len())
     }
 
-    fn layout(payload_len: usize) -> Layout {
+    fn layout(total_len: usize) -> Layout {
         let header_layout = Layout::new::<Self>();
-        Layout::from_size_align(header_layout.size() + payload_len, header_layout.align()).unwrap()
+        Layout::from_size_align(header_layout.size() + total_len, header_layout.align()).unwrap()
     }
 }
 
@@ -312,7 +315,7 @@ impl<'a, Cmp: for<'b> Comparing<&'b [u8]>> IteratorImpl<'a, Cmp> {
         }
     }
 
-    pub fn value(&self) -> Option<&[u8]> {
+    pub fn value(&self) -> Option<&'a [u8]> {
         match self.node {
             Some(node_ptr) => {
                 Some(InlineNode::value(node_ptr.as_ptr()))
@@ -371,8 +374,10 @@ impl<'a, Cmp: for<'b> Comparing<&'b [u8]>> Iterator for IteratorImpl<'a, Cmp> {
 #[cfg(test)]
 mod tests {
     use std::ptr::addr_of;
+
     use crate::comparator::{BitwiseComparator, Comparator};
     use crate::key::{InternalKey, InternalKeyComparator};
+
     use super::*;
 
     struct KeyComparator {
@@ -424,6 +429,30 @@ mod tests {
         for (key, value) in pairs {
             let internal_key = InternalKey::from_key(key.as_bytes(), 5, Tag::Key);
             iter.seek(&internal_key);
+            assert!(iter.valid());
+            assert_eq!(value.as_bytes(), iter.value().unwrap());
+        }
+    }
+
+    #[test]
+    fn large_insertion() {
+        let n = 10000;
+        let arena = Arena::new_rc();
+        let map = InlineSkipList::new(arena, new_key_cmp());
+
+        let mut sn = 1;
+        for i in 0..n {
+            let key = format!("{}", i);
+            let value = format!("v:{}", key);
+            map.insert_key_value(sn, key.as_bytes(), value.as_bytes());
+            sn += 1
+        }
+
+        let mut iter = map.iter();
+        for i in 0..n {
+            let key = format!("{}", i);
+            let value = format!("v:{}", key);
+            iter.seek(&InternalKey::from_key(key.as_bytes(), sn, Tag::Key));
             assert!(iter.valid());
             assert_eq!(value.as_bytes(), iter.value().unwrap());
         }

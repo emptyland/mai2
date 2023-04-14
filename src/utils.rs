@@ -59,3 +59,12 @@ pub fn bkdr_hash(input: &[u8]) -> u32 {
     }
     hash.0
 }
+
+pub fn round_down<T>(x: *mut T, m: i64) -> *mut T {
+    (x as u64 & -m as u64) as *mut T
+}
+
+// return RoundDown<T>(static_cast<T>(x + m - 1), m);
+pub fn round_up<T>(x: *mut T, m: i64) -> *mut T {
+    round_down((x as i64 + m - 1) as *mut T, m)
+}

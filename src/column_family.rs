@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::current;
 
 use crate::{config, files, mai2};
+use crate::compaction::Compact;
 use crate::comparator::Comparator;
 use crate::config::MAX_LEVEL;
 use crate::env::Env;
@@ -20,7 +21,7 @@ use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEF
 use crate::memory_table::MemoryTable;
 use crate::queue::NonBlockingQueue;
 use crate::status::Status;
-use crate::version::{Version, VersionSet};
+use crate::version::{FileMetadata, Version, VersionSet};
 
 pub struct ColumnFamilyImpl {
     name: String,
@@ -139,6 +140,114 @@ impl ColumnFamilyImpl {
         cps[level] = key;
         self.compaction_points.set(cps);
     }
+
+    pub fn pick_compaction(&self) -> Option<Compact> {
+        if !self.need_compaction() {
+            return None;
+        }
+
+        let should_compact = self.current().compaction_score >= 1.0;
+        if !should_compact {
+            return None;
+        }
+
+        assert!(self.current().compaction_level >= 0);
+        let level = self.current().compaction_level as usize;
+        assert!(level + 1 < config::MAX_LEVEL);
+
+        let compaction_points = self.compaction_points.take();
+        let mut inputs = [Vec::new(), Vec::new()];
+        for file in self.current().level_files(level) {
+            if compaction_points.is_empty() ||
+                self.internal_key_cmp.lt(&compaction_points[level], &file.largest_key) {
+                inputs[0].push(file.clone());
+                break;
+            }
+        }
+
+        if inputs[0].is_empty() {
+            inputs[0].push(self.current().level_files(level).first().unwrap().clone());
+        }
+        self.compaction_points.set(compaction_points);
+
+        // Files in level 0 may overlap each other, so pick up all overlapping ones
+        if level == 0 {
+            let (smallest, largest) = self.get_range(&mut inputs[0]);
+
+            // Note that the next call will discard the file we placed in
+            // c->inputs_[0] earlier and replace it with an overlapping set
+            // which will include the picked file.
+            self.current().get_overlapping_inputs(0, &smallest, &largest, &mut inputs[0]);
+            assert!(!inputs[0].is_empty());
+        }
+
+        Some(self.setup_other_inputs(Compact {
+            level,
+            input_version: self.current(),
+            patch: Default::default(),
+            inputs,
+        }))
+    }
+
+    fn setup_other_inputs(&self, mut compact: Compact) -> Compact {
+        let level = compact.level;
+        let (smallest, largest) = self.get_range(&mut compact.inputs[0]);
+
+        self.current().get_overlapping_inputs(level + 1, &smallest, &largest,
+                                              &mut compact.inputs[0]);
+
+        // Get entire range covered by compaction
+        let (_all_start, _all_limit) = self.get_range2(&mut compact.inputs);
+
+        // TODO:
+
+        // Update the place where we will do the next compaction for this level.
+        // We update this immediately instead of waiting for the VersionEdit
+        // to be applied so that if the compaction fails, we will try a different
+        // key range next time.
+        let mut compaction_points = self.compaction_points.take();
+        compaction_points[level] = largest;
+        self.compaction_points.set(compaction_points);
+
+        compact.patch.set_compaction_point(self.id, level as i32, &largest);
+        compact
+    }
+
+    // Stores the minimal range that covers all entries in inputs in
+    // *smallest, *largest.
+    // REQUIRES: inputs is not empty
+    fn get_range(&self, inputs: &mut Vec<Arc<FileMetadata>>) -> (Vec<u8>, Vec<u8>) {
+        assert!(!inputs.is_empty());
+        let mut smallest = Vec::new();
+        let mut largest = Vec::new();
+        for i in 0..inputs.len() {
+            let file = &inputs[i];
+            if i == 0 {
+                smallest = file.smallest_key.clone();
+                largest = file.largest_key.clone();
+            } else {
+                if self.internal_key_cmp.lt(&file.smallest_key, &smallest) {
+                    smallest = file.smallest_key.clone();
+                }
+                if self.internal_key_cmp.gt(&file.largest_key, &largest) {
+                    largest = file.largest_key.clone();
+                }
+            }
+        }
+        (smallest, largest)
+    }
+
+    // Stores the minimal range that covers all entries in inputs1 and inputs2
+    // in *smallest, *largest.
+    // REQUIRES: inputs is not empty
+    fn get_range2(&self, inputs: &mut [Vec<Arc<FileMetadata>>]) ->(Vec<u8>, Vec<u8>) {
+        let mut all = inputs[0].clone();
+        inputs[1].iter().for_each(|x| {
+            all.push(x.clone())
+        });
+        self.get_range(&mut all)
+    }
+
 
     pub fn get_table_file_path(&self, env: &Arc<dyn Env>, file_number: u64) -> PathBuf {
         files::paths::table_file_by_cf(&self.get_work_path(env), file_number)

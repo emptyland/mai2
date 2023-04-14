@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
 
-use crate::{iterator, mai2, skip_list};
+use crate::{inline_skip_list, iterator, mai2, skip_list};
 use crate::arena::{Arena, ScopedMemory};
 use crate::comparator::Comparator;
+use crate::inline_skip_list::InlineSkipList;
 use crate::iterator::Iterator;
 use crate::key::{InternalKey, InternalKeyComparator, KeyBundle, Tag};
 use crate::skip_list::{Comparing, SkipList};
@@ -17,7 +18,7 @@ use crate::status::Status;
 
 pub struct MemoryTable {
     arena: Rc<RefCell<Arena>>,
-    table: SkipList<KeyBundle, KeyComparator>,
+    table: InlineSkipList<'static, KeyComparator>,
     associated_file_number: Cell<u64>,
     n_entries: AtomicUsize,
 }
@@ -26,9 +27,9 @@ struct KeyComparator {
     internal_key_cmp: InternalKeyComparator,
 }
 
-impl Comparing<&KeyBundle> for KeyComparator {
-    fn cmp(&self, lhs: &KeyBundle, rhs: &KeyBundle) -> Option<Ordering> {
-        Some(self.internal_key_cmp.compare(lhs.key(), rhs.key()))
+impl Comparing<&[u8]> for KeyComparator {
+    fn cmp(&self, lhs: &[u8], rhs: &[u8]) -> Option<Ordering> {
+        Some(self.internal_key_cmp.compare(lhs, rhs))
     }
 }
 
@@ -36,7 +37,7 @@ impl MemoryTable {
     pub fn new(internal_key_cmp: InternalKeyComparator) -> Self {
         let arena = Arena::new_rc();
         let key_cmp = KeyComparator { internal_key_cmp };
-        let table = SkipList::new(arena.clone(), key_cmp);
+        let table = InlineSkipList::new(arena.clone(), key_cmp);
         Self {
             arena: arena.clone(),
             table,
@@ -54,36 +55,31 @@ impl MemoryTable {
         IteratorImpl {
             owns: this.clone(),
             status: Status::Ok,
-            iter: skip_list::IteratorImpl::new(table_ptr),
+            iter: this.table.iter(),
         }
     }
 
     pub fn insert(&self, key: &[u8], value: &[u8], sequence_number: u64, tag: Tag) {
-        let internal_key = {
-            let mut arena = self.arena.borrow_mut();
-            KeyBundle::new(arena.deref_mut(), tag, sequence_number, key, value)
-        };
-
         self.n_entries.fetch_add(1, AcqRel);
-        self.table.insert(&internal_key)
+        self.table.insert(tag, sequence_number, key, value)
     }
 
     pub fn get(&self, key: &[u8], sequence_number: u64) -> mai2::Result<(&[u8], Tag)> {
         let mut chunk = ScopedMemory::new();
         let internal_key = KeyBundle::from_key(&mut chunk, sequence_number, key);
-        let mut iter = skip_list::IteratorImpl::new(&self.table);
-        iter.seek(&internal_key);
 
+        let mut iter = self.table.iter();
+        iter.seek(&internal_key.key());
         if !iter.valid() {
             return Err(Status::NotFound);
         }
 
-        let found_key = iter.key().unwrap();
-        if found_key.user_key() != key {
+        let found_key = InternalKey::parse(iter.key().unwrap());
+        if found_key.user_key != key {
             return Err(Status::NotFound);
         }
 
-        Ok((found_key.value(), found_key.tag()))
+        Ok((iter.value().unwrap(), found_key.tag))
     }
 
     pub fn approximate_memory_usage(&self) -> usize {
@@ -106,7 +102,7 @@ impl MemoryTable {
 pub struct IteratorImpl {
     owns: Arc<MemoryTable>,
     status: Status,
-    iter: skip_list::IteratorImpl<KeyBundle, KeyComparator>,
+    iter: inline_skip_list::IteratorImpl<'static, KeyComparator>,
 }
 
 impl std::iter::Iterator for IteratorImpl {
@@ -133,7 +129,7 @@ impl Iterator for IteratorImpl {
     }
 
     fn seek_to_last(&mut self) {
-        todo!()
+        self.iter.seek_to_last();
     }
 
     fn seek(&mut self, key: &[u8]) {
@@ -142,7 +138,7 @@ impl Iterator for IteratorImpl {
         let internal_key = KeyBundle::from_key(&mut chunk,
                                                unpacked_key.sequence_number,
                                                unpacked_key.user_key);
-        self.iter.seek(&internal_key);
+        self.iter.seek(internal_key.key());
     }
 
     fn move_next(&mut self) {
@@ -150,15 +146,15 @@ impl Iterator for IteratorImpl {
     }
 
     fn move_prev(&mut self) {
-        todo!()
+        self.iter.prev();
     }
 
     fn key(&self) -> &[u8] {
-        self.iter.key().unwrap().key()
+        self.iter.key().unwrap()
     }
 
     fn value(&self) -> &[u8] {
-        self.iter.key().unwrap().value()
+        self.iter.value().unwrap()
     }
 
     fn status(&self) -> Status {

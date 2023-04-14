@@ -1,14 +1,11 @@
-use core::slice;
-use std::cell::{Cell, Ref, RefCell};
+use std::cell::{Cell, RefCell};
 use std::io;
-use std::io::{copy, Write};
-use std::mem::size_of;
-use std::ptr::{addr_of, addr_of_mut};
+use std::io::Write;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::env::{RandomAccessFile, SequentialFile, WritableFile};
-use crate::varint::{MAX_VARINT32_LEN, Varint, zig_zag32_encode};
+use crate::varint::{Varint, zig_zag32_encode};
 
 pub trait VarintEncode<T: Sized> {
     fn write_to(&self, buf: &mut Vec<u8>) -> usize;

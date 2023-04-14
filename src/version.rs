@@ -785,7 +785,7 @@ impl VersionPatch {
 #[derive(Debug)]
 pub struct Version {
     pub owns: Weak<ColumnFamilyImpl>,
-    compaction_level: i32,
+    pub compaction_level: i32,
     pub compaction_score: f64,
     files: [Vec<Arc<FileMetadata>>; config::MAX_LEVEL],
 }
@@ -871,6 +871,43 @@ impl Version {
             }
         }
         Err(Status::NotFound)
+    }
+
+    pub fn get_overlapping_inputs(&self, level: usize, begin: &[u8], end: &[u8], inputs: &mut Vec<Arc<FileMetadata>>) {
+        assert!(level >= 0 && level < config::MAX_LEVEL);
+
+        let mut user_begin_key = InternalKey::extract_user_key(begin);
+        let mut user_end_key = InternalKey::extract_user_key(end);
+        let user_cmp = self.owns.upgrade().unwrap().internal_key_cmp.user_cmp.clone();
+
+        let mut i = 0;
+        /*for file in &self.files[level]*/
+        while i < self.files[level].len() {
+            let file = &self.files[level][i]; i += 1;
+            let file_start_key = InternalKey::extract_user_key(&file.smallest_key);
+            let file_limit_key = InternalKey::extract_user_key(&file.largest_key);
+
+            if user_cmp.lt(file_limit_key, user_begin_key) {
+                // skip it
+            } else if user_cmp.gt(file_start_key, user_end_key) {
+                // skip it
+            } else {
+                inputs.push(file.clone());
+                if level == 0 {
+                    // Level-0 files may overlap each other.  So check if the newly
+                    // added file has expanded the range.  If so, restart search.
+                    if user_cmp.lt(file_start_key, user_begin_key) {
+                        user_begin_key = file_start_key;
+                        inputs.clear();
+                        i = 0;
+                    } else if user_cmp.gt(file_limit_key, user_end_key) {
+                        user_end_key = file_limit_key;
+                        inputs.clear();
+                        i = 0;
+                    }
+                }
+            }
+        }
     }
 }
 

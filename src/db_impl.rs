@@ -14,6 +14,7 @@ use std::thread::JoinHandle;
 use crate::{config, files, mai2, wal};
 use crate::cache::TableCache;
 use crate::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
+use crate::compaction::{Compact, Compaction};
 use crate::comparator::Comparator;
 use crate::env::{Env, WritableFile};
 use crate::files::{Kind, paths};
@@ -551,17 +552,34 @@ impl DBImpl {
     }
 
     fn compact(&self, cfi: &Arc<ColumnFamilyImpl>, mutex: Arc<Mutex<VersionSet>>) {
-        let mut locking = mutex.lock().unwrap();
+        let mut versions = mutex.lock().unwrap();
         if cfi.immutable_pipeline.is_not_empty() {
-            let rs = self.compact_memory_table(cfi, mutex.deref(), locking);
+            let rs = self.compact_memory_table(cfi, mutex.deref(), versions);
             if let Err(e) = rs {
                 cfi.set_background_result(Err(dbg!(e)));
                 return;
             }
-            locking = rs.unwrap();
+            versions = rs.unwrap();
         }
 
-        // TODO: Pick compaction
+        if let Some(mut compact) = cfi.pick_compaction() {
+            if let Err(e) = self.compact_file_table(cfi, &mut compact,  &versions) {
+                cfi.set_background_result(Err(dbg!(e)));
+                return;
+            }
+            if let Err(e) = versions.log_and_apply(ColumnFamilyOptions::default(), compact.patch) {
+                cfi.set_background_result(Err(Status::corrupted(e.to_string())));
+                return;
+            }
+        }
+
+        // TODO: self.delete_obsolete_files(cfi, &mut versions);
+    }
+
+    fn compact_file_table(&self, cif: &Arc<ColumnFamilyImpl>, compact: &mut Compact,
+                          _locking: &MutexGuard<VersionSet>) -> Result<()> {
+
+        todo!()
     }
 
     fn compact_memory_table<'a>(&self, cfi: &Arc<ColumnFamilyImpl>, mutex: &'a Mutex<VersionSet>,
@@ -639,7 +657,7 @@ impl DBImpl {
         Ok(file_number)
     }
 
-    fn delete_obsolete_files(&self, cfi: &mut ColumnFamilyImpl, _locking: &mut MutexGuard<VersionSet>) {
+    fn delete_obsolete_files(&self, cfi: &Arc<ColumnFamilyImpl>, _locking: &mut MutexGuard<VersionSet>) {
         todo!()
     }
 
