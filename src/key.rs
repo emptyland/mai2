@@ -28,7 +28,7 @@ pub enum Tag {
 }
 
 impl Tag {
-    fn to_flag(&self) -> u64 {
+    pub fn to_flag(&self) -> u64 {
         match self {
             Tag::Key => 0,
             Tag::Deletion => 1u64 << 63
@@ -209,7 +209,7 @@ impl PartialOrd for KeyBundle {
     }
 }
 
-const TAG_SIZE: usize = size_of::<u64>();
+pub const TAG_SIZE: usize = size_of::<u64>();
 
 pub struct InternalKey<'a> {
     pub sequence_number: u64,

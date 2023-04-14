@@ -139,6 +139,13 @@ impl SSTReader {
         Ok(iter)
     }
 
+    pub fn iter(this: &Arc<Self>, read_opts: &ReadOptions,
+                internal_key_cmp: &InternalKeyComparator) -> IteratorImpl {
+        let mut iter = Self::new_iterator(this, read_opts, internal_key_cmp).unwrap();
+        iter.seek_to_first();
+        iter
+    }
+
     fn new_index_iter(&self, internal_key_cmp: &InternalKeyComparator) -> io::Result<BlockIterator> {
         let block = self.block_cache.get(self.file.borrow_mut().deref_mut(),
                                          self.file_number,
@@ -237,6 +244,7 @@ pub struct IteratorImpl {
 }
 
 impl IteratorImpl {
+
     pub fn new(internal_key_cmp: &InternalKeyComparator, index_iter: BlockIterator,
                checksum_verify: bool, owns: &Arc<SSTReader>) -> Self {
         Self {

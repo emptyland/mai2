@@ -1,20 +1,22 @@
-use std::{cmp, ptr};
+use std::{cmp, slice};
 use std::alloc::{alloc, Layout};
 use std::cell::RefCell;
+use std::io::Write;
 use std::mem::{align_of, size_of};
 use std::ops::DerefMut;
-use std::ptr::{addr_of, NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
+use std::ptr::{NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use rand::prelude::*;
 
 use crate::arena::{Allocator, Arena};
+use crate::key::{Tag, TAG_SIZE};
 
 //type Comparator = Box<dyn for<'a> Comparing<&'a [u8]>>;
 
-const MAX_HEIGHT: usize = 12usize;
-const BRANCHING: usize = 4usize;
+pub const MAX_HEIGHT: usize = 12usize;
+pub const BRANCHING: usize = 4usize;
 
 pub struct SkipList<Key, Cmp> {
     arena: Rc<RefCell<Arena>>,
@@ -103,6 +105,46 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<Key
                 }
             }
         }
+    }
+
+    fn find_less_then(&self, key: &'a Key) -> NonNull<Node<Key>> {
+        let mut x = self.head;
+        let mut level = self.max_height() - 1;
+        loop {
+            unsafe {
+                assert!(x == self.head || self.comparator.lt(&x.as_ref().key, key));
+            }
+            let next = Node::<Key>::next(x.as_ptr(), level);
+            let next_key = unsafe { &next.unwrap().as_ref().key };
+            if next.is_none() || self.comparator.ge(next_key, key) {
+                if level == 0 {
+                    break;
+                } else {
+                    level -= 1;
+                }
+            } else {
+                x = next.unwrap();
+            }
+        }
+        x
+    }
+
+    fn find_last(&self) -> NonNull<Node<Key>> {
+        let mut x = self.head;
+        let mut level = self.max_height() - 1;
+        loop {
+            let next = Node::<Key>::next(x.as_ptr(), level);
+            if next.is_none() {
+                if level == 0 {
+                    break;
+                } else {
+                    level -= 1;
+                }
+            } else {
+                x = next.unwrap();
+            }
+        }
+        x
     }
 
     fn random_height(&self) -> usize {
@@ -215,7 +257,7 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> IteratorImpl
     }
 
     pub fn valid(&self) -> bool {
-        !matches!(self.node, None)
+        self.node.is_some()
     }
 
     pub fn key(&self) -> Option<&'a Key> {
@@ -232,6 +274,13 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> IteratorImpl
         //dbg!(self.node);
     }
 
+    pub fn prev(&mut self) {
+        self.node = Some(self.owns().find_less_then(&self.key().unwrap()));
+        if self.node == Some(self.owns().head) {
+            self.node = None;
+        }
+    }
+
     pub fn seek(&mut self, key: &'a Key) {
         self.node = self.owns().find_greater_or_equal(key, &mut [None; 0]);
     }
@@ -239,6 +288,13 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> IteratorImpl
     pub fn seek_to_first(&mut self) {
         self.node = Node::next(self.owns().head.as_ptr(), 0);
         //dbg!(self.node);
+    }
+
+    pub fn seek_to_last(&mut self) {
+        self.node = Some(self.owns().find_last());
+        if self.node == Some(self.owns().head) {
+            self.node = None;
+        }
     }
 
     fn owns(&self) -> &SkipList<Key, Cmp> {
@@ -262,10 +318,7 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> Iterator for
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::fmt::format;
-    use std::ops::{Deref, DerefMut};
-    use std::rc::Rc;
+    use std::ops::DerefMut;
 
     use crate::arena::Arena;
     use crate::key::{KeyBundle, Tag};

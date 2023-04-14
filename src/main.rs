@@ -22,6 +22,7 @@ mod cache;
 mod sst_builder;
 mod sst_reader;
 mod utils;
+mod inline_skip_list;
 
 fn main() {
     println!("ok")
