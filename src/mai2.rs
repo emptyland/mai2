@@ -10,6 +10,7 @@ use crate::cache::Block;
 use crate::comparator::{BitwiseComparator, Comparator};
 use crate::env::{Env, EnvImpl};
 use crate::key::Tag;
+use crate::log::{Logger, WriterLogger};
 use crate::marshal::{Decoder, VarintDecode, VarintEncode};
 use crate::memory_table::MemoryTable;
 use crate::sst_reader::BlockIterator;
@@ -111,6 +112,7 @@ impl OptionsBuilder {
 pub struct Options {
     pub core: ColumnFamilyOptions,
     pub env: Arc<dyn Env>,
+    pub logger: Arc<dyn Logger>,
     pub create_if_missing: bool,
     pub create_missing_column_families: bool,
     pub error_if_exists: bool,
@@ -136,6 +138,7 @@ impl Default for Options {
         Self {
             core: ColumnFamilyOptions::default(),
             env: EnvImpl::new(),
+            logger: Arc::new(WriterLogger::new(io::stderr())),
             create_if_missing: false,
             create_missing_column_families: false,
             error_if_exists: true,

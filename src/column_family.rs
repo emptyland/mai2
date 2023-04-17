@@ -11,12 +11,13 @@ use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::current;
 
-use crate::{config, files, mai2};
+use crate::{config, files, log_debug, mai2};
 use crate::compaction::Compact;
 use crate::comparator::Comparator;
 use crate::config::MAX_LEVEL;
 use crate::env::Env;
 use crate::key::InternalKeyComparator;
+use crate::log::Logger;
 use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME};
 use crate::memory_table::MemoryTable;
 use crate::queue::NonBlockingQueue;
@@ -28,6 +29,7 @@ pub struct ColumnFamilyImpl {
     id: u32,
     options: ColumnFamilyOptions,
     owns: Weak<RefCell<ColumnFamilySet>>,
+    //logger: Arc<dyn Logger>,
     dropped: AtomicBool,
     pub internal_key_cmp: InternalKeyComparator,
     initialized: Cell<bool>,
@@ -68,6 +70,7 @@ impl ColumnFamilyImpl {
                 id,
                 options,
                 owns,
+                //logger,
                 dropped: AtomicBool::from(false),
                 internal_key_cmp: internal_key_cmp.clone(),
                 initialized: Cell::new(false),
@@ -206,7 +209,7 @@ impl ColumnFamilyImpl {
         // to be applied so that if the compaction fails, we will try a different
         // key range next time.
         let mut compaction_points = self.compaction_points.take();
-        compaction_points[level] = largest;
+        compaction_points[level] = largest.clone();
         self.compaction_points.set(compaction_points);
 
         compact.patch.set_compaction_point(self.id, level as i32, &largest);
@@ -314,7 +317,12 @@ impl Drop for ColumnFamilyImpl {
             }
         }
 
-        // TODO:
+        // if let Some(owns) = self.owns.upgrade() {
+        //     if let Some(mutex) = owns.borrow().owns.upgrade() {
+        //         let versions = mutex.lock().unwrap();
+        //         log_debug!(versions.logger, "drop column-family-impl: {}", self.name);
+        //     }
+        // }
     }
 }
 
@@ -387,7 +395,7 @@ pub struct ColumnFamilySet {
 
 impl ColumnFamilySet {
     pub fn new_dummy(owns: Weak<Mutex<VersionSet>>, abs_db_path: PathBuf) -> Arc<RefCell<Self>> {
-        let mut cfs = Self {
+        let cfs = Self {
             owns,
             abs_db_path,
             max_column_family_id: 0,
@@ -399,18 +407,13 @@ impl ColumnFamilySet {
         owns
     }
 
-    // fn new_column_family_dummy(this: &Arc<RefCell<Self>>, name: String, options: ColumnFamilyOptions)
-    //     -> Arc<ColumnFamilyImpl> {
-    //     let cf = ColumnFamilyImpl::new_dummy(name,
-    //                                          this.borrow_mut().next_column_family_id(),
-    //                                          options, Arc::downgrade(this));
-    //     this.borrow_mut().column_families.insert(cf.borrow().id(), cf.clone());
-    //     cf
-    // }
-
     pub fn new_column_family(this: &Arc<RefCell<Self>>, id: u32, name: String, options: ColumnFamilyOptions)
                              -> Arc<ColumnFamilyImpl> {
         // TODO:
+        // let logger = this.borrow()
+        //     .owns.upgrade().unwrap()
+        //     .lock().unwrap()
+        //     .logger.clone();
         let cf = ColumnFamilyImpl::new(name, id, options, Arc::downgrade(this));
         let mut borrowed_this = this.borrow_mut();
 
@@ -474,7 +477,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore]
     fn sanity() {
         // let vss = VersionSet::new(PathBuf::from("db"), &Options::default());
         // let vs = vss.borrow();

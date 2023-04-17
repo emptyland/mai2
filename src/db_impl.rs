@@ -5,13 +5,14 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
+use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 
-use crate::{config, files, mai2, wal};
+use crate::{config, files, log_debug, log_error, log_info, mai2, wal};
 use crate::cache::TableCache;
 use crate::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
 use crate::compaction::{Compact, Compaction};
@@ -20,6 +21,7 @@ use crate::env::{Env, WritableFile};
 use crate::files::{Kind, paths};
 use crate::iterator::Iterator;
 use crate::key::Tag;
+use crate::log::Logger;
 use crate::mai2::*;
 use crate::memory_table::MemoryTable;
 use crate::snapshot::{SnapshotImpl, SnapshotSet};
@@ -34,6 +36,7 @@ pub struct DBImpl {
     this: Option<Weak<DBImpl>>,
     options: Options,
     env: Arc<dyn Env>,
+    logger: Arc<dyn Logger>,
     versions: Arc<Mutex<VersionSet>>,
     table_cache: TableCache,
     default_column_family: Option<Arc<dyn ColumnFamily>>,
@@ -76,12 +79,14 @@ impl DBImpl {
         let versions = VersionSet::new(abs_db_path.clone(), &options);
         let table_cache = TableCache::new(&abs_db_path, &env, options.max_open_files,
                                           options.block_cache_capacity);
+        let logger = options.logger.clone();
         let mut db = DBImpl {
             db_name: name.clone(),
             abs_db_path,
             this: None,
             options,
             env: env.clone(),
+            logger: logger.clone(),
             versions: versions.clone(),
             table_cache,
             background_active: AtomicBool::new(false),
@@ -121,12 +126,12 @@ impl DBImpl {
 
         #[cfg(test)]
         {
-            println!("----------");
+            log_debug!(logger, "----------");
             let borrowed_cfs = column_families.borrow();
             for cfi in borrowed_cfs.column_family_impls() {
-                println!("cf[{}][{}]", cfi.id(), cfi.name());
+                log_debug!(logger, "cf[{}][{}]", cfi.id(), cfi.name());
             }
-            println!("----------");
+            log_debug!(logger, "----------");
         }
 
         Ok((Arc::new_cyclic(|this| {
@@ -149,24 +154,32 @@ impl DBImpl {
         }
     }
 
-    fn start_flush_worker() -> WorkerDescriptor {
+    fn start_flush_worker(logger: Arc<dyn Logger>) -> WorkerDescriptor {
         let (tx, rx) = channel();
         let join_handle = thread::Builder::new()
             .name("flush-worker".to_string())
             .spawn(move || {
-                loop {
-                    let command = rx.recv().unwrap();
-                    match command {
-                        WorkerCommand::Work(file, mutex) => {
-                            let _locking = mutex.lock().unwrap();
-                            file.borrow_mut().flush().unwrap();
-                            file.borrow_mut().sync().unwrap();
+                log_debug!(logger, "flush worker start...");
+                let rs = catch_unwind(move || {
+                    loop {
+                        let command = rx.recv().unwrap();
+                        match command {
+                            WorkerCommand::Work(file, mutex) => {
+                                let _locking = mutex.lock().unwrap();
+                                file.borrow_mut().flush().unwrap();
+                                file.borrow_mut().sync().unwrap();
+                            }
+                            WorkerCommand::Exit => break,
+                            _ => unreachable!(),
                         }
-                        WorkerCommand::Exit => break,
-                        _ => unreachable!(),
                     }
+                    drop(rx);
+                });
+                if let Err(e) = rs {
+                    log_error!(logger, "flush worker panic! {:#?}", e);
+                } else {
+                    log_debug!(logger, "flush worker stop.");
                 }
-                drop(rx);
             }).unwrap();
         WorkerDescriptor {
             tx,
@@ -398,7 +411,7 @@ impl DBImpl {
         if let Some(worker) = self.flush_worker.take() {
             self.flush_worker.set(Some(worker));
         } else {
-            self.flush_worker.set(Some(Self::start_flush_worker()));
+            self.flush_worker.set(Some(Self::start_flush_worker(self.logger.clone())));
         }
         Ok(())
     }
@@ -502,52 +515,60 @@ impl DBImpl {
             worker.tx.send(WorkerCommand::Compact(this, cfi.clone())).unwrap();
             self.compaction_worker.set(Some(worker));
         } else {
-            let worker = self.start_compacting_worker();
+            let worker = self.start_compacting_worker(self.logger.clone());
             worker.tx.send(WorkerCommand::Compact(this, cfi.clone())).unwrap();
             self.compaction_worker.set(Some(worker));
         }
     }
 
-    fn start_compacting_worker(&self) -> WorkerDescriptor {
+    fn start_compacting_worker(&self, logger: Arc<dyn Logger>) -> WorkerDescriptor {
         let (tx, rx) = channel();
         let join_handle = thread::Builder::new()
             .name("compact-worker".to_string())
             .spawn(move || {
-                loop {
-                    let command = rx.recv().unwrap();
-                    match command {
-                        WorkerCommand::Compact(this, cfi) => {
-                            let db = if let Some(db) = this.upgrade() {
-                                db
-                            } else {
-                                break;
-                            };
-
-                            db.background_active.store(true, Ordering::Release);
-                            cfi.set_background_progress(true);
-
-                            if !db.shutting_down.load(Ordering::Acquire) {
-                                let mutex = db.versions.clone();
-                                db.compact(&cfi, mutex);
-                            }
-
-                            db.background_active.store(false, Ordering::Release);
-                            cfi.set_background_progress(false);
-
-                            let mutex = db.versions.clone();
-                            db.maybe_schedule_compacting(&cfi, &mutex.lock().unwrap());
-
-                            cfi.background_cv.notify_all();
-                        }
-                        WorkerCommand::Exit => break,
-                        _ => unreachable!(),
-                    }
+                let rs = catch_unwind(move || {
+                    Self::do_compacting_work(rx);
+                });
+                if let Err(e) = rs {
+                    log_error!(logger, "compacting worker panic! {:#?}", e);
                 }
-                drop(rx);
             }).unwrap();
         WorkerDescriptor {
             tx,
             join_handle,
+        }
+    }
+
+    fn do_compacting_work(rx: Receiver<WorkerCommand>) {
+        loop {
+            let command = rx.recv().unwrap();
+            match command {
+                WorkerCommand::Compact(this, cfi) => {
+                    let db = if let Some(db) = this.upgrade() {
+                        db
+                    } else {
+                        break;
+                    };
+
+                    db.background_active.store(true, Ordering::Release);
+                    cfi.set_background_progress(true);
+
+                    if !db.shutting_down.load(Ordering::Acquire) {
+                        let mutex = db.versions.clone();
+                        db.compact(&cfi, mutex);
+                    }
+
+                    db.background_active.store(false, Ordering::Release);
+                    cfi.set_background_progress(false);
+
+                    let mutex = db.versions.clone();
+                    db.maybe_schedule_compacting(&cfi, &mutex.lock().unwrap());
+
+                    cfi.background_cv.notify_all();
+                }
+                WorkerCommand::Exit => break,
+                _ => unreachable!(),
+            }
         }
     }
 
@@ -563,7 +584,7 @@ impl DBImpl {
         }
 
         if let Some(mut compact) = cfi.pick_compaction() {
-            if let Err(e) = self.compact_file_table(cfi, &mut compact,  &versions) {
+            if let Err(e) = self.compact_file_table(cfi, &mut compact, &versions) {
                 cfi.set_background_result(Err(dbg!(e)));
                 return;
             }
@@ -573,18 +594,19 @@ impl DBImpl {
             }
         }
 
-        // TODO: self.delete_obsolete_files(cfi, &mut versions);
+        if let Err(e) = self.delete_obsolete_files(cfi, &mut versions) {
+            cfi.set_background_result(Err(Status::corrupted(e.to_string())));
+        }
     }
 
     fn compact_file_table(&self, cif: &Arc<ColumnFamilyImpl>, compact: &mut Compact,
                           _locking: &MutexGuard<VersionSet>) -> Result<()> {
-
         todo!()
     }
 
     fn compact_memory_table<'a>(&self, cfi: &Arc<ColumnFamilyImpl>, mutex: &'a Mutex<VersionSet>,
                                 mut locking: MutexGuard<'a, VersionSet>)
-                                -> mai2::Result<MutexGuard<'a, VersionSet>> {
+                                -> Result<MutexGuard<'a, VersionSet>> {
         assert!(cfi.immutable_pipeline.is_not_empty());
 
         while let Some(memory_table) = cfi.immutable_pipeline.take() {
@@ -616,7 +638,7 @@ impl DBImpl {
     fn write_level0_table(&self, version: Arc<Version>, file_number: u64,
                           memory_table: Arc<MemoryTable>, patch: &mut VersionPatch)
                           -> io::Result<u64> {
-        let _jiffies = self.env.current_time_mills();
+        let jiffies = self.env.current_time_mills();
         let cfi = version.owns.upgrade().unwrap();
         let file_path = paths::table_file_by_cf(cfi.get_work_path(&self.env).as_path(), file_number);
         let file = self.env.new_writable_file(file_path.as_path(), false)?;
@@ -654,11 +676,51 @@ impl DBImpl {
             ctime: self.env.current_time_mills(),
         };
         patch.create_file_by_file_metadata(cfi.id(), 0, Arc::new(metadata));
+        log_info!(self.logger, "write level-0 file ok, cost: {} mills",
+            self.env.current_time_mills() - jiffies);
         Ok(file_number)
     }
 
-    fn delete_obsolete_files(&self, cfi: &Arc<ColumnFamilyImpl>, _locking: &mut MutexGuard<VersionSet>) {
-        todo!()
+    fn delete_obsolete_files(&self, cfi: &Arc<ColumnFamilyImpl>, versions: &mut MutexGuard<VersionSet>) -> io::Result<()> {
+        let mut cleanup = HashMap::new();
+        for name in self.env.get_children(&self.abs_db_path)? {
+            let (kind, number) = files::parse_name(&name);
+            match kind {
+                Kind::Log | Kind::Manifest => {
+                    cleanup.insert(number, self.abs_db_path.join(name));
+                }
+                _ => ()
+            }
+        }
+        cleanup.remove(&self.redo_log_number.get());
+        cleanup.remove(&versions.manifest_file_number);
+
+        for cfi in versions.column_families().borrow().column_family_impls() {
+            cleanup.remove(&cfi.redo_log_number());
+        }
+
+        let cfi_work_path = cfi.get_work_path(&self.env);
+        for name in self.env.get_children(&cfi_work_path)? {
+            let (kind, number) = files::parse_name(&name);
+            match kind {
+                Kind::SstTable => {
+                    cleanup.insert(number, cfi_work_path.join(name));
+                }
+                _ => ()
+            }
+        }
+
+        for i in 0..config::MAX_LEVEL {
+            for file in cfi.current().level_files(i) {
+                cleanup.remove(&file.number);
+            }
+        }
+
+        for (_, path) in cleanup {
+            self.env.delete_file(&path, true)?;
+            log_info!(self.logger, "delete obsolete file: {}", path.to_str().unwrap());
+        }
+        Ok(())
     }
 
     fn prepare_for_get(&self, options: &ReadOptions, cf: &Arc<dyn ColumnFamily>) -> mai2::Result<Get> {
@@ -851,7 +913,7 @@ impl Drop for DBImpl {
             worker.join_handle.join().unwrap();
             drop(worker.tx);
         }
-        println!("drop it! DBImpl");
+        log_debug!(self.logger, "drop it! DBImpl");
     }
 }
 

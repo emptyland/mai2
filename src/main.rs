@@ -24,6 +24,7 @@ mod sst_reader;
 mod utils;
 mod inline_skip_list;
 mod compaction;
+mod log;
 
 fn main() {
     println!("ok")

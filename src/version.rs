@@ -23,6 +23,7 @@ use crate::comparator::Comparator;
 use crate::config::max_size_for_level;
 use crate::env::{Env, WritableFile};
 use crate::key::{InternalKey, InternalKeyComparator, Tag};
+use crate::log::Logger;
 use crate::mai2::{ColumnFamilyOptions, Options, PinnableValue, ReadOptions};
 use crate::marshal::{Decoder, VarintDecode, VarintEncode};
 use crate::status::Status;
@@ -31,6 +32,7 @@ use crate::wal::{LogReader, LogWriter};
 
 pub struct VersionSet {
     env: Arc<dyn Env>,
+    pub logger: Arc<dyn Logger>,
 
     abs_db_path: PathBuf,
     block_size: u64,
@@ -39,7 +41,7 @@ pub struct VersionSet {
     next_file_number: u64,
     pub prev_log_number: u64,
     pub redo_log_number: u64,
-    manifest_file_number: u64,
+    pub manifest_file_number: u64,
     column_families: Arc<RefCell<ColumnFamilySet>>,
     log: Option<LogWriter>,
     log_file: Option<Arc<RefCell<dyn WritableFile>>>,
@@ -52,6 +54,7 @@ impl VersionSet {
         Arc::new_cyclic(|weak| {
             Mutex::new(Self {
                 env: options.env.clone(),
+                logger: options.logger.clone(),
                 abs_db_path: abs_db_path.clone(),
                 block_size: options.core.block_size,
                 last_sequence_number: 0,
@@ -192,7 +195,7 @@ impl VersionSet {
                 let size_in_bytes = version.size_of_level_files(level);
                 (size_in_bytes as f64) / max_size_for_level(level) as f64
             };
-            dbg!(score);
+            //dbg!(score);
             if score > best_score {
                 best_level = level as i32;
                 best_score = score;
