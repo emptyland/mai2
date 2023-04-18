@@ -65,6 +65,13 @@ impl SnapshotSet {
         self.snapshots.set(container);
         rv
     }
+
+    pub fn is_empty(&self) -> bool {
+        let container = self.snapshots.take();
+        let rv = container.is_empty();
+        self.snapshots.set(container);
+        rv
+    }
 }
 
 pub struct SnapshotImpl {

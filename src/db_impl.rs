@@ -3,10 +3,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::btree_set::BTreeSet;
 use std::collections::HashMap;
 use std::io::Write;
+use std::iter::Iterator;
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -19,13 +21,14 @@ use crate::compaction::{Compact, Compaction};
 use crate::comparator::Comparator;
 use crate::env::{Env, WritableFile};
 use crate::files::{Kind, paths};
-use crate::iterator::Iterator;
+use crate::iterator::Iterator as MaiIterator;
 use crate::key::Tag;
 use crate::log::Logger;
 use crate::mai2::*;
 use crate::memory_table::MemoryTable;
 use crate::snapshot::{SnapshotImpl, SnapshotSet};
 use crate::sst_builder::SSTBuilder;
+use crate::sst_reader::SSTReader;
 use crate::status::{Corrupting, Status};
 use crate::version::{FileMetadata, Version, VersionPatch, VersionSet};
 use crate::wal::{LogReader, LogWriter};
@@ -584,10 +587,13 @@ impl DBImpl {
         }
 
         if let Some(mut compact) = cfi.pick_compaction() {
-            if let Err(e) = self.compact_file_table(cfi, &mut compact, &versions) {
+            let rs = self.compact_file_table(cfi, &mut compact, mutex.deref(), versions);
+            if let Err(e) = rs {
                 cfi.set_background_result(Err(dbg!(e)));
                 return;
             }
+            versions = rs.unwrap();
+
             if let Err(e) = versions.log_and_apply(ColumnFamilyOptions::default(), compact.patch) {
                 cfi.set_background_result(Err(Status::corrupted(e.to_string())));
                 return;
@@ -599,9 +605,70 @@ impl DBImpl {
         }
     }
 
-    fn compact_file_table(&self, cif: &Arc<ColumnFamilyImpl>, compact: &mut Compact,
-                          _locking: &MutexGuard<VersionSet>) -> Result<()> {
-        todo!()
+    fn compact_file_table<'a>(&self, cfi: &Arc<ColumnFamilyImpl>, compact: &mut Compact,
+                              mutex: &'a Mutex<VersionSet>, mut versions: MutexGuard<'a, VersionSet>)
+                              -> Result<MutexGuard<'a, VersionSet>> {
+        assert!(compact.level < config::MAX_LEVEL);
+
+        let mut n_entries = 0;
+        for i in 0..compact.inputs.len() {
+            for file in &compact.inputs[i] {
+                let rd = from_io_result(self.table_cache.get_reader(cfi, file.number))?;
+                n_entries += rd.table_properties.n_entries;
+            }
+        }
+        let new_n_slots = config::compute_number_of_slots(compact.level + 1,
+                                                          n_entries as usize,
+                                                          config::LIMIT_MIN_NUMBER_OF_SLOTS);
+        let mut compaction = Compaction::new(&self.abs_db_path,
+                                             &cfi.internal_key_cmp,
+                                             &cfi,
+                                             &compact.input_version,
+                                             compact.level,
+                                             versions.generate_file_number(),
+                                             &cfi.compaction_point(compact.level));
+        compaction.smallest_snapshot = if self.snapshots.is_empty() {
+            versions.last_sequence_number()
+        } else {
+            self.snapshots.oldest().sequence_number
+        };
+
+        for i in 0..compact.inputs.len() {
+            for file in &compact.inputs[i] {
+                let rd = from_io_result(self.table_cache.get_reader(cfi, file.number))?;
+                let iter = from_io_result(SSTReader::new_iterator(&rd, &ReadOptions::default(), &cfi.internal_key_cmp))?;
+                compaction.original_inputs.push(Rc::new(RefCell::new(iter)));
+                compact.patch.delete_file(cfi.id(), compact.level as i32, file.number);
+            }
+        }
+
+        let table_file_path = cfi.get_table_file_path(&self.env, compaction.target_file_number);
+        let rs = self.env.new_writable_file(&table_file_path, false);
+        if let Err(e) = &rs {
+            versions.reuse_file_number(compaction.target_file_number);
+            Err(Status::corrupted(e.to_string()))?;
+        }
+
+        let mut builder = SSTBuilder::new(&cfi.internal_key_cmp,
+                                      rs.as_ref().unwrap().clone(),
+                                      cfi.options().block_size,
+                                      cfi.options().block_restart_interval,
+                                      new_n_slots);
+        drop(versions);
+        //------------------------------unlock------------------------------------------------------
+        let result = from_io_result(compaction.run(&self.table_cache, &mut builder))?;
+        //------------------------------lock again--------------------------------------------------
+        versions = mutex.lock().unwrap();
+
+        let mut file = FileMetadata::default();
+        file.ctime = self.env.current_time_mills();
+        file.size  = from_io_result(builder.file_size())?;
+        file.largest_key = result.largest_key.clone();
+        file.smallest_key = result.smallest_key.clone();
+
+        compact.patch.create_file_by_file_metadata(cfi.id(), compaction.target_level as i32,
+                                                   Arc::new(file));
+        Ok(versions)
     }
 
     fn compact_memory_table<'a>(&self, cfi: &Arc<ColumnFamilyImpl>, mutex: &'a Mutex<VersionSet>,

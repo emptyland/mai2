@@ -1,4 +1,5 @@
 use std::collections::vec_deque::VecDeque;
+use std::ops::DerefMut;
 use std::sync::Mutex;
 
 pub struct NonBlockingQueue<T> {
@@ -20,6 +21,12 @@ impl<T: Clone> NonBlockingQueue<T> {
     pub fn take(&self) -> Option<T> {
         let mut q = self.queue.lock().unwrap();
         q.pop_front()
+    }
+
+    pub fn take_all(&self, receiver: &mut Vec<T>) {
+        let mut q = self.queue.lock().unwrap();
+        q.iter().for_each(|x| { receiver.push(x.clone()) });
+        q.clear()
     }
 
     pub fn peek(&self) -> Option<T> {

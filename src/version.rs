@@ -877,7 +877,7 @@ impl Version {
     }
 
     pub fn get_overlapping_inputs(&self, level: usize, begin: &[u8], end: &[u8], inputs: &mut Vec<Arc<FileMetadata>>) {
-        assert!(level >= 0 && level < config::MAX_LEVEL);
+        assert!(level < config::MAX_LEVEL);
 
         let mut user_begin_key = InternalKey::extract_user_key(begin);
         let mut user_end_key = InternalKey::extract_user_key(end);

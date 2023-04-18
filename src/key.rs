@@ -211,6 +211,8 @@ impl PartialOrd for KeyBundle {
 
 pub const TAG_SIZE: usize = size_of::<u64>();
 
+pub const MAX_SEQUENCE_NUMBER: u64 = 0x00ffffffffffffffu64;
+
 pub struct InternalKey<'a> {
     pub sequence_number: u64,
     pub tag: Tag,

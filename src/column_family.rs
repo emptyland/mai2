@@ -7,18 +7,15 @@ use std::fmt::{Debug, Formatter};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::current;
 
 use crate::{config, files, log_debug, mai2};
 use crate::compaction::Compact;
 use crate::comparator::Comparator;
-use crate::config::MAX_LEVEL;
 use crate::env::Env;
 use crate::key::InternalKeyComparator;
-use crate::log::Logger;
-use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME};
+use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions};
 use crate::memory_table::MemoryTable;
 use crate::queue::NonBlockingQueue;
 use crate::status::Status;
@@ -41,7 +38,7 @@ pub struct ColumnFamilyImpl {
     history: Cell<Vec<Arc<Version>>>,
     non_version: Arc<Version>, // flag by current version not exists
 
-    compaction_points: Cell<Vec<Vec<u8>>>,
+    compaction_points: RefCell<[Vec<u8>;config::MAX_LEVEL]>,
 
     mutable: Cell<Arc<MemoryTable>>,
     pub immutable_pipeline: Arc<NonBlockingQueue<Arc<MemoryTable>>>,
@@ -82,7 +79,7 @@ impl ColumnFamilyImpl {
                 non_version: Arc::new(Version::new(weak.clone())),
                 mutable: Cell::new(MemoryTable::new_rc(internal_key_cmp.clone())),
                 immutable_pipeline: Arc::new(NonBlockingQueue::new()),
-                compaction_points: Cell::new(Vec::from_iter(iter::repeat(Vec::new()).take(MAX_LEVEL))),
+                compaction_points: RefCell::new(array::from_fn(|_|{Vec::new()})),
             }
         })
     }
@@ -139,9 +136,11 @@ impl ColumnFamilyImpl {
     }
 
     pub fn set_compaction_point(&self, level: usize, key: Vec<u8>) {
-        let mut cps = self.compaction_points.take();
-        cps[level] = key;
-        self.compaction_points.set(cps);
+        self.compaction_points.borrow_mut()[level] = key;
+    }
+
+    pub fn compaction_point(&self, level: usize) -> Vec<u8> {
+        self.compaction_points.borrow()[level].clone()
     }
 
     pub fn pick_compaction(&self) -> Option<Compact> {
@@ -158,11 +157,11 @@ impl ColumnFamilyImpl {
         let level = self.current().compaction_level as usize;
         assert!(level + 1 < config::MAX_LEVEL);
 
-        let compaction_points = self.compaction_points.take();
+        //let compaction_points = self.compaction_points.take();
         let mut inputs = [Vec::new(), Vec::new()];
         for file in self.current().level_files(level) {
-            if compaction_points.is_empty() ||
-                self.internal_key_cmp.lt(&compaction_points[level], &file.largest_key) {
+            if self.compaction_point(level).is_empty() ||
+                self.internal_key_cmp.lt(&self.compaction_point(level), &file.largest_key) {
                 inputs[0].push(file.clone());
                 break;
             }
@@ -171,7 +170,7 @@ impl ColumnFamilyImpl {
         if inputs[0].is_empty() {
             inputs[0].push(self.current().level_files(level).first().unwrap().clone());
         }
-        self.compaction_points.set(compaction_points);
+        //self.compaction_points.set(compaction_points);
 
         // Files in level 0 may overlap each other, so pick up all overlapping ones
         if level == 0 {
@@ -208,9 +207,7 @@ impl ColumnFamilyImpl {
         // We update this immediately instead of waiting for the VersionEdit
         // to be applied so that if the compaction fails, we will try a different
         // key range next time.
-        let mut compaction_points = self.compaction_points.take();
-        compaction_points[level] = largest.clone();
-        self.compaction_points.set(compaction_points);
+        self.set_compaction_point(level, largest.clone());
 
         compact.patch.set_compaction_point(self.id, level as i32, &largest);
         compact
