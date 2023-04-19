@@ -1,6 +1,5 @@
 use std::cell::RefCell;
-use std::cmp::Ordering::Equal;
-use std::fmt::Pointer;
+use std::cmp::Ordering;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -9,7 +8,7 @@ use crate::cache::TableCache;
 use crate::column_family::ColumnFamilyImpl;
 use crate::comparator::Comparator;
 use crate::{config, iterator};
-use crate::iterator::{Iterator, MergingIterator};
+use crate::iterator::{Iterator, IteratorRc, MergingIterator};
 use crate::key::{InternalKey, InternalKeyComparator, MAX_SEQUENCE_NUMBER, Tag};
 use crate::memory_table::MemoryTable;
 use crate::sst_builder::SSTBuilder;
@@ -25,7 +24,7 @@ pub struct Compaction {
     pub target_file_number: u64,
     pub smallest_snapshot: u64,
     compaction_point: Vec<u8>,
-    pub original_inputs: Vec<Rc<RefCell<dyn iterator::Iterator<Item=(Vec<u8>, Vec<u8>)>>>>,
+    pub original_inputs: Vec<IteratorRc>,
     input_version: Arc<Version>,
 }
 
@@ -88,7 +87,7 @@ impl Compaction {
 
             if current_user_key.is_none() ||
                 self.internal_key_cmp.compare(&current_user_key.as_ref().unwrap(),
-                                              internal_key.user_key) != Equal {
+                                              internal_key.user_key) != Ordering::Equal {
 
                 // First occurrence of this user key
                 current_user_key = Some(internal_key.user_key.to_vec());

@@ -21,7 +21,7 @@ use crate::compaction::{Compact, Compaction};
 use crate::comparator::Comparator;
 use crate::env::{Env, WritableFile};
 use crate::files::{Kind, paths};
-use crate::iterator::Iterator as MaiIterator;
+use crate::iterator::{DBIterator, Iterator as MaiIterator, IteratorArc, IteratorRc, MergingIterator};
 use crate::key::Tag;
 use crate::log::Logger;
 use crate::mai2::*;
@@ -790,6 +790,23 @@ impl DBImpl {
         Ok(())
     }
 
+    fn new_internal_iterator(&self, options: &ReadOptions, cfi: &Arc<ColumnFamilyImpl>, _locking: &MutexGuard<VersionSet>)
+                             -> Result<IteratorRc> {
+        let mut iters = Vec::<IteratorRc>::new();
+        iters.push(Rc::new(RefCell::new(MemoryTable::iter(cfi.mutable().clone()))));
+
+        for table in cfi.immutable_pipeline.peek_all() {
+            iters.push(Rc::new(RefCell::new(MemoryTable::iter(table))));
+        }
+
+        from_io_result(cfi.get_levels_iters(options, &self.table_cache, &mut iters))?;
+
+        // No need register cleanup:
+        // Memory table's iterator can cleanup itself reference count.
+        let iter = MergingIterator::new(cfi.internal_key_cmp.clone(), iters);
+        Ok(Rc::new(RefCell::new(iter)))
+    }
+
     fn prepare_for_get(&self, options: &ReadOptions, cf: &Arc<dyn ColumnFamily>) -> mai2::Result<Get> {
         let cfi = ColumnFamilyImpl::from(cf);
 
@@ -941,6 +958,22 @@ impl DB for DBImpl {
                 Ok(value)
             }
         }
+    }
+
+    fn new_iterator(&self, options: &ReadOptions, column_family: &Arc<dyn ColumnFamily>)
+                    -> Result<IteratorArc> {
+        let get = self.prepare_for_get(options, column_family)?;
+        let cfi = ColumnFamilyImpl::from(column_family);
+
+        let mutex = self.versions.clone();
+        let locking = mutex.lock().unwrap();
+        //--------------------------lock version-set------------------------------------------------
+        let internal_iter = self.new_internal_iterator(options, &cfi, &locking)?;
+        let iter = DBIterator::new(&cfi.internal_key_cmp.user_cmp,
+                                   internal_iter,
+                                   get.last_sequence_number);
+        Ok(Arc::new(RefCell::new(iter)))
+        //--------------------------unlock version-set----------------------------------------------
     }
 
     fn get_snapshot(&self) -> Arc<dyn Snapshot> {

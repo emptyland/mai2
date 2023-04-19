@@ -1,5 +1,6 @@
 use std::{io, iter};
 use std::any::Any;
+use std::cell::RefCell;
 use std::io::Write;
 use std::mem::size_of;
 use std::ptr::NonNull;
@@ -9,6 +10,8 @@ use std::sync::Arc;
 use crate::cache::Block;
 use crate::comparator::{BitwiseComparator, Comparator};
 use crate::env::{Env, EnvImpl};
+use crate::iterator;
+use crate::iterator::IteratorArc;
 use crate::key::Tag;
 use crate::log::{Logger, WriterLogger};
 use crate::marshal::{Decoder, VarintDecode, VarintEncode};
@@ -286,6 +289,9 @@ pub trait DB: Send + Sync {
 
     fn get_pinnable(&self, options: &ReadOptions, column_family: &Arc<dyn ColumnFamily>,
                     key: &[u8]) -> Result<PinnableValue>;
+
+    fn new_iterator(&self, options: &ReadOptions, column_family: &Arc<dyn ColumnFamily>)
+                    -> Result<IteratorArc>;
 
     fn get_snapshot(&self) -> Arc<dyn Snapshot>;
 

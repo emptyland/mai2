@@ -105,20 +105,6 @@ pub struct IteratorImpl {
     iter: inline_skip_list::IteratorImpl<'static, KeyComparator>,
 }
 
-impl std::iter::Iterator for IteratorImpl {
-    type Item = (Vec<u8>, Vec<u8>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.valid() {
-            let rv = Some((Vec::from(self.key()), Vec::from(self.value())));
-            self.iter.next();
-            rv
-        } else {
-            None
-        }
-    }
-}
-
 impl Iterator for IteratorImpl {
     fn valid(&self) -> bool {
         self.iter.valid()

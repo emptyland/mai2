@@ -5,19 +5,23 @@ use std::cmp::max;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::io::Read;
+use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::{config, files, log_debug, mai2};
+use crate::{config, files, iterator, log_debug, mai2};
+use crate::cache::TableCache;
 use crate::compaction::Compact;
 use crate::comparator::Comparator;
 use crate::env::Env;
+use crate::iterator::IteratorRc;
 use crate::key::InternalKeyComparator;
-use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions};
+use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, ReadOptions};
 use crate::memory_table::MemoryTable;
 use crate::queue::NonBlockingQueue;
+use crate::sst_reader::SSTReader;
 use crate::status::Status;
 use crate::version::{FileMetadata, Version, VersionSet};
 
@@ -189,6 +193,18 @@ impl ColumnFamilyImpl {
             patch: Default::default(),
             inputs,
         }))
+    }
+
+    pub fn get_levels_iters(&self, options: &ReadOptions, table_cache: &TableCache,
+                            receiver: &mut Vec<IteratorRc>) -> io::Result<()> {
+        for i in 0..config::MAX_LEVEL {
+            for file in self.current().level_files(i) {
+                let rd = table_cache.get_reader(self, file.number)?;
+                let iter = SSTReader::iter(&rd, options, &self.internal_key_cmp);
+                receiver.push(Rc::new(RefCell::new(iter)));
+            }
+        }
+        Ok(())
     }
 
     fn setup_other_inputs(&self, mut compact: Compact) -> Compact {

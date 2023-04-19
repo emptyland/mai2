@@ -213,6 +213,7 @@ pub const TAG_SIZE: usize = size_of::<u64>();
 
 pub const MAX_SEQUENCE_NUMBER: u64 = 0x00ffffffffffffffu64;
 
+#[derive(Debug, PartialEq)]
 pub struct InternalKey<'a> {
     pub sequence_number: u64,
     pub tag: Tag,
@@ -263,6 +264,13 @@ impl InternalKey<'_> {
         } else {
             (Tag::Key, sequence_number)
         }
+    }
+
+    pub fn _test_expect(key: &[u8], user_key: &str, sequence_number: u64, tag: Tag) {
+        let ik = Self::parse(key);
+        assert_eq!(user_key.as_bytes(), ik.user_key);
+        assert_eq!(sequence_number, ik.sequence_number);
+        assert_eq!(tag, ik.tag);
     }
 }
 
