@@ -123,6 +123,7 @@ impl ColumnFamilyImpl {
     }
 
     pub fn append(&self, version: Version) {
+        // assert_ne!(version.level_files(0)[0].number, 0);
         let mut history = self.history.take();
         let record = Arc::new(version);
         history.push(record);
@@ -174,7 +175,6 @@ impl ColumnFamilyImpl {
         if inputs[0].is_empty() {
             inputs[0].push(self.current().level_files(level).first().unwrap().clone());
         }
-        //self.compaction_points.set(compaction_points);
 
         // Files in level 0 may overlap each other, so pick up all overlapping ones
         if level == 0 {

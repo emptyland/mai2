@@ -635,6 +635,7 @@ impl DBImpl {
                                                           config::LIMIT_MIN_NUMBER_OF_SLOTS);
         let mut compaction = Compaction::new(&self.abs_db_path,
                                              &cfi.internal_key_cmp,
+                                             &self.logger,
                                              &cfi,
                                              &compact.input_version,
                                              compact.level,
@@ -674,6 +675,7 @@ impl DBImpl {
         versions = mutex.lock().unwrap();
 
         let mut file = FileMetadata::default();
+        file.number = compaction.target_file_number;
         file.ctime = self.env.current_time_mills();
         file.size = from_io_result(builder.file_size())?;
         file.largest_key = result.largest_key.clone();
@@ -707,7 +709,7 @@ impl DBImpl {
             }
             patch.set_prev_log_number(0);
             patch.set_redo_log(cfi.id(), file_number);
-            log_debug!(self.logger, "column family: {}, new redo log is {}", cfi.name(), file_number);
+            //log_debug!(self.logger, "column family: {}, new redo log is {}", cfi.name(), file_number);
 
             //------------------------------lock again----------------------------------------------
             locking = mutex.lock().unwrap();
@@ -1059,7 +1061,7 @@ impl WritingHandler {
     }
 
     fn get_memory_table(&self, cf_id: u32) -> Arc<MemoryTable> {
-        let cfs = self.column_families.borrow();
+        let cfs = unsafe { &*self.column_families.as_ptr() };
         let cfi = cfs.get_column_family_by_id(cf_id).unwrap().clone();
         cfi.mutable().clone()
     }

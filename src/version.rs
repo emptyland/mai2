@@ -156,8 +156,8 @@ impl VersionSet {
             }
 
             if patch.has_max_column_family() {
-                self.column_families()
-                    .borrow_mut().update_max_column_family_id(patch.max_column_family);
+                unsafe { &mut *self.column_families().as_ptr() }
+                    .update_max_column_family_id(patch.max_column_family);
             }
         }
 
@@ -280,7 +280,7 @@ impl VersionSet {
         }
 
         if patch.has_redo_log() {
-            let column_families = self.column_families().borrow_mut();
+            let column_families = self.column_families().borrow();
             let id = patch.redo_log.cf_id;
             let cfi = column_families.get_column_family_by_id(id).unwrap();
             assert!(patch.redo_log.number >= cfi.redo_log_number());
@@ -290,7 +290,7 @@ impl VersionSet {
 
         if patch.has_column_family_deletion() {
             let cfi = {
-                let column_families = self.column_families().borrow_mut();
+                let column_families = self.column_families().borrow();
                 let id = patch.cf_deletion;
                 assert_ne!(id, 0);
                 column_families.get_column_family_by_id(id).unwrap().clone()

@@ -7,9 +7,10 @@ use std::sync::Arc;
 use crate::cache::TableCache;
 use crate::column_family::ColumnFamilyImpl;
 use crate::comparator::Comparator;
-use crate::{config, iterator};
+use crate::{config, iterator, key};
 use crate::iterator::{Iterator, IteratorRc, MergingIterator};
 use crate::key::{InternalKey, InternalKeyComparator, MAX_SEQUENCE_NUMBER, Tag};
+use crate::log::Logger;
 use crate::memory_table::MemoryTable;
 use crate::sst_builder::SSTBuilder;
 use crate::version::{FileMetadata, Version, VersionPatch};
@@ -17,7 +18,7 @@ use crate::version::{FileMetadata, Version, VersionPatch};
 pub struct Compaction {
     abs_db_path: PathBuf,
     internal_key_cmp: InternalKeyComparator,
-
+    logger: Arc<dyn Logger>,
     cfi: Arc<ColumnFamilyImpl>,
     memory_tables: Vec<Arc<MemoryTable>>,
     pub target_level: usize,
@@ -49,6 +50,7 @@ pub struct Compact {
 impl Compaction {
     pub fn new(abs_db_path: &Path,
                internal_key_cmp: &InternalKeyComparator,
+               logger: &Arc<dyn Logger>,
                cfi: &Arc<ColumnFamilyImpl>,
                input_version: &Arc<Version>,
                target_level: usize,
@@ -61,6 +63,7 @@ impl Compaction {
         Self {
             abs_db_path: abs_db_path.to_path_buf(),
             internal_key_cmp: internal_key_cmp.clone(),
+            logger: logger.clone(),
             cfi: cfi.clone(),
             memory_tables,
             target_level,
@@ -86,12 +89,12 @@ impl Compaction {
             let mut should_drop = false;
 
             if current_user_key.is_none() ||
-                self.internal_key_cmp.compare(&current_user_key.as_ref().unwrap(),
+                self.internal_key_cmp.user_cmp.compare(&current_user_key.as_ref().unwrap(),
                                               internal_key.user_key) != Ordering::Equal {
 
                 // First occurrence of this user key
                 current_user_key = Some(internal_key.user_key.to_vec());
-                last_sequence_number_for_key = internal_key.sequence_number;
+                last_sequence_number_for_key = MAX_SEQUENCE_NUMBER;
             }
 
             if self.is_base_memory_for_key(internal_key.user_key) {
@@ -144,7 +147,10 @@ impl Compaction {
             }
             merger.move_next();
         }
-        builder.finish()?;
+        dbg!(&state);
+        if state.compacted_entries_count > 0 {
+            builder.finish()?;
+        }
         Ok(state)
     }
 
