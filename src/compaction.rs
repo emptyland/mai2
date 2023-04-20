@@ -4,10 +4,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+
+use crate::{config, iterator, key};
 use crate::cache::TableCache;
 use crate::column_family::ColumnFamilyImpl;
 use crate::comparator::Comparator;
-use crate::{config, iterator, key};
 use crate::iterator::{Iterator, IteratorRc, MergingIterator};
 use crate::key::{InternalKey, InternalKeyComparator, MAX_SEQUENCE_NUMBER, Tag};
 use crate::log::Logger;
@@ -90,7 +91,7 @@ impl Compaction {
 
             if current_user_key.is_none() ||
                 self.internal_key_cmp.user_cmp.compare(&current_user_key.as_ref().unwrap(),
-                                              internal_key.user_key) != Ordering::Equal {
+                                                       internal_key.user_key) != Ordering::Equal {
 
                 // First occurrence of this user key
                 current_user_key = Some(internal_key.user_key.to_vec());

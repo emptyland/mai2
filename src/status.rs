@@ -3,6 +3,7 @@ pub enum Status {
     Ok,
     Corruption(String),
     NotFound,
+    Eof,
 }
 
 pub trait Corrupting<T>: Sized {

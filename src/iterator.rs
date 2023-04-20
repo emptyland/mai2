@@ -3,6 +3,7 @@ use std::cmp::Ordering::Equal;
 use std::iter::Iterator as StdIterator;
 use std::rc::Rc;
 use std::sync::Arc;
+
 use crate::comparator::Comparator;
 use crate::key::{InternalKey, Tag};
 use crate::status::Status;
@@ -417,14 +418,6 @@ impl<'a> IteratorWrapper<'a> {
     }
 }
 
-impl<'a> StdIterator for IteratorWrapper<'a> {
-    type Item = (Vec<u8>, Vec<u8>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        todo!()
-    }
-}
-
 impl<'a> Iterator for IteratorWrapper<'a> {
     fn valid(&self) -> bool { self.valid }
 
@@ -471,6 +464,7 @@ impl<'a> Iterator for IteratorWrapper<'a> {
 mod tests {
     use crate::comparator::BitwiseComparator;
     use crate::key::InternalKeyComparator;
+
     use super::*;
 
     #[test]
@@ -571,7 +565,7 @@ mod tests {
     struct MemoryMockIter {
         data: Vec<Vec<u8>>,
         iter: usize,
-        cmp: InternalKeyComparator
+        cmp: InternalKeyComparator,
     }
 
     impl MemoryMockIter {
@@ -579,7 +573,7 @@ mod tests {
             Self {
                 data: Vec::default(),
                 iter: 0,
-                cmp: cmp.clone()
+                cmp: cmp.clone(),
             }
         }
 

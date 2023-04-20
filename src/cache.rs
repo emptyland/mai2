@@ -79,12 +79,12 @@ impl TableCache {
 
     fn load(&self, cfi: &ColumnFamilyImpl, file_number: u64, mut file_size: u64) -> io::Result<TableEntry> {
         let file_path = cfi.get_table_file_path(&self.env, file_number);
-        let file = self.env.new_random_access_file(dbg!(&file_path))?;
+        let file = self.env.new_random_access_file(&file_path)?;
         if file_size == 0 {
             file_size = file.borrow().get_file_size()? as u64;
         }
-        let table = SSTReader::new(file.clone(), file_number, file_size,
-                                   true, self.block_cache.clone())?;
+        let table = SSTReader::new(file.clone(), file_number, file_size, true,
+                                   self.block_cache.clone())?;
         Ok(TableEntry {
             cf_id: 0,
             file_path,

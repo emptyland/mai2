@@ -67,17 +67,18 @@ impl Logger for BlackHoleLogger {
 }
 
 pub struct WriterLogger {
-    writer: Mutex<Box<RefCell<dyn Write>>>
+    writer: Mutex<Box<RefCell<dyn Write>>>,
 }
 
 impl WriterLogger {
     pub fn new<T>(owns: T) -> Self
         where T: Write + 'static {
-        Self { writer: Mutex::new( Box::new(RefCell::new(owns))) }
+        Self { writer: Mutex::new(Box::new(RefCell::new(owns))) }
     }
 }
 
 unsafe impl Sync for WriterLogger {}
+
 unsafe impl Send for WriterLogger {}
 
 impl Logger for WriterLogger {
@@ -93,11 +94,12 @@ impl Logger for WriterLogger {
 mod tests {
     use std::io;
     use std::sync::Arc;
+
     use super::*;
 
     #[test]
     fn black_hole_log() {
-        let log = Arc::new(BlackHoleLogger{});
+        let log = Arc::new(BlackHoleLogger {});
         log_info!(log, "{}", 1);
     }
 

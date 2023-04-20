@@ -893,7 +893,8 @@ impl Version {
         let mut i = 0;
         /*for file in &self.files[level]*/
         while i < self.files[level].len() {
-            let file = &self.files[level][i]; i += 1;
+            let file = &self.files[level][i];
+            i += 1;
             let file_start_key = InternalKey::extract_user_key(&file.smallest_key);
             let file_limit_key = InternalKey::extract_user_key(&file.largest_key);
 

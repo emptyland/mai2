@@ -175,7 +175,7 @@ impl LogReader {
     }
 
     fn read_physical_record(&mut self, scratch: &mut Vec<u8>) -> io::Result<RecordType> {
-        let mut buf: [u8;4] = [0;4];
+        let mut buf: [u8; 4] = [0; 4];
         let rs = self.file_reader.read(buf.as_mut_slice());
         if let Err(e) = rs {
             return if e.kind() == io::ErrorKind::UnexpectedEof && self.file_reader.eof() {
@@ -267,8 +267,7 @@ mod tests {
                 break;
             }
             //dbg!(buf);
-            let (_, patch) = VersionPatch::from_unmarshal(&buf)?;
-            dbg!(patch.redo_log_number());
+            let (_, _patch) = VersionPatch::from_unmarshal(&buf)?;
         }
 
         Ok(())

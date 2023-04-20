@@ -42,7 +42,7 @@ pub struct ColumnFamilyImpl {
     history: Cell<Vec<Arc<Version>>>,
     non_version: Arc<Version>, // flag by current version not exists
 
-    compaction_points: RefCell<[Vec<u8>;config::MAX_LEVEL]>,
+    compaction_points: RefCell<[Vec<u8>; config::MAX_LEVEL]>,
 
     mutable: Cell<Arc<MemoryTable>>,
     pub immutable_pipeline: Arc<NonBlockingQueue<Arc<MemoryTable>>>,
@@ -83,7 +83,7 @@ impl ColumnFamilyImpl {
                 non_version: Arc::new(Version::new(weak.clone())),
                 mutable: Cell::new(MemoryTable::new_rc(internal_key_cmp.clone())),
                 immutable_pipeline: Arc::new(NonBlockingQueue::new()),
-                compaction_points: RefCell::new(array::from_fn(|_|{Vec::new()})),
+                compaction_points: RefCell::new(array::from_fn(|_| { Vec::new() })),
             }
         })
     }
@@ -256,7 +256,7 @@ impl ColumnFamilyImpl {
     // Stores the minimal range that covers all entries in inputs1 and inputs2
     // in *smallest, *largest.
     // REQUIRES: inputs is not empty
-    fn get_range2(&self, inputs: &mut [Vec<Arc<FileMetadata>>]) ->(Vec<u8>, Vec<u8>) {
+    fn get_range2(&self, inputs: &mut [Vec<Arc<FileMetadata>>]) -> (Vec<u8>, Vec<u8>) {
         let mut all = inputs[0].clone();
         inputs[1].iter().for_each(|x| {
             all.push(x.clone())
@@ -379,7 +379,8 @@ impl ColumnFamily for ColumnFamilyHandle {
     }
 
     fn comparator(&self) -> Rc<dyn Comparator> {
-        todo!()
+        let _locking = self.mutex.lock().unwrap();
+        self.core.internal_key_cmp.user_cmp.clone()
     }
 
     fn get_descriptor(&self) -> Result<ColumnFamilyDescriptor, Status> {

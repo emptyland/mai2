@@ -26,5 +26,6 @@ mod utils;
 mod inline_skip_list;
 mod compaction;
 mod log;
+mod sql;
 
 //fn main() {}

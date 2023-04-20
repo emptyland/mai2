@@ -111,7 +111,7 @@ impl DBImpl {
             if db.options.error_if_exists {
                 return Err(Status::corrupted("db exists and error_if_exists is true."));
             }
-            db.recovery(column_family_descriptors)?;
+            db.recover(column_family_descriptors)?;
         }
         let locked_versions = versions.lock().unwrap();
         let column_families = locked_versions.column_families();
@@ -275,7 +275,7 @@ impl DBImpl {
         //------------------------------unlock version-set--------------------------------------
     }
 
-    fn recovery(&self, desc: &[ColumnFamilyDescriptor]) -> mai2::Result<()> {
+    fn recover(&self, desc: &[ColumnFamilyDescriptor]) -> mai2::Result<()> {
         let current_file_path = paths::current_file(self.abs_db_path.as_path());
         let rv = from_io_result(self.env.read_to_string(current_file_path.as_path()))?;
         let rs = u64::from_str_radix(rv.as_str(), 10);
@@ -622,11 +622,12 @@ impl DBImpl {
                               mutex: &'a Mutex<VersionSet>, mut versions: MutexGuard<'a, VersionSet>)
                               -> Result<MutexGuard<'a, VersionSet>> {
         assert!(compact.level < config::MAX_LEVEL);
-
+        let jiffies = self.env.current_time_mills();
         let mut n_entries = 0;
         for i in 0..compact.inputs.len() {
             for file in &compact.inputs[i] {
-                let rd = from_io_result(self.table_cache.get_reader(cfi, file.number))?;
+                let rd = from_io_result(self.table_cache.get_reader(cfi,
+                                                                    file.number))?;
                 n_entries += rd.table_properties.n_entries;
             }
         }
@@ -649,8 +650,11 @@ impl DBImpl {
 
         for i in 0..compact.inputs.len() {
             for file in &compact.inputs[i] {
-                let rd = from_io_result(self.table_cache.get_reader(cfi, file.number))?;
-                let iter = from_io_result(SSTReader::new_iterator(&rd, &ReadOptions::default(), &cfi.internal_key_cmp))?;
+                let rd = from_io_result(self.table_cache.get_reader(cfi,
+                                                                    file.number))?;
+                let iter = from_io_result(SSTReader::new_iterator(&rd,
+                                                                  &ReadOptions::default(),
+                                                                  &cfi.internal_key_cmp))?;
                 compaction.original_inputs.push(Rc::new(RefCell::new(iter)));
                 compact.patch.delete_file(cfi.id(), compact.level as i32, file.number);
             }
@@ -683,6 +687,10 @@ impl DBImpl {
 
         compact.patch.create_file_by_file_metadata(cfi.id(), compaction.target_level as i32,
                                                    Arc::new(file));
+        log_info!(self.logger, "compact level-{} file: {}.sst ok, cost: {} mills",
+            compaction.target_level,
+            compaction.target_file_number,
+            self.env.current_time_mills() - jiffies);
         Ok(versions)
     }
 
@@ -1098,6 +1106,7 @@ struct Get {
 #[cfg(test)]
 mod tests {
     use std::iter;
+
     use crate::env::JunkFilesCleaner;
 
     use super::*;

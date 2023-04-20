@@ -244,7 +244,6 @@ pub struct IteratorImpl {
 }
 
 impl IteratorImpl {
-
     pub fn new(internal_key_cmp: &InternalKeyComparator, index_iter: BlockIterator,
                checksum_verify: bool, owns: &Arc<SSTReader>) -> Self {
         Self {
@@ -286,14 +285,6 @@ impl IteratorImpl {
 
     fn block_iter_mut(&mut self) -> &mut BlockIterator {
         self.block_iter.as_mut().unwrap()
-    }
-}
-
-impl iter::Iterator for IteratorImpl {
-    type Item = (Vec<u8>, Vec<u8>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        todo!()
     }
 }
 
@@ -460,14 +451,6 @@ impl BlockIterator {
 
         let value = decoder.read_slice(buf)?;
         Ok((key, value, position + decoder.offset()))
-    }
-}
-
-impl iter::Iterator for BlockIterator {
-    type Item = (Vec<u8>, Vec<u8>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        todo!()
     }
 }
 
