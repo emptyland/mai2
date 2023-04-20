@@ -1,22 +1,18 @@
 use std::{io, iter};
 use std::any::Any;
-use std::cell::RefCell;
 use std::io::Write;
 use std::mem::size_of;
-use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::cache::Block;
 use crate::comparator::{BitwiseComparator, Comparator};
 use crate::env::{Env, EnvImpl};
-use crate::iterator;
 use crate::iterator::IteratorArc;
 use crate::key::Tag;
 use crate::log::{Logger, WriterLogger};
 use crate::marshal::{Decoder, VarintDecode, VarintEncode};
 use crate::memory_table::MemoryTable;
-use crate::sst_reader::BlockIterator;
 use crate::status::{Corrupting, Status};
 
 pub type Result<T> = std::result::Result<T, Status>;

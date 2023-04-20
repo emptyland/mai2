@@ -147,10 +147,11 @@ impl DBImpl {
         if let Some(desc) = self.redo_log.take() {
             let worker = self.flush_worker.take().unwrap();
             if sync {
-                todo!()
+                desc.file.borrow_mut().flush().unwrap();
+                desc.file.borrow_mut().sync().unwrap();
             } else {
-                worker.tx.send(WorkerCommand::Work(desc.file.clone(),
-                                                   self.versions.clone())).unwrap();
+                // worker.tx.send(WorkerCommand::Work(desc.file.clone(),
+                //                                    self.versions.clone())).unwrap();
             }
             self.flush_worker.set(Some(worker));
             self.redo_log.set(Some(desc));
@@ -191,7 +192,7 @@ impl DBImpl {
     }
 
     fn get_total_redo_log_size(&self) -> io::Result<u64> {
-        let children = self.env.get_children(self.abs_db_path.as_path())?;
+        let children = self.env.get_children(&self.abs_db_path)?;
         let mut total_size = 0u64;
         for child in children {
             let (kind, _) = files::parse_name(&child);
@@ -295,6 +296,14 @@ impl DBImpl {
         let mut history: BTreeSet<u64> = from_io_result(versions.recover(&cfs, manifest_file_number))?;
         assert!(history.len() >= 1);
 
+        #[cfg(test)]
+        {
+            log_debug!(self.logger, "recover versions history:");
+            for number in history.iter() {
+                log_debug!(self.logger, "history={}", number);
+            }
+        }
+
         if self.options.create_missing_column_families {
             for cfi in versions.column_families().borrow().column_family_impls() {
                 cfs.remove(cfi.name());
@@ -341,6 +350,9 @@ impl DBImpl {
 
         let total_wal_size = from_io_result(self.get_total_redo_log_size())?;
         self.total_wal_size.store(total_wal_size, Ordering::Release);
+
+        log_debug!(self.logger, "recover ok.\ntotal_wal_size={total_wal_size}\nredo_log_number={}",
+            versions.redo_log_number);
         Ok(())
         //------------------------------unlock version-set------------------------------------------
     }
@@ -408,6 +420,7 @@ impl DBImpl {
                     number: new_log_number,
                     log: LogWriter::new(file, wal::DEFAULT_BLOCK_SIZE),
                 }));
+                self.redo_log_number.set(new_log_number);
             }
         }
 
@@ -650,10 +663,10 @@ impl DBImpl {
         }
 
         let mut builder = SSTBuilder::new(&cfi.internal_key_cmp,
-                                      rs.as_ref().unwrap().clone(),
-                                      cfi.options().block_size,
-                                      cfi.options().block_restart_interval,
-                                      new_n_slots);
+                                          rs.as_ref().unwrap().clone(),
+                                          cfi.options().block_size,
+                                          cfi.options().block_restart_interval,
+                                          new_n_slots);
         drop(versions);
         //------------------------------unlock------------------------------------------------------
         let result = from_io_result(compaction.run(&self.table_cache, &mut builder))?;
@@ -662,7 +675,7 @@ impl DBImpl {
 
         let mut file = FileMetadata::default();
         file.ctime = self.env.current_time_mills();
-        file.size  = from_io_result(builder.file_size())?;
+        file.size = from_io_result(builder.file_size())?;
         file.largest_key = result.largest_key.clone();
         file.smallest_key = result.smallest_key.clone();
 
@@ -694,6 +707,7 @@ impl DBImpl {
             }
             patch.set_prev_log_number(0);
             patch.set_redo_log(cfi.id(), file_number);
+            log_debug!(self.logger, "column family: {}, new redo log is {}", cfi.name(), file_number);
 
             //------------------------------lock again----------------------------------------------
             locking = mutex.lock().unwrap();
@@ -1081,6 +1095,7 @@ struct Get {
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
     use crate::env::JunkFilesCleaner;
 
     use super::*;
@@ -1284,6 +1299,43 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn large_insert() -> Result<()> {
+        let n = 100000;
+
+        let _junk = JunkFilesCleaner::new("tests/db7");
+
+        {
+            let db = open_test_db("db7")?;
+            let cf0 = db.default_column_family();
+
+            let blank_val = String::from_iter(iter::repeat('a').take(1000));
+            let wr_opts = WriteOptions::default();
+            for i in 0..n {
+                let key = format!("key.{}", i);
+                //let value = format!("val.{}", i);
+                db.insert(&wr_opts, &cf0, key.as_bytes(), blank_val.as_bytes())?;
+            }
+        }
+
+        {
+            let desc = [ColumnFamilyDescriptor {
+                name: DEFAULT_COLUMN_FAMILY_NAME.to_string(),
+                options: ColumnFamilyOptions::default(),
+            }];
+            let db = load_test_db("db7", &desc)?;
+            let cf0 = db.default_column_family();
+            let rd_opts = ReadOptions::default();
+            for i in 0..n {
+                let key = format!("key.{}", i);
+                let value = db.get_pinnable(&rd_opts, &cf0, key.as_bytes())?;
+                assert_eq!(1000, value.value().len());
+            }
+        }
+
+        Ok(())
+    }
+
     fn insert_key_value_pairs(db: &Arc<DBImpl>, cf: &Arc<dyn ColumnFamily>, pairs: &[(&str, &str)]) -> Result<()> {
         let wr_opts = WriteOptions::default();
         for (key, value) in pairs {
@@ -1301,7 +1353,7 @@ mod tests {
         Ok(())
     }
 
-    fn open_test_db(name: &str) -> mai2::Result<Arc<DBImpl>> {
+    fn open_test_db(name: &str) -> Result<Arc<DBImpl>> {
         let options = Options::with()
             .create_if_missing(true)
             .dir(String::from("tests"))
@@ -1310,9 +1362,27 @@ mod tests {
         Ok(db)
     }
 
-    fn load_test_db(name: &str, desc: &[ColumnFamilyDescriptor]) -> mai2::Result<Arc<DBImpl>> {
+    // fn open_dummy_db(name: &str) -> mai2::Result<Arc<DBImpl>> {
+    //     let options = Options::with()
+    //         .create_if_missing(true)
+    //         .dir(String::from("dummies"))
+    //         .build();
+    //     let (db, _cfs) = DBImpl::open(options, String::from(name), &Vec::new())?;
+    //     Ok(db)
+    // }
+
+    fn load_test_db(name: &str, desc: &[ColumnFamilyDescriptor]) -> Result<Arc<DBImpl>> {
         let options = Options::with()
             .dir("tests".to_string())
+            .error_if_exists(false)
+            .build();
+        let (db, _cfs) = DBImpl::open(options, String::from(name), desc)?;
+        Ok(db)
+    }
+
+    fn load_dummy_db(name: &str, desc: &[ColumnFamilyDescriptor]) -> Result<Arc<DBImpl>> {
+        let options = Options::with()
+            .dir("dummies".to_string())
             .error_if_exists(false)
             .build();
         let (db, _cfs) = DBImpl::open(options, String::from(name), desc)?;

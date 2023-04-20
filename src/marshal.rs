@@ -191,6 +191,7 @@ impl FileWriter {
     }
 
     pub fn write_pad(&self, n: usize) -> io::Result<usize> {
+        println!("pad: {}", n);
         for _ in 0..n / DUMMY.len() {
             self.write(&DUMMY)?;
         }

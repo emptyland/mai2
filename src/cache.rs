@@ -135,7 +135,8 @@ impl BlockCache {
     }
 
     fn load_block(file: &mut dyn RandomAccessFile, offset: u64, checksum_verify: bool) -> io::Result<Block> {
-        let mut header = Vec::from_iter(iter::repeat(0u8).take(offset as usize + MAX_VARINT32_LEN));
+        let mut header = Vec::from_iter(iter::repeat(0u8)
+            .take(4/*crc32*/ + MAX_VARINT32_LEN/*len*/));
         file.positioned_read(offset, &mut header)?;
         let (checksum, len, delta) = {
             let mut decoder = Decoder::new();
@@ -152,7 +153,8 @@ impl BlockCache {
             let mut digest = crc.digest();
             digest.update(block.payload());
             if digest.finalize() != checksum {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "incorrect checksum"));
+                let message = format!("Incorrect checksum, block offset={}", offset);
+                return Err(io::Error::new(io::ErrorKind::InvalidData, message));
             }
         }
         Ok(block)

@@ -175,7 +175,8 @@ impl LogReader {
     }
 
     fn read_physical_record(&mut self, scratch: &mut Vec<u8>) -> io::Result<RecordType> {
-        let rs = self.file_reader.read_fixed_u32();
+        let mut buf: [u8;4] = [0;4];
+        let rs = self.file_reader.read(buf.as_mut_slice());
         if let Err(e) = rs {
             return if e.kind() == io::ErrorKind::UnexpectedEof && self.file_reader.eof() {
                 Ok(RecordType::Zero)
@@ -183,7 +184,7 @@ impl LogReader {
                 Err(e)
             };
         }
-        let checksum = rs?;
+        let checksum = u32::from_le_bytes(buf);
         let len = self.file_reader.read_fixed_u16()? as usize;
         let raw_rd_ty = self.file_reader.read_byte()?;
         let record_ty_rs = RecordType::try_from_primitive(raw_rd_ty as u32);
@@ -217,9 +218,11 @@ impl LogReader {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::path::PathBuf;
     use std::rc::Rc;
 
-    use crate::env::{MemorySequentialFile, MemoryWritableFile, WritableFile};
+    use crate::env::{Env, EnvImpl, MemorySequentialFile, MemoryWritableFile, WritableFile};
+    use crate::version::VersionPatch;
 
     use super::*;
 
@@ -251,6 +254,24 @@ mod tests {
         let mut log = LogReader::new(rf.clone(), true, 16);
         let rd = log.read().unwrap();
         assert_eq!(data, rd.as_slice());
+    }
+
+    #[test]
+    fn issue001() -> io::Result<()> {
+        let env = EnvImpl::new();
+        let file = env.new_sequential_file(&PathBuf::from("tests/issue001-MANIFEST-1"))?;
+        let mut rd = LogReader::new(file, true, DEFAULT_BLOCK_SIZE);
+        loop {
+            let buf = rd.read()?;
+            if buf.is_empty() {
+                break;
+            }
+            //dbg!(buf);
+            let (_, patch) = VersionPatch::from_unmarshal(&buf)?;
+            dbg!(patch.redo_log_number());
+        }
+
+        Ok(())
     }
 
     fn new_and_write_log(data: &[u8], block_size: usize) -> Arc<RefCell<dyn WritableFile>> {

@@ -71,11 +71,9 @@ impl VersionSet {
 
     pub fn recover(&mut self, desc: &HashMap<String, ColumnFamilyOptions>, file_number: u64)
                    -> io::Result<BTreeSet<u64>> {
-        let mut reader = {
-            let manifest_file_path = files::paths::manifest_file(self.abs_db_path.as_path(), file_number);
-            let file = self.env.new_sequential_file(manifest_file_path.as_path())?;
-            LogReader::new(file, true, wal::DEFAULT_BLOCK_SIZE)
-        };
+        let manifest_file_path = files::paths::manifest_file(&self.abs_db_path, file_number);
+        let file = self.env.new_sequential_file(&manifest_file_path)?;
+        let mut reader = LogReader::new(file, true, wal::DEFAULT_BLOCK_SIZE);
 
         let mut history = BTreeSet::new();
         loop {
@@ -83,8 +81,10 @@ impl VersionSet {
             if record.is_empty() {
                 break;
             }
+            //dbg!(&record);
 
-            let (_, patch) = VersionPatch::from_unmarshal(record.as_slice())?;
+            let (read_in_bytes, patch) = VersionPatch::from_unmarshal(&record)?;
+            assert_eq!(read_in_bytes, record.len());
 
             if patch.has_column_family_creation() {
                 if !desc.contains_key(&patch.cf_creation.name) {
@@ -229,7 +229,12 @@ impl VersionSet {
                                        cfi.internal_key_cmp.user_cmp.name());
             patch.set_redo_log(cfi.id(), cfi.redo_log_number());
 
-            // TODO: write level files
+            for i in 0..config::MAX_LEVEL {
+                for file in cfi.current().level_files(i) {
+                    patch.create_file_by_file_metadata(cfi.id(), i as i32,
+                                                       file.clone());
+                }
+            }
 
             self.write_patch(&patch)?;
         }
@@ -293,7 +298,7 @@ impl VersionSet {
             cfi.drop_it();
         }
 
-        if matches!(self.log, None) {
+        if self.log.is_none() {
             self.create_manifest_file()?;
             patch.set_next_file_number(self.next_file_number);
         }
@@ -319,9 +324,11 @@ impl VersionSet {
         patch.marshal(&mut buf);
 
         let log = self.log.as_mut().unwrap();
+        //dbg!(buf.as_slice());
         log.append(buf.as_slice())?;
-        log.flush()?;
-        log.sync()
+        // log.flush()?;
+        // log.sync()
+        log.flush()
     }
 
     pub fn abs_db_path(&self) -> &Path {
@@ -497,7 +504,7 @@ mod patch {
     impl VarintEncode<Field> for Field {
         fn write_to(&self, buf: &mut Vec<u8>) -> usize {
             buf.push(self.clone() as u8);
-            size_of::<Self>()
+            size_of::<u8>()
         }
     }
 }
@@ -1061,15 +1068,17 @@ mod tests {
     fn version_patch_marshal() -> io::Result<()> {
         let mut patch = VersionPatch::default();
         patch.set_redo_log(1, 99);
+        patch.set_redo_log_number(2);
 
         let mut buf = Vec::<u8>::new();
         patch.marshal(&mut buf);
-        assert_eq!(4, buf.len());
+        assert_eq!(6, buf.len());
 
         let (loaded, b) = VersionPatch::from_unmarshal(buf.as_slice())?;
-        assert_eq!(4, loaded);
+        assert_eq!(6, loaded);
         assert_eq!(patch.redo_log().cf_id, b.redo_log().cf_id);
         assert_eq!(patch.redo_log().number, b.redo_log().number);
+        assert_eq!(2, patch.redo_log_number());
 
         Ok(())
     }
