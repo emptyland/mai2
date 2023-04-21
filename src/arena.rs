@@ -1,8 +1,11 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
-use std::iter;
+use std::{iter, ptr};
+use std::fmt::{Debug, Formatter};
+use std::marker::PhantomData;
 use std::mem::size_of;
-use std::ptr::{addr_of_mut, NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
+use std::ops::{Deref, DerefMut, Index};
+use std::ptr::{addr_of_mut, copy_nonoverlapping, NonNull, replace, slice_from_raw_parts, slice_from_raw_parts_mut, write};
 use std::rc::Rc;
 
 use crate::utils::round_up;
@@ -220,6 +223,174 @@ impl Allocator for ScopedMemory {
     }
 }
 
+#[derive(Clone)]
+pub struct Handle<T: ?Sized> {
+    naked: NonNull<T>,
+    owns: Rc<RefCell<Arena>>,
+}
+
+impl<T> Handle<T> {
+    pub fn new(data: T, owns: &Rc<RefCell<Arena>>) -> Self {
+        let layout = Layout::new::<T>();
+        let chunk = owns.borrow_mut().allocate(layout).unwrap();
+        let naked = NonNull::new(chunk.as_ptr() as *mut T).unwrap();
+        unsafe { write(naked.as_ptr(), data) }
+        Self {
+            naked,
+            owns: owns.clone(),
+        }
+    }
+}
+
+impl<T> Deref for Handle<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.naked.as_ref() }
+    }
+}
+
+impl<T> DerefMut for Handle<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.naked.as_mut() }
+    }
+}
+
+impl <T: Debug> Debug for Handle<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Handle<T>")
+            .field(self.deref())
+            .finish()
+    }
+}
+
+pub struct ArenaStr {
+    naked: NonNull<str>
+}
+
+impl ArenaStr {
+    pub fn new(str: &str, alloc: &mut dyn Allocator) -> Self {
+        let layout = Layout::from_size_align(str.len(), 4).unwrap();
+        let mut chunk = alloc.allocate(layout).unwrap();
+        let naked = unsafe {
+            copy_nonoverlapping(str.as_ptr(), &mut chunk.as_mut()[0], str.len());
+            NonNull::new(chunk.as_ptr() as *mut str).unwrap()
+        };
+        Self { naked }
+    }
+
+    pub fn from_string(str: &String, alloc: &mut dyn Allocator) -> Self {
+        Self::new(str.as_str(), alloc)
+    }
+
+    pub fn to_string(&self) -> String {
+        self.as_str().to_string()
+    }
+
+    pub fn as_str(&self) -> &str {
+        unsafe { self.naked.as_ref() }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.as_str().as_bytes()
+    }
+}
+
+impl Debug for ArenaStr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ArenaStr")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
+impl Clone for ArenaStr {
+    fn clone(&self) -> Self {
+        Self { naked: self.naked }
+    }
+}
+
+
+pub struct ArenaVec<T> {
+    naked: NonNull<[T]>,
+    len: usize,
+    owns: Rc<RefCell<Arena>>,
+}
+
+impl<T> ArenaVec<T> {
+    pub fn new(owns: &Rc<RefCell<Arena>>) -> Self {
+        let naked = unsafe {
+            Self::new_uninitialized(owns.borrow_mut().deref_mut(), 1)
+        };
+        Self {
+            naked,
+            len: 0,
+            owns: owns.clone(),
+        }
+    }
+
+    pub fn push(&mut self, elem: T) {
+        self.extend_if_needed(1);
+        unsafe { write(&mut self.naked.as_mut()[self.len - 1], elem) }
+    }
+
+    pub fn len(&self) -> usize { self.len }
+
+    pub fn capacity(&self) -> usize { unsafe { self.naked.as_ref() }.len() }
+
+    pub fn as_slice(&self) -> &[T] {
+        unsafe { &self.naked.as_ref()[..self.len] }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        unsafe { &mut self.naked.as_mut()[..self.len] }
+    }
+
+    fn extend_if_needed(&mut self, incremental: usize) {
+        if self.len() + incremental > self.capacity() {
+            let new_cap = self.capacity() * 2 + 4;
+            let naked = unsafe {
+                Self::new_uninitialized(self.owns.borrow_mut().deref_mut(), new_cap)
+            };
+            let old_raw_vec = self.naked;
+            self.naked = naked;
+            unsafe {
+                let src = &old_raw_vec.as_ref()[0] as *const T;
+                let dst = &mut self.naked.as_mut()[0] as *mut T;
+                ptr::copy_nonoverlapping(src, dst, self.len);
+            }
+        }
+
+        self.len += incremental;
+    }
+
+    unsafe fn new_uninitialized(alloc: &mut dyn Allocator, capacity: usize) -> NonNull<[T]> {
+        let elem_layout = Layout::new::<T>();
+        let layout = Layout::from_size_align_unchecked(elem_layout.size() * capacity,
+                                                       elem_layout.align());
+        let chunk = alloc.allocate(layout).unwrap();
+        let addr = chunk.as_ptr() as *mut T;
+        NonNull::new(slice_from_raw_parts_mut(addr, capacity)).unwrap()
+    }
+}
+
+impl <T> Index<usize> for ArenaVec<T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.as_slice()[index]
+    }
+}
+
+impl <T: Debug> Debug for ArenaVec<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut r = f.debug_list();
+        for i in 0..self.len {
+            r.entry(&self[i]);
+        }
+        r.finish()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -248,6 +419,35 @@ mod tests {
         unsafe {
             chunk.as_mut().write(s.as_bytes()).unwrap();
             assert_eq!(s.as_bytes(), chunk.as_ref());
+        }
+    }
+
+    #[test]
+    fn arena_vec() {
+        let arena = Arena::new_rc();
+        let mut vec = ArenaVec::new(&arena);
+        vec.push(1);
+        vec.push(2);
+        vec.push(3);
+        assert_eq!(6, vec.capacity());
+        assert_eq!(3, vec.len());
+        assert_eq!(1, vec[0]);
+        assert_eq!(2, vec[1]);
+        assert_eq!(3, vec[2]);
+    }
+
+    #[test]
+    fn arena_vec_large_push() {
+        let arena = Arena::new_rc();
+        let mut vec = ArenaVec::new(&arena);
+        let n = 10000;
+
+        for i in 0..n {
+            vec.push(i);
+        }
+        assert_eq!(n, vec.len);
+        for i in 0..n {
+            assert_eq!(i, vec[i]);
         }
     }
 }

@@ -1,10 +1,6 @@
 use std::io::Read;
-use std::fmt::Display;
-use crate::comparator::Comparator;
-use crate::mai2;
-use crate::mai2::from_io_result;
-use crate::mai2::Result;
-use crate::sql::SourceLocation;
+use crate::sql::{from_io_result, Result};
+use crate::sql::{SourceLocation, SourcePosition};
 use crate::status::{Corrupting, Status};
 
 #[derive(Default)]
@@ -24,6 +20,12 @@ pub enum Token {
 
     Plus,
     Comma,
+
+    Char,
+    Varchar,
+    SmallInt,
+    Int,
+    BigInt,
 }
 
 pub struct Lexer<'a> {
@@ -119,7 +121,7 @@ impl <'a> Lexer<'a> {
         }
     }
 
-    fn current_position(&self) -> SourcePosition {
+    pub fn current_position(&self) -> SourcePosition {
         SourcePosition {
             line: self.line,
             column: self.column
