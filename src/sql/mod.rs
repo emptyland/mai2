@@ -21,13 +21,13 @@ fn from_io_result<T>(rs: io::Result<T>) -> Result<T> {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SourceLocation {
     pub start: SourcePosition,
     pub end: SourcePosition,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SourcePosition {
     pub line: u32,
     pub column: u32,

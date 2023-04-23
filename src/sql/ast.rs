@@ -1,6 +1,9 @@
+use std::any::Any;
 use std::cell::RefCell;
+use std::io::Write;
+use std::ptr::NonNull;
 use std::rc::Rc;
-use crate::arena::{Arena, ArenaStr, ArenaVec, Handle};
+use crate::arena::{Arena, ArenaStr, ArenaVec, ArenaBox};
 use crate::mai2::Snapshot;
 use crate::sql::lexer::Token;
 
@@ -26,6 +29,7 @@ macro_rules! ast_nodes_impl {
 macro_rules! statement_impl {
     ($name:ident, $call:ident) => {
         impl Statement for $name {
+            fn as_any(&self) -> &dyn Any { self }
             fn accept(&self, visitor: &dyn Visitor) {
                 visitor.$call(self)
             }
@@ -41,6 +45,7 @@ ast_nodes_impl![
 
 
 pub trait Statement {
+    fn as_any(&self) -> &dyn Any;
     fn accept(&self, visitor: &dyn Visitor);
 }
 
@@ -50,22 +55,25 @@ pub enum Operator {
 
 pub trait Expression: Statement {
     fn op(&self) -> &Operator;
-    fn operands(&self) -> &[Handle<dyn Expression>];
-    fn lhs(&self) -> &Handle<dyn Expression> { &self.operands()[0] }
-    fn rhs(&self) -> &Handle<dyn Expression> { &self.operands()[1] }
+    fn operands(&self) -> &[ArenaBox<dyn Expression>];
+    fn lhs(&self) -> &ArenaBox<dyn Expression> { &self.operands()[0] }
+    fn rhs(&self) -> &ArenaBox<dyn Expression> { &self.operands()[1] }
 }
 
 pub struct CreateTable {
     pub table_name: ArenaStr,
-    pub if_exists: bool,
-    pub columns: ArenaVec<Handle<ColumnDeclaration>>,
+    pub if_not_exists: bool,
+    pub columns: ArenaVec<ArenaBox<ColumnDeclaration>>,
+    pub primary_keys: ArenaVec<ArenaStr>
 }
 
 pub struct ColumnDeclaration {
     pub name: ArenaStr,
     pub auto_increment: bool,
-    pub type_decl: Handle<TypeDeclaration>,
-    pub default_val: Option<Handle<dyn Expression>>,
+    pub not_null: bool,
+    pub primary_key: bool,
+    pub type_decl: ArenaBox<TypeDeclaration>,
+    pub default_val: Option<ArenaBox<dyn Expression>>,
 }
 
 #[derive(Debug)]
@@ -78,11 +86,12 @@ pub struct TypeDeclaration {
 #[derive(Debug)]
 pub struct DropTable {
     pub table_name: ArenaStr,
+    pub if_exists: bool,
 }
 
 pub struct BinaryExpression {
     op: Operator,
-    operands: [Handle<dyn Expression>; 2]
+    operands: [ArenaBox<dyn Expression>; 2]
 }
 
 impl Expression for BinaryExpression {
@@ -90,7 +99,7 @@ impl Expression for BinaryExpression {
         &self.op
     }
 
-    fn operands(&self) -> &[Handle<dyn Expression>] {
+    fn operands(&self) -> &[ArenaBox<dyn Expression>] {
         &self.operands
     }
 }
@@ -106,34 +115,40 @@ impl Factory {
         }
     }
 
-    pub fn new_create_table(&self, table_name: ArenaStr, if_exists: bool) -> Handle<CreateTable> {
-        Handle::new(CreateTable {
+    pub fn new_create_table(&self, table_name: ArenaStr, if_not_exists: bool) -> ArenaBox<CreateTable> {
+        ArenaBox::new(CreateTable {
             table_name,
-            if_exists,
+            if_not_exists,
             columns: ArenaVec::new(&self.arena),
+            primary_keys: ArenaVec::new(&self.arena),
         }, &self.arena)
     }
 
-    // pub fn new_drop_table(&self, table_name: ArenaStr) -> Handle<dyn Statement> {
-    //     Handle::new(DropTable {
-    //         table_name
-    //     }, &self.arena)
-    // }
+    pub fn new_drop_table(&self, table_name: ArenaStr, if_exists: bool) -> ArenaBox<DropTable> {
+        ArenaBox::new(DropTable {
+            table_name,
+            if_exists,
+        }, &self.arena)
+    }
 
     pub fn new_column_decl(&self, name: ArenaStr,
                            auto_increment: bool,
-                           type_decl: Handle<TypeDeclaration>,
-                           default_val: Option<Handle<dyn Expression>>) -> Handle<ColumnDeclaration> {
-        Handle::new(ColumnDeclaration {
+                           not_null: bool,
+                           primary_key: bool,
+                           type_decl: ArenaBox<TypeDeclaration>,
+                           default_val: Option<ArenaBox<dyn Expression>>) -> ArenaBox<ColumnDeclaration> {
+        ArenaBox::new(ColumnDeclaration {
             name,
             auto_increment,
+            not_null,
+            primary_key,
             type_decl,
             default_val,
         }, &self.arena)
     }
 
-    pub fn new_type_decl(&self, token: Token, len: usize, len_part: usize) -> Handle<TypeDeclaration> {
-        Handle::new(TypeDeclaration {
+    pub fn new_type_decl(&self, token: Token, len: usize, len_part: usize) -> ArenaBox<TypeDeclaration> {
+        ArenaBox::new(TypeDeclaration {
             token,
             len,
             len_part,
@@ -141,14 +156,39 @@ impl Factory {
     }
 }
 
-// impl <T: Statement> From<Handle<T>> for Handle<dyn Statement> {
-//     fn from(value: Handle<T>) -> Self {
-//         Self {
-//             naked:
-//             owns: value.owns.clone()
-//         }
-//     }
-// }
+impl <T: Statement + 'static> From<ArenaBox<T>> for ArenaBox<dyn Statement> {
+    fn from(value: ArenaBox<T>) -> Self {
+        Self::from_ptr(value.ptr(), value.owns())
+    }
+}
+
+impl <T: Statement + 'static> From<ArenaBox<dyn Statement>> for ArenaBox<T> {
+    fn from(value: ArenaBox<dyn Statement>) -> Self {
+        let ptr = NonNull::from(value.as_any().downcast_ref::<T>().unwrap());
+        Self::from_ptr(ptr, value.owns())
+    }
+}
+
+struct YamlWriter<'a> {
+    writer: &'a dyn Write,
+    indent: u32
+}
+
+impl <'a> Visitor for YamlWriter<'a> {
+    fn visit_create_table(&self, this: &CreateTable) {
+        todo!()
+    }
+
+    fn visit_drop_table(&self, this: &DropTable) {
+        todo!()
+    }
+
+    fn visit_binary_expression(&self, this: &BinaryExpression) {
+        todo!()
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -161,12 +201,14 @@ mod tests {
         let factory = Factory::new();
         let name = ArenaStr::new("a", factory.arena.borrow_mut().deref_mut());
         let mut node = factory.new_create_table(name, false);
-        assert!(!node.if_exists);
+        assert!(!node.if_not_exists);
         assert_eq!("a", node.table_name.as_str());
 
         let name = ArenaStr::new("col1", factory.arena.borrow_mut().deref_mut());
         let type_decl = factory.new_type_decl(Token::Varchar, 256, 0);
-        let col_decl = factory.new_column_decl(name, false, type_decl, None);
+        let col_decl = factory.new_column_decl(name, false,
+                                               true, false, type_decl,
+                                               None);
         node.columns.push(col_decl);
 
         assert_eq!(1, node.columns.len());
@@ -177,6 +219,6 @@ mod tests {
         let factory = Factory::new();
         let name = ArenaStr::new("a", factory.arena.borrow_mut().deref_mut());
         let node = factory.new_create_table(name, false);
-        let ast: Handle<dyn Statement> = node;
+        let ast: ArenaBox<dyn Statement> = node.into();
     }
 }

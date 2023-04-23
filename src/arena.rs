@@ -223,13 +223,12 @@ impl Allocator for ScopedMemory {
     }
 }
 
-#[derive(Clone)]
-pub struct Handle<T: ?Sized> {
+pub struct ArenaBox<T: ?Sized> {
     naked: NonNull<T>,
     owns: Rc<RefCell<Arena>>,
 }
 
-impl<T> Handle<T> {
+impl <T> ArenaBox<T> {
     pub fn new(data: T, owns: &Rc<RefCell<Arena>>) -> Self {
         let layout = Layout::new::<T>();
         let chunk = owns.borrow_mut().allocate(layout).unwrap();
@@ -242,7 +241,18 @@ impl<T> Handle<T> {
     }
 }
 
-impl<T> Deref for Handle<T> {
+impl<T: ?Sized> ArenaBox<T> {
+    pub fn from_ptr(naked: NonNull<T>, owns: Rc<RefCell<Arena>>) -> Self {
+        Self {
+            naked, owns
+        }
+    }
+
+    pub fn ptr(&self) -> NonNull<T> { self.naked }
+    pub fn owns(&self) -> Rc<RefCell<Arena>> { self.owns.clone() }
+}
+
+impl<T: ?Sized> Deref for ArenaBox<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -250,15 +260,24 @@ impl<T> Deref for Handle<T> {
     }
 }
 
-impl<T> DerefMut for Handle<T> {
+impl<T: ?Sized> DerefMut for ArenaBox<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { self.naked.as_mut() }
     }
 }
 
-impl <T: Debug> Debug for Handle<T> {
+impl <T: ?Sized> Clone for ArenaBox<T> {
+    fn clone(&self) -> Self {
+        Self {
+            naked: self.naked.clone(),
+            owns: self.owns.clone(),
+        }
+    }
+}
+
+impl <T: Debug> Debug for ArenaBox<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Handle<T>")
+        f.debug_tuple("ArenaBox<T>")
             .field(self.deref())
             .finish()
     }
@@ -301,6 +320,12 @@ impl Debug for ArenaStr {
         f.debug_tuple("ArenaStr")
             .field(&self.to_string())
             .finish()
+    }
+}
+
+impl PartialEq for ArenaStr {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
     }
 }
 
