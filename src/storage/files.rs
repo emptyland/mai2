@@ -1,7 +1,7 @@
 use std::fmt::Write;
 use std::str::FromStr;
 
-use crate::files::Kind::Unknown;
+use crate::storage::files::Kind::Unknown;
 
 const LOCK_NAME: &str = "LOCK";
 const CURRENT_NAME: &str = "CURRENT";

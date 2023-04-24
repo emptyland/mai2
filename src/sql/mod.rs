@@ -3,6 +3,7 @@ use std::io;
 mod lexer;
 mod parser;
 mod ast;
+mod serialize;
 
 #[derive(Debug)]
 pub enum ParseError {

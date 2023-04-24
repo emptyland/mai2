@@ -1,14 +1,13 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::{iter, ptr};
-use std::fmt::{Debug, Formatter};
-use std::marker::PhantomData;
+use std::fmt::{Debug, Display, Formatter};
 use std::mem::size_of;
-use std::ops::{Deref, DerefMut, Index};
-use std::ptr::{addr_of_mut, copy_nonoverlapping, NonNull, replace, slice_from_raw_parts, slice_from_raw_parts_mut, write};
+use std::ops::{Deref, DerefMut, Index, IndexMut};
+use std::ptr::{addr_of_mut, copy_nonoverlapping, NonNull, slice_from_raw_parts_mut, write};
 use std::rc::Rc;
 
-use crate::utils::round_up;
+use crate::base::utils::round_up;
 
 const NORMAL_PAGE_SIZE: usize = 16 * 1024;
 const LARGE_PAGE_THRESHOLD_SIZE: usize = NORMAL_PAGE_SIZE / 2;
@@ -335,6 +334,12 @@ impl Clone for ArenaStr {
     }
 }
 
+impl Display for ArenaStr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 
 pub struct ArenaVec<T> {
     naked: NonNull<[T]>,
@@ -404,6 +409,12 @@ impl <T> Index<usize> for ArenaVec<T> {
 
     fn index(&self, index: usize) -> &Self::Output {
         &self.as_slice()[index]
+    }
+}
+
+impl <T> IndexMut<usize> for ArenaVec<T> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.as_mut_slice()[index]
     }
 }
 

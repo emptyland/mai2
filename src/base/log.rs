@@ -35,28 +35,28 @@ macro_rules! log_append {
 #[macro_export]
 macro_rules! log_info {
     ($logger:expr, $($arg:tt)+) => {
-        $crate::log_append!($logger, $crate::log::LoggingLevel::Info, $($arg)+)
+        $crate::log_append!($logger, $crate::base::LoggingLevel::Info, $($arg)+)
     }
 }
 
 #[macro_export]
 macro_rules! log_warn {
     ($logger:expr, $($arg:tt)+) => {
-        $crate::log_append!($logger, $crate::log::LoggingLevel::Warn, $($arg)+)
+        $crate::log_append!($logger, $crate::base::LoggingLevel::Warn, $($arg)+)
     }
 }
 
 #[macro_export]
 macro_rules! log_error {
     ($logger:expr, $($arg:tt)+) => {
-        $crate::log_append!($logger, $crate::log::LoggingLevel::Error, $($arg)+)
+        $crate::log_append!($logger, $crate::base::LoggingLevel::Error, $($arg)+)
     }
 }
 
 #[macro_export]
 macro_rules! log_debug {
     ($logger:expr, $($arg:tt)+) => {
-        $crate::log_append!($logger, $crate::log::LoggingLevel::Debug, $($arg)+)
+        $crate::log_append!($logger, $crate::base::LoggingLevel::Debug, $($arg)+)
     }
 }
 

@@ -5,25 +5,24 @@ use std::cmp::max;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::io::Read;
-use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::{config, files, iterator, log_debug, mai2};
-use crate::cache::TableCache;
-use crate::compaction::Compact;
-use crate::comparator::Comparator;
-use crate::env::Env;
-use crate::iterator::IteratorRc;
-use crate::key::InternalKeyComparator;
-use crate::mai2::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, ReadOptions};
-use crate::memory_table::MemoryTable;
-use crate::queue::NonBlockingQueue;
-use crate::sst_reader::SSTReader;
-use crate::status::Status;
-use crate::version::{FileMetadata, Version, VersionSet};
+use crate::storage::{config, files, mai2};
+use crate::storage::cache::TableCache;
+use crate::storage::compaction::Compact;
+use crate::storage::comparator::Comparator;
+use crate::storage::Env;
+use crate::storage::IteratorRc;
+use crate::storage::key::InternalKeyComparator;
+use crate::storage::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, ReadOptions};
+use crate::storage::memory_table::MemoryTable;
+use crate::base::queue::NonBlockingQueue;
+use crate::storage::sst_reader::SSTReader;
+use crate::storage::Status;
+use crate::storage::version::{FileMetadata, Version, VersionSet};
 
 pub struct ColumnFamilyImpl {
     name: String,
@@ -484,12 +483,6 @@ impl ColumnFamilySet {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use crate::mai2::Options;
-
-    use super::*;
-
     #[test]
     fn sanity() {
         // let vss = VersionSet::new(PathBuf::from("db"), &Options::default());

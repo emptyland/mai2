@@ -11,17 +11,18 @@ use std::sync::Arc;
 
 use crc::{Crc, CRC_32_ISCSI};
 
-use crate::{iterator, mai2, utils};
-use crate::cache::{Block, BlockCache};
-use crate::comparator::Comparator;
-use crate::env::RandomAccessFile;
-use crate::iterator::{Direction, Iterator as MaiIterator};
-use crate::key::{InternalKey, InternalKeyComparator, KeyBundle, Tag};
-use crate::mai2::{from_io_result, PinnableValue, ReadOptions};
-use crate::marshal::{Decoder, RandomAccessFileReader, VarintDecode};
-use crate::sst_builder::{BlockHandle, SST_MAGIC_NUMBER, TableProperties};
-use crate::status::{Corrupting, Status};
-use crate::varint::{MAX_VARINT32_LEN, Varint};
+use crate::storage::{iterator, mai2};
+use crate::base::utils;
+use crate::storage::cache::{Block, BlockCache};
+use crate::storage::Comparator;
+use crate::storage::RandomAccessFile;
+use crate::storage::{Direction, Iterator as MaiIterator};
+use crate::storage::key::{InternalKey, InternalKeyComparator, KeyBundle, Tag};
+use crate::storage::{from_io_result, PinnableValue, ReadOptions};
+use crate::base::{Decoder, RandomAccessFileReader, VarintDecode};
+use crate::storage::sst_builder::{BlockHandle, SST_MAGIC_NUMBER, TableProperties};
+use crate::storage::{Corrupting, Status};
+use crate::base::varint::{MAX_VARINT32_LEN, Varint};
 
 pub struct SSTReader {
     //this: Weak<SSTReader>,
@@ -563,9 +564,9 @@ impl iterator::Iterator for BlockIterator {
 
 #[cfg(test)]
 mod tests {
-    use crate::arena::Arena;
-    use crate::env::{MemoryRandomAccessFile, MemoryWritableFile};
-    use crate::sst_builder::tests::*;
+    use crate::base::Arena;
+    use crate::storage::{MemoryRandomAccessFile, MemoryWritableFile};
+    use crate::storage::sst_builder::tests::*;
 
     use super::*;
 

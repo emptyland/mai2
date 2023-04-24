@@ -1,5 +1,4 @@
 use std::collections::vec_deque::VecDeque;
-use std::ops::DerefMut;
 use std::sync::Mutex;
 
 pub struct NonBlockingQueue<T> {

@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use crc::{Crc, CRC_32_ISCSI};
 use num_enum::TryFromPrimitive;
+use crate::base;
 
-use crate::env::{SequentialFile, WritableFile};
-use crate::marshal;
-use crate::marshal::FileReader;
+use crate::storage::{SequentialFile, WritableFile};
+use crate::base::FileReader;
 
 #[repr(u32)]
 #[derive(PartialEq, Debug, Clone, Copy, TryFromPrimitive)]
@@ -39,7 +39,7 @@ pub const DEFAULT_BLOCK_SIZE: usize = 32768;
  * +---------+-------+
  */
 pub struct LogWriter {
-    file_writer: marshal::FileWriter,
+    file_writer: base::marshal::FileWriter,
     block_size: usize,
     block_offset: usize,
     record_ty_crc32_sums: [u32; MAX_RECORD_TYPE + 1],
@@ -57,7 +57,7 @@ impl LogWriter {
         }
 
         Self {
-            file_writer: marshal::FileWriter::new(file),
+            file_writer: base::FileWriter::new(file),
             block_size,
             block_offset: 0,
             record_ty_crc32_sums: sums,
@@ -143,7 +143,7 @@ pub struct LogReader {
 impl LogReader {
     pub fn new(file: Rc<RefCell<dyn SequentialFile>>, verify_checksum: bool, block_size: usize) -> Self {
         Self {
-            file_reader: marshal::FileReader::new(file),
+            file_reader: FileReader::new(file),
             verify_checksum,
             block_size,
             block_offset: 0,
@@ -219,10 +219,9 @@ impl LogReader {
 mod tests {
     use std::cell::RefCell;
     use std::path::PathBuf;
-    use std::rc::Rc;
 
-    use crate::env::{Env, EnvImpl, MemorySequentialFile, MemoryWritableFile, WritableFile};
-    use crate::version::VersionPatch;
+    use crate::storage::{Env, EnvImpl, MemorySequentialFile, MemoryWritableFile, WritableFile};
+    use crate::storage::version::VersionPatch;
 
     use super::*;
 

@@ -4,11 +4,9 @@ use std::io::Read;
 use std::ops::DerefMut;
 use std::rc::Rc;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use crate::arena::{Allocator, Arena, ArenaStr};
+use crate::base::{Arena, ArenaStr};
 use crate::sql::{from_io_result, ParseError, Result};
 use crate::sql::{SourceLocation, SourcePosition};
-use crate::status::{Corrupting, Status};
 
 #[derive(Default, Clone)]
 pub struct TokenPart {
@@ -301,7 +299,7 @@ impl<'a> Lexer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::env::MemorySequentialFile;
+    use crate::storage::MemorySequentialFile;
     use super::*;
 
     #[test]

@@ -16,15 +16,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crc::{Crc, CRC_32_ISCSI};
 use lru::LruCache;
 
-use crate::column_family::ColumnFamilyImpl;
-use crate::env::{Env, RandomAccessFile};
-use crate::key::Tag;
-use crate::mai2;
-use crate::mai2::{from_io_result, PinnableValue, ReadOptions};
-use crate::marshal::{Decoder, FixedDecode, VarintDecode};
-use crate::sst_builder::{BlockHandle, TableProperties};
-use crate::sst_reader::{KeyBloomFilter, SSTReader};
-use crate::varint::MAX_VARINT32_LEN;
+use crate::storage::column_family::ColumnFamilyImpl;
+use crate::storage::{Env, RandomAccessFile};
+use crate::storage::key::Tag;
+use crate::storage;
+use crate::storage::{from_io_result, PinnableValue, ReadOptions};
+use crate::base::{Decoder, FixedDecode, VarintDecode};
+use crate::storage::sst_builder::{BlockHandle, TableProperties};
+use crate::storage::sst_reader::{KeyBloomFilter, SSTReader};
+use crate::base::varint::MAX_VARINT32_LEN;
 
 pub struct TableCache {
     abs_db_path: PathBuf,
@@ -52,7 +52,7 @@ impl TableCache {
     }
 
     pub fn get(&self, read_opts: &ReadOptions, cfi: &ColumnFamilyImpl, file_number: u64, key: &[u8])
-               -> mai2::Result<(PinnableValue, Tag)> {
+               -> storage::Result<(PinnableValue, Tag)> {
         let entry = from_io_result(self.get_or_insert(cfi, file_number, 0))?;
         entry.table.get(read_opts, &cfi.internal_key_cmp, key)
     }

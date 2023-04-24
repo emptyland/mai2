@@ -14,24 +14,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 
-use crate::{config, files, log_debug, log_error, log_info, mai2, wal};
-use crate::cache::TableCache;
-use crate::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
-use crate::compaction::{Compact, Compaction};
-use crate::comparator::Comparator;
-use crate::env::{Env, WritableFile};
-use crate::files::{Kind, paths};
-use crate::iterator::{DBIterator, Iterator as MaiIterator, IteratorArc, IteratorRc, MergingIterator};
-use crate::key::Tag;
-use crate::log::Logger;
-use crate::mai2::*;
-use crate::memory_table::MemoryTable;
-use crate::snapshot::{SnapshotImpl, SnapshotSet};
-use crate::sst_builder::SSTBuilder;
-use crate::sst_reader::SSTReader;
-use crate::status::{Corrupting, Status};
-use crate::version::{FileMetadata, Version, VersionPatch, VersionSet};
-use crate::wal::{LogReader, LogWriter};
+use crate::storage::{config, mai2, wal, files};
+use crate::{log_debug, log_error, log_info};
+use crate::storage::cache::TableCache;
+use crate::storage::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
+use crate::storage::compaction::{Compact, Compaction};
+use crate::storage::comparator::Comparator;
+use crate::storage::{Env, WritableFile};
+use crate::storage::files::{Kind, paths};
+use crate::storage::{DBIterator, Iterator as MaiIterator, IteratorArc, IteratorRc, MergingIterator};
+use crate::storage::key::Tag;
+use crate::base::Logger;
+use crate::storage::mai2::*;
+use crate::storage::memory_table::MemoryTable;
+use crate::storage::snapshot::{SnapshotImpl, SnapshotSet};
+use crate::storage::sst_builder::SSTBuilder;
+use crate::storage::sst_reader::SSTReader;
+use crate::storage::{Corrupting, Status};
+use crate::storage::version::{FileMetadata, Version, VersionPatch, VersionSet};
+use crate::storage::wal::{LogReader, LogWriter};
 
 pub struct DBImpl {
     pub db_name: String,
@@ -1107,7 +1108,7 @@ struct Get {
 mod tests {
     use std::iter;
 
-    use crate::env::JunkFilesCleaner;
+    use crate::storage::JunkFilesCleaner;
 
     use super::*;
 

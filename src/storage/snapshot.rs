@@ -3,7 +3,7 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::sync::{Arc, Weak};
 
-use crate::mai2::Snapshot;
+use crate::storage::Snapshot;
 
 pub struct SnapshotSet {
     snapshots: Cell<Vec<Arc<SnapshotImpl>>>,

@@ -4,9 +4,9 @@ use std::iter::Iterator as StdIterator;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::comparator::Comparator;
-use crate::key::{InternalKey, Tag};
-use crate::status::Status;
+use crate::storage::Comparator;
+use crate::storage::key::{InternalKey, Tag};
+use crate::storage::Status;
 
 pub trait Iterator {
     fn valid(&self) -> bool;
@@ -462,8 +462,8 @@ impl<'a> Iterator for IteratorWrapper<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::comparator::BitwiseComparator;
-    use crate::key::InternalKeyComparator;
+    use crate::storage::BitwiseComparator;
+    use crate::storage::key::InternalKeyComparator;
 
     use super::*;
 

@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use rand::random;
 
-use crate::arena::{Allocator, Arena};
-use crate::key::{InternalKey, Tag, TAG_SIZE};
-use crate::skip_list::{BRANCHING, Comparing, MAX_HEIGHT};
+use crate::base::{Allocator, Arena};
+use crate::storage::key::{InternalKey, Tag, TAG_SIZE};
+use crate::storage::skip_list::{BRANCHING, Comparing, MAX_HEIGHT};
 
 pub struct InlineSkipList<'a, Cmp> {
     arena: Rc<RefCell<Arena>>,
@@ -373,10 +373,8 @@ impl<'a, Cmp: for<'b> Comparing<&'b [u8]>> Iterator for IteratorImpl<'a, Cmp> {
 
 #[cfg(test)]
 mod tests {
-    use std::ptr::addr_of;
-
-    use crate::comparator::{BitwiseComparator, Comparator};
-    use crate::key::{InternalKey, InternalKeyComparator};
+    use crate::storage::{BitwiseComparator, Comparator};
+    use crate::storage::key::{InternalKey, InternalKeyComparator};
 
     use super::*;
 

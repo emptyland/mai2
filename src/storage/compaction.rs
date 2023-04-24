@@ -2,19 +2,18 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::{config, iterator, key};
-use crate::cache::TableCache;
-use crate::column_family::ColumnFamilyImpl;
-use crate::comparator::Comparator;
-use crate::iterator::{Iterator, IteratorRc, MergingIterator};
-use crate::key::{InternalKey, InternalKeyComparator, MAX_SEQUENCE_NUMBER, Tag};
-use crate::log::Logger;
-use crate::memory_table::MemoryTable;
-use crate::sst_builder::SSTBuilder;
-use crate::version::{FileMetadata, Version, VersionPatch};
+use crate::storage::{config, key};
+use crate::storage::cache::TableCache;
+use crate::storage::column_family::ColumnFamilyImpl;
+use crate::storage::Comparator;
+use crate::storage::{Iterator, IteratorRc, MergingIterator};
+use crate::storage::key::{InternalKey, InternalKeyComparator, MAX_SEQUENCE_NUMBER, Tag};
+use crate::base::Logger;
+use crate::storage::memory_table::MemoryTable;
+use crate::storage::sst_builder::SSTBuilder;
+use crate::storage::version::{FileMetadata, Version, VersionPatch};
 
 pub struct Compaction {
     abs_db_path: PathBuf,

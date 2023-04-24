@@ -1,26 +1,15 @@
 use std::any::Any;
 use std::cell::RefCell;
-use std::io::Write;
+use std::ops::DerefMut;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use crate::arena::{Arena, ArenaStr, ArenaVec, ArenaBox};
-use crate::mai2::Snapshot;
+use crate::base::{Arena, ArenaStr, ArenaVec, ArenaBox};
 use crate::sql::lexer::Token;
 
-// macro_rules! ast_nodes {
-//     () => {
-//         [
-//             (CreateTable, visit_create_table),
-//             (DropTable, visit_drop_table),
-//         ]
-//     }
-// }
-
-//($($val:expr),+ $(,)?)
 macro_rules! ast_nodes_impl {
     [$(($name:ident, $call:ident)),+ $(,)?] => {
         pub trait Visitor {
-            $(fn $call(&self, this: &$name);)+
+            $(fn $call(&mut self, this: &mut $name);)+
         }
         $(statement_impl!($name, $call);)+
     }
@@ -30,7 +19,8 @@ macro_rules! statement_impl {
     ($name:ident, $call:ident) => {
         impl Statement for $name {
             fn as_any(&self) -> &dyn Any { self }
-            fn accept(&self, visitor: &dyn Visitor) {
+            fn as_mut_any(&mut self) -> &mut dyn Any { self }
+            fn accept(&mut self, visitor: &mut dyn Visitor) {
                 visitor.$call(self)
             }
         }
@@ -46,7 +36,8 @@ ast_nodes_impl![
 
 pub trait Statement {
     fn as_any(&self) -> &dyn Any;
-    fn accept(&self, visitor: &dyn Visitor);
+    fn as_mut_any(&mut self) -> &mut dyn Any;
+    fn accept(&mut self, visitor: &mut dyn Visitor);
 }
 
 pub enum Operator {
@@ -56,8 +47,11 @@ pub enum Operator {
 pub trait Expression: Statement {
     fn op(&self) -> &Operator;
     fn operands(&self) -> &[ArenaBox<dyn Expression>];
+    fn operands_mut(&mut self) -> &mut [ArenaBox<dyn Expression>];
     fn lhs(&self) -> &ArenaBox<dyn Expression> { &self.operands()[0] }
+    fn lhs_mut(&mut self) -> &mut ArenaBox<dyn Expression> { &mut self.operands_mut()[0] }
     fn rhs(&self) -> &ArenaBox<dyn Expression> { &self.operands()[1] }
+    fn rhs_mut(&mut self) -> &mut ArenaBox<dyn Expression> { &mut self.operands_mut()[1] }
 }
 
 pub struct CreateTable {
@@ -101,6 +95,10 @@ impl Expression for BinaryExpression {
 
     fn operands(&self) -> &[ArenaBox<dyn Expression>] {
         &self.operands
+    }
+
+    fn operands_mut(&mut self) -> &mut [ArenaBox<dyn Expression>] {
+        &mut self.operands
     }
 }
 
@@ -154,6 +152,10 @@ impl Factory {
             len_part,
         }, &self.arena)
     }
+
+    pub fn str(&self, raw: &str) -> ArenaStr {
+        ArenaStr::new(raw, self.arena.borrow_mut().deref_mut())
+    }
 }
 
 impl <T: Statement + 'static> From<ArenaBox<T>> for ArenaBox<dyn Statement> {
@@ -168,26 +170,6 @@ impl <T: Statement + 'static> From<ArenaBox<dyn Statement>> for ArenaBox<T> {
         Self::from_ptr(ptr, value.owns())
     }
 }
-
-struct YamlWriter<'a> {
-    writer: &'a dyn Write,
-    indent: u32
-}
-
-impl <'a> Visitor for YamlWriter<'a> {
-    fn visit_create_table(&self, this: &CreateTable) {
-        todo!()
-    }
-
-    fn visit_drop_table(&self, this: &DropTable) {
-        todo!()
-    }
-
-    fn visit_binary_expression(&self, this: &BinaryExpression) {
-        todo!()
-    }
-}
-
 
 
 #[cfg(test)]

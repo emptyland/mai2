@@ -1,20 +1,19 @@
-use std::cell::{Cell, Ref, RefCell};
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
-use std::ops::DerefMut;
 use std::ptr::addr_of;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
 
-use crate::{inline_skip_list, iterator, mai2, skip_list};
-use crate::arena::{Arena, ScopedMemory};
-use crate::comparator::Comparator;
-use crate::inline_skip_list::InlineSkipList;
-use crate::iterator::Iterator;
-use crate::key::{InternalKey, InternalKeyComparator, KeyBundle, Tag};
-use crate::skip_list::{Comparing, SkipList};
-use crate::status::Status;
+use crate::storage::{inline_skip_list, iterator, mai2, skip_list};
+use crate::base::{Arena, ScopedMemory};
+use crate::storage::comparator::Comparator;
+use crate::storage::inline_skip_list::InlineSkipList;
+use crate::storage::Iterator;
+use crate::storage::key::{InternalKey, InternalKeyComparator, KeyBundle, Tag};
+use crate::storage::skip_list::{Comparing, SkipList};
+use crate::storage::Status;
 
 pub struct MemoryTable {
     arena: Rc<RefCell<Arena>>,
@@ -150,7 +149,7 @@ impl Iterator for IteratorImpl {
 
 #[cfg(test)]
 mod tests {
-    use crate::comparator::BitwiseComparator;
+    use crate::storage::BitwiseComparator;
 
     use super::*;
 

@@ -5,15 +5,14 @@ use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::cache::Block;
-use crate::comparator::{BitwiseComparator, Comparator};
-use crate::env::{Env, EnvImpl};
-use crate::iterator::IteratorArc;
-use crate::key::Tag;
-use crate::log::{Logger, WriterLogger};
-use crate::marshal::{Decoder, VarintDecode, VarintEncode};
-use crate::memory_table::MemoryTable;
-use crate::status::{Corrupting, Status};
+use crate::storage::cache::Block;
+use crate::storage::{BitwiseComparator, Comparator};
+use crate::storage::{Env, EnvImpl};
+use crate::storage::IteratorArc;
+use crate::storage::key::Tag;
+use crate::base::{Logger, WriterLogger, Decoder, VarintDecode, VarintEncode};
+use crate::storage::memory_table::MemoryTable;
+use crate::storage::{Corrupting, Status};
 
 pub type Result<T> = std::result::Result<T, Status>;
 

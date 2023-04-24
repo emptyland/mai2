@@ -1,5 +1,5 @@
 use std::io::Read;
-use crate::arena::{ArenaVec, ArenaBox, ArenaStr};
+use crate::base::{ArenaVec, ArenaBox, ArenaStr};
 use crate::sql::{ParseError, Result, SourceLocation, SourcePosition};
 use crate::sql::ast::{ColumnDeclaration, CreateTable, Expression, Factory, Statement, TypeDeclaration};
 use crate::sql::lexer::{Lexer, Token, TokenPart};
@@ -218,7 +218,7 @@ impl <'a> Parser<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::env::MemorySequentialFile;
+    use crate::storage::MemorySequentialFile;
     use super::*;
     use crate::sql::ast::Factory;
 
@@ -228,7 +228,10 @@ mod tests {
         let txt = Vec::from("create table a { a char(122) }");
         let mut file = MemorySequentialFile::new(txt);
         let mut parser = Parser::new(&mut file, factory)?;
-        let stmts = parser.parse()?;
+        let mut stmts = parser.parse()?;
+
+        // let yaml = serialize_yaml_to_string(stmts[0].deref_mut());
+        // println!("{}", yaml);
 
         assert_eq!(1, stmts.len());
         let ast = ArenaBox::<CreateTable>::from(stmts[0].clone());

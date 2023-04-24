@@ -2,33 +2,29 @@ use std::{array, io};
 use std::cell::RefCell;
 use std::cmp::{max, Ordering};
 use std::collections::{BTreeSet, HashMap};
-use std::collections::hash_map::Iter;
 use std::fs::{File, read};
 use std::io::Read;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::ptr::addr_of_mut;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use num_enum::TryFromPrimitive;
 
 use patch::CFCreation;
 use patch::FileCreation;
 
-use crate::{config, files, mai2, wal};
-use crate::cache::TableCache;
-use crate::column_family::{ColumnFamilyImpl, ColumnFamilySet};
-use crate::comparator::Comparator;
-use crate::config::max_size_for_level;
-use crate::env::{Env, WritableFile};
-use crate::key::{InternalKey, InternalKeyComparator, Tag};
-use crate::log::Logger;
-use crate::mai2::{ColumnFamilyOptions, Options, PinnableValue, ReadOptions};
-use crate::marshal::{Decoder, VarintDecode, VarintEncode};
-use crate::status::Status;
-use crate::status::Status::NotFound;
-use crate::wal::{LogReader, LogWriter};
+use crate::storage::{config, files, mai2, wal};
+use crate::storage::cache::TableCache;
+use crate::storage::column_family::{ColumnFamilyImpl, ColumnFamilySet};
+use crate::storage::Comparator;
+use crate::storage::config::max_size_for_level;
+use crate::storage::{Env, WritableFile};
+use crate::storage::key::{InternalKey, InternalKeyComparator, Tag};
+use crate::storage::{ColumnFamilyOptions, Options, PinnableValue, ReadOptions};
+use crate::base::{Logger, Decoder, VarintDecode, VarintEncode};
+use crate::storage::Status;
+use crate::storage::Status::NotFound;
+use crate::storage::wal::{LogReader, LogWriter};
 
 pub struct VersionSet {
     env: Arc<dyn Env>,
@@ -387,8 +383,8 @@ mod patch {
 
     use num_enum::TryFromPrimitive;
 
-    use crate::marshal::VarintEncode;
-    use crate::version::FileMetadata;
+    use crate::base::VarintEncode;
+    use crate::storage::version::FileMetadata;
 
     #[derive(Debug, Default, Clone)]
     pub struct PrepareRedoLog {

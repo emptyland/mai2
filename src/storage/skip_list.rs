@@ -10,8 +10,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use rand::prelude::*;
 
-use crate::arena::{Allocator, Arena};
-use crate::key::{Tag, TAG_SIZE};
+use crate::base::{Allocator, Arena};
 
 //type Comparator = Box<dyn for<'a> Comparing<&'a [u8]>>;
 
@@ -320,8 +319,8 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> Iterator for
 mod tests {
     use std::ops::DerefMut;
 
-    use crate::arena::Arena;
-    use crate::key::{KeyBundle, Tag};
+    use crate::base::Arena;
+    use crate::storage::key::{KeyBundle, Tag};
 
     use super::*;
 

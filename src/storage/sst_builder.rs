@@ -8,11 +8,12 @@ use std::sync::Arc;
 
 use crc::{Crc, CRC_32_ISCSI};
 
-use crate::{config, utils};
-use crate::comparator::Comparator;
-use crate::env::WritableFile;
-use crate::key::{InternalKey, InternalKeyComparator};
-use crate::marshal::{Decoder, FileWriter, FixedEncode, VarintDecode, VarintEncode};
+use crate::base;
+use crate::storage::config;
+use crate::storage::Comparator;
+use crate::storage::WritableFile;
+use crate::storage::key::{InternalKey, InternalKeyComparator};
+use crate::base::{Decoder, FileWriter, FixedEncode, VarintDecode, VarintEncode};
 
 pub const SST_MAGIC_NUMBER: u32 = 0x74737300;
 
@@ -379,13 +380,13 @@ impl FilterBlockBuilder {
     pub fn is_empty(&self) -> bool { self.bits.is_empty() }
 
     pub fn add_key(&mut self, key: &[u8]) {
-        for hash in utils::BLOOM_FILTER_HASHES_ORDER {
+        for hash in base::BLOOM_FILTER_HASHES_ORDER {
             self.set_bit(hash(key) % self.size_in_bits());
         }
     }
 
     pub fn maybe_exists(&self, key: &[u8]) -> bool {
-        for hash in utils::BLOOM_FILTER_HASHES_ORDER {
+        for hash in base::BLOOM_FILTER_HASHES_ORDER {
             if !self.test_bit(hash(key) % self.size_in_bits()) {
                 return false;
             }
@@ -426,11 +427,11 @@ impl FilterBlockBuilder {
 pub mod tests {
     use std::rc::Rc;
 
-    use crate::arena::Arena;
-    use crate::comparator::BitwiseComparator;
-    use crate::env::MemoryWritableFile;
-    use crate::key::KeyBundle;
-    use crate::utils::*;
+    use crate::base::Arena;
+    use crate::storage::BitwiseComparator;
+    use crate::storage::MemoryWritableFile;
+    use crate::storage::key::KeyBundle;
+    use crate::base::*;
 
     use super::*;
 
