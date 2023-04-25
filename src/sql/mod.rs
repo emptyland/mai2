@@ -1,15 +1,37 @@
 use std::io;
+use crate::Status;
 
-mod lexer;
-mod parser;
-mod ast;
-mod serialize;
+pub mod lexer;
+pub mod parser;
+pub mod ast;
+pub mod serialize;
+
+use lexer::Token;
 
 #[derive(Debug)]
 pub enum ParseError {
     IOError(String),
     SyntaxError(String, SourceLocation),
-    TokenError(String, SourcePosition)
+    TokenError(String, SourcePosition),
+}
+
+impl ParseError {
+    pub fn to_string(&self) -> String {
+        match self {
+            Self::IOError(e) => format!("IO error: {}", e),
+            Self::SyntaxError(e, location) => {
+                format!("Syntax error: [{}:{}-{}:{}] {}",
+                        location.start.line,
+                        location.start.column,
+                        location.end.line,
+                        location.end.column,
+                        e)
+            },
+            Self::TokenError(e, pos) => {
+                format!("Incorrect token: [{}:{}] {}", pos.line, pos.column, e)
+            }
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ParseError>;

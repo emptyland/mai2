@@ -1,7 +1,6 @@
 use std::{io, iter};
 use std::cell::RefCell;
 use std::cmp::Ordering::Equal;
-use std::ffi::c_void;
 use std::io::Write;
 use std::iter::Iterator;
 use std::mem::size_of_val;
@@ -17,12 +16,13 @@ use crate::storage::cache::{Block, BlockCache};
 use crate::storage::Comparator;
 use crate::storage::RandomAccessFile;
 use crate::storage::{Direction, Iterator as MaiIterator};
-use crate::storage::key::{InternalKey, InternalKeyComparator, KeyBundle, Tag};
+use crate::storage::key::{InternalKey, InternalKeyComparator, Tag};
 use crate::storage::{from_io_result, PinnableValue, ReadOptions};
 use crate::base::{Decoder, RandomAccessFileReader, VarintDecode};
 use crate::storage::sst_builder::{BlockHandle, SST_MAGIC_NUMBER, TableProperties};
 use crate::storage::{Corrupting, Status};
 use crate::base::varint::{MAX_VARINT32_LEN, Varint};
+use crate::Result;
 
 pub struct SSTReader {
     //this: Weak<SSTReader>,
@@ -95,7 +95,7 @@ impl SSTReader {
     }
 
     pub fn get(&self, _read_opts: &ReadOptions, internal_key_cmp: &InternalKeyComparator,
-               target: &[u8]) -> mai2::Result<(PinnableValue, Tag)> {
+               target: &[u8]) -> Result<(PinnableValue, Tag)> {
         let user_key = InternalKey::extract_user_key(target);
         if self.keys_filter().ensure_not_exists(user_key) {
             return Err(Status::NotFound);

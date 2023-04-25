@@ -2,6 +2,7 @@ use std::{io, iter};
 use std::any::Any;
 use std::io::Write;
 use std::mem::size_of;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -12,9 +13,7 @@ use crate::storage::IteratorArc;
 use crate::storage::key::Tag;
 use crate::base::{Logger, WriterLogger, Decoder, VarintDecode, VarintEncode};
 use crate::storage::memory_table::MemoryTable;
-use crate::storage::{Corrupting, Status};
-
-pub type Result<T> = std::result::Result<T, Status>;
+use crate::{Result, Corrupting, Status};
 
 pub const DEFAULT_COLUMN_FAMILY_NAME: &str = "default";
 
@@ -253,6 +252,8 @@ impl WriteBatch {
 
 
 pub trait DB: Send + Sync {
+    fn get_absolute_path(&self) -> &Path;
+
     fn new_column_family(&self, name: &str, options: ColumnFamilyOptions)
                          -> Result<Arc<dyn ColumnFamily>>;
 
@@ -324,6 +325,10 @@ impl PinnableValue {
 
     pub fn to_vec(self) -> Vec<u8> {
         self.value().into()
+    }
+
+    pub fn to_utf8_string(&self) -> String {
+        String::from_utf8_lossy(self.value()).to_string()
     }
 }
 

@@ -33,6 +33,7 @@ use crate::storage::sst_reader::SSTReader;
 use crate::storage::{Corrupting, Status};
 use crate::storage::version::{FileMetadata, Version, VersionPatch, VersionSet};
 use crate::storage::wal::{LogReader, LogWriter};
+use crate::Result;
 
 pub struct DBImpl {
     pub db_name: String,
@@ -77,7 +78,7 @@ struct WALDescriptor {
 
 impl DBImpl {
     pub fn open(options: Options, name: String, column_family_descriptors: &[ColumnFamilyDescriptor])
-                -> mai2::Result<(Arc<DBImpl>, Vec<Arc<dyn ColumnFamily>>)> {
+                -> Result<(Arc<DBImpl>, Vec<Arc<dyn ColumnFamily>>)> {
         let env = options.env.clone();
         let abs_db_path = DBImpl::make_abs_db_path(&options.core.dir, &name, &env)?;
         let versions = VersionSet::new(abs_db_path.clone(), &options);
@@ -205,7 +206,7 @@ impl DBImpl {
         Ok(total_size)
     }
 
-    fn make_abs_db_path(dir: &String, name: &String, env: &Arc<dyn Env>) -> mai2::Result<PathBuf> {
+    fn make_abs_db_path(dir: &String, name: &String, env: &Arc<dyn Env>) -> Result<PathBuf> {
         let work_path = from_io_result(env.get_work_dir())?;
         let rs = if dir.is_empty() {
             work_path.join(Path::new(&name))
@@ -220,7 +221,7 @@ impl DBImpl {
         Ok(rs)
     }
 
-    fn new_db(&mut self, desc: &[ColumnFamilyDescriptor]) -> mai2::Result<()> {
+    fn new_db(&mut self, desc: &[ColumnFamilyDescriptor]) -> Result<()> {
         if self.env.file_not_exists(self.abs_db_path.as_path()) {
             from_io_result(self.env.make_dir(self.abs_db_path.as_path()))?;
         }
@@ -276,7 +277,7 @@ impl DBImpl {
         //------------------------------unlock version-set--------------------------------------
     }
 
-    fn recover(&self, desc: &[ColumnFamilyDescriptor]) -> mai2::Result<()> {
+    fn recover(&self, desc: &[ColumnFamilyDescriptor]) -> Result<()> {
         let current_file_path = paths::current_file(self.abs_db_path.as_path());
         let rv = from_io_result(self.env.read_to_string(current_file_path.as_path()))?;
         let rs = u64::from_str_radix(rv.as_str(), 10);
@@ -358,7 +359,7 @@ impl DBImpl {
         //------------------------------unlock version-set------------------------------------------
     }
 
-    fn redo(&self, log_file_number: u64, filter: bool, versions: &MutexGuard<VersionSet>) -> mai2::Result<u64> {
+    fn redo(&self, log_file_number: u64, filter: bool, versions: &MutexGuard<VersionSet>) -> Result<u64> {
         let log_file_path = paths::log_file(self.abs_db_path.as_path(), log_file_number);
         let file = from_io_result(self.env.new_sequential_file(log_file_path.as_path()))?;
 
@@ -396,7 +397,7 @@ impl DBImpl {
 
     //fn redo_log_number(&self) -> u64 { self.redo_log.into_inner().as_ref().unwrap().number }
 
-    fn renew_log_file(&self, locking: &mut MutexGuard<VersionSet>) -> mai2::Result<()> {
+    fn renew_log_file(&self, locking: &mut MutexGuard<VersionSet>) -> Result<()> {
         if let Some(redo_log) = self.redo_log.take() {
             {
                 let mut borrow = redo_log.file.borrow_mut();
@@ -435,7 +436,7 @@ impl DBImpl {
 
     fn internal_new_column_family(&self, name: String, options: ColumnFamilyOptions,
                                   locking: &mut MutexGuard<VersionSet>)
-                                  -> mai2::Result<u32> {
+                                  -> Result<u32> {
         let (id, patch) = {
             let versions = locking.deref_mut();
             let mut cfs = versions.column_families().borrow_mut();
@@ -454,7 +455,7 @@ impl DBImpl {
         Ok(id)
     }
 
-    fn write_impl(&self, options: &WriteOptions, updates: WriteBatch) -> mai2::Result<()> {
+    fn write_impl(&self, options: &WriteOptions, updates: WriteBatch) -> Result<()> {
         let mutex = self.versions.clone();
         let mut versions = mutex.lock().unwrap();
         //------------------------------lock version-set--------------------------------------------
@@ -482,7 +483,7 @@ impl DBImpl {
         Ok(())
     }
 
-    fn make_room_for_write<'a>(&'a self, cfi: &Arc<ColumnFamilyImpl>, mut locking: MutexGuard<'a, VersionSet>) -> mai2::Result<MutexGuard<'a, VersionSet>> {
+    fn make_room_for_write<'a>(&'a self, cfi: &Arc<ColumnFamilyImpl>, mut locking: MutexGuard<'a, VersionSet>) -> Result<MutexGuard<'a, VersionSet>> {
         loop {
             if let Err(e) = cfi.background_result.replace(Ok(())) {
                 return Err(e.clone());
@@ -832,7 +833,7 @@ impl DBImpl {
         Ok(Rc::new(RefCell::new(iter)))
     }
 
-    fn prepare_for_get(&self, options: &ReadOptions, cf: &Arc<dyn ColumnFamily>) -> mai2::Result<Get> {
+    fn prepare_for_get(&self, options: &ReadOptions, cf: &Arc<dyn ColumnFamily>) -> Result<Get> {
         let cfi = ColumnFamilyImpl::from(cf);
 
         //------------------------------lock version-set--------------------------------------------
@@ -892,8 +893,10 @@ impl DBImpl {
 }
 
 impl DB for DBImpl {
+    fn get_absolute_path(&self) -> &Path { &self.abs_db_path }
+
     fn new_column_family(&self, name: &str, options: ColumnFamilyOptions)
-                         -> mai2::Result<Arc<dyn ColumnFamily>> {
+                         -> Result<Arc<dyn ColumnFamily>> {
         //--------------------------lock version-set------------------------------------------------
         let mutex = self.versions.clone();
         let mut versions = mutex.lock().unwrap();
@@ -908,7 +911,7 @@ impl DB for DBImpl {
         //--------------------------unlock version-set----------------------------------------------
     }
 
-    fn drop_column_family(&self, column_family: Arc<dyn ColumnFamily>) -> mai2::Result<()> {
+    fn drop_column_family(&self, column_family: Arc<dyn ColumnFamily>) -> Result<()> {
         if column_family.id() == 0 {
             return Err(Status::corrupted("can not drop default column family!"));
         }
@@ -935,7 +938,7 @@ impl DB for DBImpl {
         //--------------------------unlock version-set----------------------------------------------
     }
 
-    fn get_all_column_families(&self) -> mai2::Result<Vec<Arc<dyn ColumnFamily>>> {
+    fn get_all_column_families(&self) -> Result<Vec<Arc<dyn ColumnFamily>>> {
         //--------------------------lock version-set------------------------------------------------
         let versions = self.versions.lock().unwrap();
         let mut cfs: Vec<Arc<dyn ColumnFamily>> = versions
@@ -955,12 +958,12 @@ impl DB for DBImpl {
         self.default_column_family.as_ref().unwrap().clone()
     }
 
-    fn write(&self, options: &WriteOptions, updates: WriteBatch) -> mai2::Result<()> {
+    fn write(&self, options: &WriteOptions, updates: WriteBatch) -> Result<()> {
         self.write_impl(options, updates)
     }
 
     fn get_pinnable(&self, options: &ReadOptions, column_family: &Arc<dyn ColumnFamily>, key: &[u8])
-                    -> mai2::Result<PinnableValue> {
+                    -> Result<PinnableValue> {
         let get = self.prepare_for_get(options, column_family)?;
         //-------------------------------------Lock-free--------------------------------------------
         for table in &get.memory_tables {
@@ -1113,7 +1116,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanity() -> mai2::Result<()> {
+    fn sanity() -> Result<()> {
         let junk = JunkFilesCleaner::new("tests/demo");
 
         let descs = [
@@ -1139,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn default_cf() -> mai2::Result<()> {
+    fn default_cf() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db0");
         let db = open_test_db("db0")?;
         let cf = db.default_column_family();
@@ -1154,7 +1157,7 @@ mod tests {
     }
 
     #[test]
-    fn new_cf() -> mai2::Result<()> {
+    fn new_cf() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db1");
 
         let descs = [
@@ -1189,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_safe_column_family() -> mai2::Result<()> {
+    fn thread_safe_column_family() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db2");
         let db = open_test_db("db2")?;
         let db1 = db.clone();
@@ -1211,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn write_batch() -> mai2::Result<()> {
+    fn write_batch() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db3");
         let db = open_test_db("db3")?;
         let cf = db.default_column_family();

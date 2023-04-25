@@ -6,14 +6,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
 
-use crate::storage::{inline_skip_list, iterator, mai2, skip_list};
+use crate::storage::{inline_skip_list, skip_list};
 use crate::base::{Arena, ScopedMemory};
 use crate::storage::comparator::Comparator;
 use crate::storage::inline_skip_list::InlineSkipList;
 use crate::storage::Iterator;
 use crate::storage::key::{InternalKey, InternalKeyComparator, KeyBundle, Tag};
-use crate::storage::skip_list::{Comparing, SkipList};
-use crate::storage::Status;
+use crate::storage::skip_list::Comparing;
+use crate::{Status, Result};
 
 pub struct MemoryTable {
     arena: Rc<RefCell<Arena>>,
@@ -63,7 +63,7 @@ impl MemoryTable {
         self.table.insert(tag, sequence_number, key, value)
     }
 
-    pub fn get(&self, key: &[u8], sequence_number: u64) -> mai2::Result<(&[u8], Tag)> {
+    pub fn get(&self, key: &[u8], sequence_number: u64) -> Result<(&[u8], Tag)> {
         let mut chunk = ScopedMemory::new();
         let internal_key = KeyBundle::from_key(&mut chunk, sequence_number, key);
 

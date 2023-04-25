@@ -23,6 +23,7 @@ use crate::base::queue::NonBlockingQueue;
 use crate::storage::sst_reader::SSTReader;
 use crate::storage::Status;
 use crate::storage::version::{FileMetadata, Version, VersionSet};
+use crate::Result;
 
 pub struct ColumnFamilyImpl {
     name: String,
@@ -34,7 +35,7 @@ pub struct ColumnFamilyImpl {
     pub internal_key_cmp: InternalKeyComparator,
     initialized: Cell<bool>,
     background_progress: AtomicBool,
-    pub background_result: Cell<mai2::Result<()>>,
+    pub background_result: Cell<Result<()>>,
     pub background_cv: Condvar,
     redo_log_number: Cell<u64>,
 
@@ -295,7 +296,7 @@ impl ColumnFamilyImpl {
         self.background_progress.store(in_progress, Ordering::Relaxed)
     }
 
-    pub fn set_background_result(&self, rs: mai2::Result<()>) {
+    pub fn set_background_result(&self, rs: Result<()>) {
         self.background_result.set(rs);
     }
 
@@ -382,7 +383,7 @@ impl ColumnFamily for ColumnFamilyHandle {
         self.core.internal_key_cmp.user_cmp.clone()
     }
 
-    fn get_descriptor(&self) -> Result<ColumnFamilyDescriptor, Status> {
+    fn get_descriptor(&self) -> Result<ColumnFamilyDescriptor> {
         let _locking = self.mutex.lock().unwrap();
         if self.core().dropped() {
             Err(Status::Corruption(String::from("Column family is dropped!")))

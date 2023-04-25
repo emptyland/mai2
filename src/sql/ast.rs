@@ -113,6 +113,12 @@ impl Factory {
         }
     }
 
+    pub fn from(arena: &Rc<RefCell<Arena>>) -> Self {
+        Self {
+            arena: arena.clone(),
+        }
+    }
+
     pub fn new_create_table(&self, table_name: ArenaStr, if_not_exists: bool) -> ArenaBox<CreateTable> {
         ArenaBox::new(CreateTable {
             table_name,

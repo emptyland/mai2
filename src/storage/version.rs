@@ -13,7 +13,7 @@ use num_enum::TryFromPrimitive;
 use patch::CFCreation;
 use patch::FileCreation;
 
-use crate::storage::{config, files, mai2, wal};
+use crate::storage::{config, files, wal};
 use crate::storage::cache::TableCache;
 use crate::storage::column_family::{ColumnFamilyImpl, ColumnFamilySet};
 use crate::storage::Comparator;
@@ -25,6 +25,7 @@ use crate::base::{Logger, Decoder, VarintDecode, VarintEncode};
 use crate::storage::Status;
 use crate::storage::Status::NotFound;
 use crate::storage::wal::{LogReader, LogWriter};
+use crate::Result;
 
 pub struct VersionSet {
     env: Arc<dyn Env>,
@@ -831,7 +832,7 @@ impl Version {
     }
 
     pub fn get(&self, read_opts: &ReadOptions, key: &[u8], sequence_number: u64, cache: &TableCache) ->
-    mai2::Result<(PinnableValue, Tag)> {
+        Result<(PinnableValue, Tag)> {
         let internal_key = InternalKey::from_key(key, sequence_number, Tag::Key);
         let owns = self.owns.upgrade().unwrap();
         let internal_key_cmp = &owns.internal_key_cmp;
