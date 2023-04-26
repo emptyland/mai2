@@ -22,8 +22,11 @@ pub enum Token {
     Id(ArenaStr),
     IntLiteral(i64),
     FloatLiteral(f64),
+    StringLiteral(ArenaStr),
 
+    // keywords
     Create,
+    Drop,
     Table,
     If,
     Not,
@@ -33,8 +36,36 @@ pub enum Token {
     Key,
     Default,
     Auto_Increment,
+    Insert,
+    Into,
+    Values,
+    Row,
+    And,
+    Or,
+    True,
+    False,
+    Distinct,
+
+    // types:
+    Char,
+    Varchar,
+    TinyInt,
+    SmallInt,
+    Int,
+    BigInt,
+    Float,
+    Double,
 
     Plus,
+    Minus,
+    Star,
+    Div,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
     LBrace,
     RBrace,
     LBracket,
@@ -46,15 +77,10 @@ pub enum Token {
     RParent,
     // )
     Comma,
-
-    Char,
-    Varchar,
-    TinyInt,
-    SmallInt,
-    Int,
-    BigInt,
-    Float,
-    Double,
+    // ;
+    Semi,
+    // .
+    Dot,
 }
 
 unsafe impl Sync for Token {}
@@ -80,6 +106,7 @@ impl Keywords {
             words
             [
                 Create,
+                Drop,
                 Table,
                 If,
                 Not,
@@ -89,6 +116,15 @@ impl Keywords {
                 Key,
                 Default,
                 Auto_Increment,
+                Insert,
+                Into,
+                Values,
+                Row,
+                And,
+                Or,
+                True,
+                False,
+                Distinct,
 
                 Char,
                 Varchar,
@@ -147,6 +183,10 @@ impl<'a> Lexer<'a> {
             match ch {
                 '\0' => return self.move_to_single_token(Token::Eof),
                 '+' => return self.move_to_single_token(Token::Plus),
+                '-' => return self.move_to_single_token(Token::Minus),
+                '*' => return self.move_to_single_token(Token::Star),
+                '/' => return self.move_to_single_token(Token::Div),
+                '=' => return self.move_to_single_token(Token::Eq),
                 ',' => return self.move_to_single_token(Token::Comma),
                 '{' => return self.move_to_single_token(Token::LBrace),
                 '}' => return self.move_to_single_token(Token::RBrace),
@@ -154,6 +194,10 @@ impl<'a> Lexer<'a> {
                 ']' => return self.move_to_single_token(Token::RBracket),
                 '(' => return self.move_to_single_token(Token::LParent),
                 ')' => return self.move_to_single_token(Token::RParent),
+                ';' => return self.move_to_single_token(Token::Semi),
+                '.' => return self.move_to_single_token(Token::Dot),
+                '\'' => return self.parse_str_literal('\''),
+                '\"' => return self.parse_str_literal('\"'),
                 '`' => {
                     let start_pos = self.current_position();
                     return self.parse_id_or_keyword('`', start_pos);
@@ -233,6 +277,22 @@ impl<'a> Lexer<'a> {
             Token::IntLiteral(i64::from_str(buf.as_str()).unwrap())
         };
         Ok(self.to_concat_token(token, start_pos))
+    }
+
+    fn parse_str_literal(&mut self, quote: char) -> Result<TokenPart> {
+        let start_pos = self.current_position();
+        assert_eq!(quote, self.move_next()?);
+        let mut buf = String::new();
+        while self.peek() != quote {
+            let ch = self.peek();
+            if ch == '\r' || ch == '\n' {
+                return Err(ParseError::TokenError("Unexpected `return' character in single-line string".to_string(),
+                                                  self.current_position()));
+            }
+            buf.push(ch);
+        }
+        let str = ArenaStr::new(buf.as_str(), self.arena.borrow_mut().deref_mut());
+        Ok(self.to_concat_token(Token::StringLiteral(str), start_pos))
     }
 
     fn is_id_character(ch: char) -> bool {

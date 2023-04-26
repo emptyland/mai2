@@ -3,10 +3,10 @@ use std::io::Read;
 use std::rc::Rc;
 use std::sync::Weak;
 
-use crate::base::Arena;
+use crate::base::{Arena, ArenaStr};
 use crate::exec::db::{ColumnMetadata, ColumnType, DB, TableMetadata};
 use crate::exec::from_sql_result;
-use crate::sql::ast::{BinaryExpression, CreateTable, DropTable, Factory, TypeDeclaration, Visitor};
+use crate::sql::ast::{BinaryExpression, CallFunction, CreateTable, DropTable, Factory, FullyQualifiedName, Identifier, InsertIntoTable, Literal, TypeDeclaration, UnaryExpression, Visitor};
 use crate::sql::parser::Parser;
 use crate::{Corrupting, Result, Status};
 use crate::sql::lexer::Token;
@@ -59,7 +59,8 @@ impl Executor {
 impl Visitor for Executor {
     fn visit_create_table(&mut self, this: &mut CreateTable) {
         let db = self.db.upgrade().unwrap();
-        if db.is_table_exists(this.table_name.as_str()) {
+        let mut locking_tables = db.lock_tables();
+        if locking_tables.contains_key(&this.table_name.to_string()) {
             if !this.if_not_exists {
                 self.rs = Err(Status::corrupted(format!("Duplicated type name: {}",
                                                         this.table_name.as_str())));
@@ -99,17 +100,65 @@ impl Visitor for Executor {
             table.columns.push(col);
         }
 
-        match db.create_table(table) {
+        match db.create_table(table, &mut locking_tables) {
             Err(e) => self.rs = Err(e),
             Ok(_) => ()
         }
     }
 
     fn visit_drop_table(&mut self, this: &mut DropTable) {
+        let db = self.db.upgrade().unwrap();
+        let mut locking_tables = db.lock_tables();
+        if !locking_tables.contains_key(&this.table_name.to_string()) {
+            if !this.if_exists {
+                self.rs = Err(Status::corrupted(format!("Table `{}` not found",
+                                                        this.table_name.as_str())));
+            }
+            return;
+        }
+        match db.drop_table(&this.table_name.to_string(), &mut locking_tables) {
+            Err(e) => self.rs = Err(e),
+            Ok(_) => ()
+        }
+    }
+
+    fn visit_insert_into_table(&mut self, this: &mut InsertIntoTable) {
+        todo!()
+    }
+
+    fn visit_identifier(&mut self, this: &mut Identifier) {
+        todo!()
+    }
+
+    fn visit_full_qualified_name(&mut self, this: &mut FullyQualifiedName) {
+        todo!()
+    }
+
+    fn visit_unary_expression(&mut self, this: &mut UnaryExpression) {
         todo!()
     }
 
     fn visit_binary_expression(&mut self, this: &mut BinaryExpression) {
+        todo!()
+    }
+
+    fn visit_call_function(&mut self, this: &mut CallFunction) {
+        todo!()
+    }
+
+    fn visit_int_literal(&mut self, this: &mut Literal<i64>) {
+        todo!()
+    }
+
+    fn visit_float_literal(&mut self, this: &mut Literal<f64>) {
+        todo!()
+    }
+
+    fn visit_str_literal(&mut self, this: &mut Literal<ArenaStr>) {
+        todo!()
+    }
+
+    fn visit_null_literal(&mut self, this: &mut Literal<()>) {
         todo!()
     }
 }

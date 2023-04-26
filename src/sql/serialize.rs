@@ -1,4 +1,5 @@
 use std::io::Write;
+use crate::base::ArenaStr;
 use crate::sql::ast::*;
 
 pub struct YamlWriter<'a> {
@@ -12,6 +13,11 @@ impl <'a> YamlWriter<'a> {
             writer,
             indent,
         }
+    }
+
+    fn emit_prefix(&mut self, prefix: &str) {
+        self.emit_indent();
+        self.writer.write(prefix.as_bytes()).unwrap();
     }
 
     fn emit_indent(&mut self) {
@@ -87,11 +93,79 @@ impl Visitor for YamlWriter<'_> {
         }
     }
 
+    fn visit_insert_into_table(&mut self, this: &mut InsertIntoTable) {
+        emit!(self, "InsertIntoTable");
+        indent! {self;
+            emit!(self, "table_name: {}", this.table_name);
+            if this.columns_name.len() > 0 {
+                emit!(self, "columns_name:");
+            };
+            indent! {self;
+                for i in 0..this.columns_name.len() {
+                    emit!(self, "- {}", this.columns_name[i]);
+                }
+            };
+            emit!(self, "values:");
+        }
+    }
+
+    fn visit_identifier(&mut self, this: &mut Identifier) {
+        emit!(self, "Identifier: {}", this.symbol);
+    }
+
+    fn visit_full_qualified_name(&mut self, this: &mut FullyQualifiedName) {
+        emit!(self, "FullQualifiedName: {}.{}", this.prefix, this.suffix);
+    }
+
+    fn visit_unary_expression(&mut self, this: &mut UnaryExpression) {
+        emit!(self, "UnaryExpression");
+        indent! {self;
+            emit!(self, "op: {}", this.op());
+            emit!(self, "operand:");
+            indent! {self;
+                this.operands_mut()[0].accept(self);
+            }
+        }
+    }
+
     fn visit_binary_expression(&mut self, this: &mut BinaryExpression) {
         this.lhs_mut().accept(self);
         this.rhs_mut().accept(self);
 
         todo!()
+    }
+
+    fn visit_call_function(&mut self, this: &mut CallFunction) {
+        emit!(self, "CallFunction:");
+        indent! {self;
+            emit!(self, "name: {}", this.name);
+            emit!(self, "in_args_star: {}", this.in_args_star);
+            if this.args.len() > 0 {
+                emit!(self, "args:");
+                indent! {self;
+                    for arg in this.args.as_mut_slice() {
+                        self.emit_prefix("- ");
+                        arg.accept(self);
+                    }
+                }
+            }
+        }
+    }
+
+    fn visit_int_literal(&mut self, this: &mut Literal<i64>) {
+        emit!(self, "IntLiteral: {}", this.data);
+    }
+
+    fn visit_float_literal(&mut self, this: &mut Literal<f64>) {
+        emit!(self, "FloatLiteral: {}", this.data);
+    }
+
+    fn visit_str_literal(&mut self, this: &mut Literal<ArenaStr>) {
+        emit!(self, "StrLiteral: {}", this.data);
+    }
+
+    fn visit_null_literal(&mut self, _this: &mut Literal<()>) {
+        emit!(self, "NullLiteral: NULL");
     }
 }
 

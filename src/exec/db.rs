@@ -2,10 +2,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::default::Default;
 use std::path::{Path, PathBuf};
-use std::pin::pin;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
-use serde_yaml::mapping::Index;
 
 use crate::exec::connection::Connection;
 use crate::{Corrupting, log_debug, Status, storage};
@@ -28,6 +26,8 @@ pub struct DB {
     connections: Mutex<Vec<Arc<Connection>>>,
     // TODO:
 }
+
+type LockingTables<'a> = MutexGuard<'a, HashMap<String, TableHandle>>;
 
 impl DB {
     const META_COL_TABLE_NAMES: &'static [u8] = "__metadata_table_names__".as_bytes();
@@ -143,10 +143,8 @@ impl DB {
                         return Err(Status::corrupted(message));
                     }
                     let mut locking = self.tables_handle.lock().unwrap();
-                    locking.insert(table.name.clone(), TableHandle {
-                        column_family: cf.unwrap(),
-                        metadata: Arc::new(RefCell::new(table)),
-                    });
+                    locking.insert(table.name.clone(),
+                                   TableHandle::new(cf.unwrap(), table));
                 }
             }
             log_debug!(self.logger, "load table:\n {}", yaml);
@@ -170,11 +168,6 @@ impl DB {
         conn
     }
 
-    pub fn is_table_exists(&self, name: &str) -> bool {
-        let locking = self.tables_handle.lock().unwrap();
-        locking.contains_key(&name.to_string())
-    }
-
     pub fn next_table_id(&self) -> Result<u64> {
         let id = self.next_table_id.fetch_add(1, Ordering::AcqRel) + 1;
         let mut wr_opts = WriteOptions::default();
@@ -185,9 +178,9 @@ impl DB {
         Ok(id)
     }
 
-    pub fn create_table(&self, table_metadata: TableMetadata) -> Result<u64> {
+    pub fn create_table(&self, table_metadata: TableMetadata, tables: &mut LockingTables) -> Result<u64> {
         let mut batch = WriteBatch::new();
-        let mut tables = self.tables_handle.lock().unwrap();
+        //let mut tables = self.tables_handle.lock().unwrap();
 
         let mut names: Vec<String> = tables.keys().cloned().collect();
         names.push(table_metadata.name.clone());
@@ -222,13 +215,41 @@ impl DB {
                 Err(e)
             }
             Ok(()) => {
-                tables.insert(table_metadata.name.clone(), TableHandle {
-                    column_family,
-                    metadata: Arc::new(RefCell::new(table_metadata)),
-                });
+                tables.insert(table_metadata.name.clone(),
+                              TableHandle::new(column_family, table_metadata));
                 Ok(id)
             }
         }
+    }
+
+    pub fn drop_table(&self, name: &String, tables: &mut LockingTables) -> Result<u64> {
+        let rs = tables.get(name);
+        if rs.is_none() {
+            return Err(Status::corrupted(format!("Table `{}` not found", name)));
+        }
+        let cf = rs.unwrap().column_family.clone();
+        let table = rs.unwrap().metadata.clone();
+        let table_id = table.borrow().id;
+        drop(rs);
+
+        self.storage.drop_column_family(cf)?;
+        // TODO: delete secondary indexes
+
+        let names: Vec<String> = tables.keys().cloned().filter(|x| {x != name}).collect();
+        self.sync_tables_name(&names)?;
+        let mut batch = WriteBatch::new();
+        batch.insert(&self.default_column_family, Self::META_COL_TABLE_NAMES,
+                     names.join(",").as_bytes());
+
+        let col_name = format!("{}{}", Self::META_COL_TABLE_PREFIX, name);
+        batch.delete(&self.default_column_family, col_name.as_bytes());
+
+        let mut wr_opts = WriteOptions::default();
+        wr_opts.sync = true;
+        self.storage.write(&wr_opts, batch)?;
+
+        tables.remove(name);
+        Ok(table_id)
     }
 
     fn get_table_handle(&self, name: &String) -> Option<(Arc<dyn ColumnFamily>, Arc<RefCell<TableMetadata>>)> {
@@ -237,6 +258,10 @@ impl DB {
             Some(handle) => Some((handle.column_family.clone(), handle.metadata.clone())),
             None => None
         }
+    }
+
+    pub fn lock_tables(&self) -> LockingTables {
+        self.tables_handle.lock().unwrap()
     }
 
     fn sync_tables_name(&self, names: &[String]) -> Result<()> {
@@ -256,9 +281,24 @@ impl DB {
     }
 }
 
-struct TableHandle {
+pub struct TableHandle {
     column_family: Arc<dyn ColumnFamily>,
+    secondary_indexes: Vec<Arc<dyn ColumnFamily>>,
+    anonymous_row_key_counter: AtomicU64,
+    auto_increment_counter: AtomicU64,
     metadata: Arc<RefCell<TableMetadata>>,
+}
+
+impl TableHandle {
+    fn new(column_family: Arc<dyn ColumnFamily>, metadata: TableMetadata) -> Self {
+        Self {
+            column_family,
+            secondary_indexes: Vec::default(),
+            anonymous_row_key_counter: AtomicU64::new(0),
+            auto_increment_counter: AtomicU64::new(0),
+            metadata: Arc::new(RefCell::new(metadata))
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -334,6 +374,23 @@ mod tests {
         assert_eq!("t1", cf1.name());
         assert_eq!("t1", t1.borrow().name);
         assert_eq!(2, t1.borrow().columns.len());
+        Ok(())
+    }
+
+    #[test]
+    fn create_before_drop_table() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db102");
+        let arena = Arena::new_rc();
+        let db = DB::open("tests".to_string(), "db102".to_string())?;
+        let sql = " create table t1 {\n\
+                a tinyint(1) not null,\n\
+                b char(6)\n\
+            };\n\
+            drop table if exists t1;\n\
+            ";
+        let conn = db.connect();
+        conn.execute_str(sql, &arena)?;
+        assert!(db.get_table_handle(&"t1".to_string()).is_none());
         Ok(())
     }
 }
