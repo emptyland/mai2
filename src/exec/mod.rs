@@ -3,6 +3,7 @@ use crate::{Corrupting, sql, Status};
 mod db;
 mod executor;
 mod connection;
+mod evaluator;
 
 #[inline]
 pub fn from_sql_result<T>(input: sql::Result<T>) -> crate::Result<T> {

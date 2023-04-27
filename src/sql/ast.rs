@@ -264,7 +264,7 @@ pub struct FullyQualifiedName {
 expression_impl!(FullyQualifiedName);
 
 pub struct CallFunction {
-    pub name: ArenaStr,
+    pub callee_name: ArenaStr,
     pub distinct: bool,
     pub in_args_star: bool,
     pub args: ArenaVec<ArenaBox<dyn Expression>>
@@ -273,7 +273,7 @@ pub struct CallFunction {
 impl Expression for CallFunction {
     fn op(&self) -> &Operator { &Operator::Lit }
     fn operands(&self) -> &[ArenaBox<dyn Expression>] { self.args.as_slice() }
-    fn operands_mut(&mut self) -> &mut [ArenaBox<dyn Expression>] { self.args.as_mut_slice() }
+    fn operands_mut(&mut self) -> &mut [ArenaBox<dyn Expression>] { self.args.as_slice_mut() }
 }
 
 pub struct Factory {
@@ -353,6 +353,15 @@ impl Factory {
         ArenaBox::new(BinaryExpression {
             op,
             operands: [lhs, rhs]
+        }, &self.arena)
+    }
+
+    pub fn new_call_function(&self, callee_name: ArenaStr, distinct: bool) -> ArenaBox<CallFunction> {
+        ArenaBox::new(CallFunction {
+            callee_name,
+            distinct,
+            in_args_star: false,
+            args: ArenaVec::new(&self.arena),
         }, &self.arena)
     }
 

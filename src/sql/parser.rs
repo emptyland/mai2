@@ -249,50 +249,57 @@ impl <'a> Parser<'a> {
                 self.move_next()?;
                 Ok(self.factory.new_literal(0i64).into())
             }
-            _ => self.parse_suffixed()
+            _ => self.parse_primary()
         }
     }
 
-    fn parse_suffixed(&mut self) -> Result<ArenaBox<dyn Expression>> {
-        let start_pos = self.lexer.current_position();
-        let mut expr = self.parse_primary()?;
-        loop {
-            let part = self.peek();
-            match part.token {
-                Token::Dot => {
-                    self.move_next()?;
-                    let suffix = self.match_id()?;
-                    if let Some(id) = expr.as_any().downcast_ref::<Identifier>() {
-                        expr = self.factory.new_fully_qualified_name(id.symbol.clone(), suffix).into();
-                    } else {
-                        let message = format!("Invalid full-qualified name, prefix.");
-                        return Err(self.concat_syntax_error(start_pos, message));
-                    }
-                }
-                Token::LParent => {
-                    let may_id = expr.as_any().downcast_ref::<Identifier>();
-                    if may_id.is_none() {
-                        let message = format!("Invalid calling, prefix.");
-                        return Err(self.concat_syntax_error(start_pos, message));
-                    }
-
-                    self.move_next()?;
-                    let distinct = self.test(Token::Distinct);
-
-                    while !self.test(Token::RParent)? {
-
-                    }
-
-                    todo!()
-                }
-                _ => break
-            }
-        }
-        Ok(expr)
-    }
 
     fn parse_primary(&mut self) -> Result<ArenaBox<dyn Expression>> {
-        todo!()
+        let _start_pos = self.lexer.current_position();
+        match self.peek().token.clone() {
+            Token::LParent => {
+                self.move_next()?;
+                let expr = self.parse_expr()?;
+                self.match_expected(Token::RParent)?;
+                Ok(expr)
+            }
+            Token::IntLiteral(val) => {
+                self.move_next()?;
+                Ok(self.factory.new_literal(val).into())
+            }
+            Token::StringLiteral(val) => {
+                self.move_next()?;
+                Ok(self.factory.new_literal(val).into())
+            }
+            Token::FloatLiteral(val) => {
+                self.move_next()?;
+                Ok(self.factory.new_literal(val).into())
+            }
+            Token::Id(symbol) => {
+                self.move_next()?;
+                if self.test(Token::Dot)? {
+                    let suffix = self.match_id()?;
+                    Ok(self.factory.new_fully_qualified_name(symbol, suffix).into())
+                } else if self.test(Token::LParent)? {
+                    //self.move_next()?;
+                    let distinct = self.test(Token::Distinct)?;
+                    let mut call = self.factory.new_call_function(symbol, distinct);
+                    while !self.test(Token::RParent)? {
+                        let arg = self.parse_expr()?;
+                        call.args.push(arg);
+                        if !self.test(Token::Comma)? {
+                            self.match_expected(Token::RParent)?;
+                            break;
+                        }
+                    }
+                    Ok(call.into())
+                } else {
+                    Ok(self.factory.new_identifier(symbol).into())
+                }
+            },
+            _ => unreachable!()
+        }
+
     }
 
     fn current_syntax_error(&self, message: String) -> ParseError {
@@ -403,16 +410,70 @@ mod tests {
     #[test]
     fn insert_into_table() -> Result<()> {
         let arena = Arena::new_rc();
-        let yaml = parse_to_yaml(&arena, "insert into table t1(a,b,c) values()")?;
+        let yaml = parse_all_to_yaml(&arena, "insert into table t1(a,b,c) values(1,2,3)")?;
         println!("{}", yaml);
+        assert_eq!("InsertIntoTable
+  table_name: t1
+  columns_name:
+    - a
+    - b
+    - c
+  values:
+    - row:
+      - IntLiteral: 1
+      - IntLiteral: 2
+      - IntLiteral: 3
+", yaml);
         Ok(())
     }
 
-    fn parse_to_yaml(arena: &Rc<RefCell<Arena>>, sql: &str) -> Result<String> {
+    #[test]
+    fn simple_expr() -> Result<()> {
+        let arena = Arena::new_rc();
+        let yaml = parse_expr_to_yaml(&arena, "col + b")?;
+        println!("{}", yaml);
+        assert_eq!("BinaryExpression:
+  op: Add(+)
+  lhs:
+    Identifier: col
+  rhs:
+    Identifier: b\n", yaml);
+        Ok(())
+    }
+
+    #[test]
+    fn call_function_expr() -> Result<()> {
+        let arena = Arena::new_rc();
+        let yaml = parse_expr_to_yaml(&arena, "sum(1)")?;
+        println!("{}", yaml);
+        assert_eq!("CallFunction:
+  name: sum
+  distinct: false
+  in_args_star: false
+  args:
+    - IntLiteral: 1
+", yaml);
+        Ok(())
+    }
+
+    fn parse_all_to_yaml(arena: &Rc<RefCell<Arena>>, sql: &str) -> Result<String> {
+        parse_to_yaml(arena, sql, false)
+    }
+
+    fn parse_expr_to_yaml(arena: &Rc<RefCell<Arena>>, sql: &str) -> Result<String> {
+        parse_to_yaml(arena, sql, true)
+    }
+
+    fn parse_to_yaml(arena: &Rc<RefCell<Arena>>, sql: &str, parse_expr_only: bool) -> Result<String> {
         let factory = Factory::from(arena);
         let txt = Vec::from(sql);
         let mut file = MemorySequentialFile::new(txt);
         let mut parser = Parser::new(&mut file, factory)?;
+
+        if parse_expr_only {
+            let mut expr = parser.parse_expr()?;
+            return Ok(serialize_yaml_to_string(expr.deref_mut()));
+        }
         let mut stmts = parser.parse()?;
 
         let mut buf = String::new();

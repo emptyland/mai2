@@ -2,6 +2,7 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::{iter, ptr};
 use std::fmt::{Debug, Display, Formatter};
+use std::marker::PhantomData;
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::ptr::{addr_of_mut, copy_nonoverlapping, NonNull, slice_from_raw_parts_mut, write};
@@ -372,8 +373,22 @@ impl<T> ArenaVec<T> {
         unsafe { &self.naked.as_ref()[..self.len] }
     }
 
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
+    pub fn as_slice_mut(&mut self) -> &mut [T] {
         unsafe { &mut self.naked.as_mut()[..self.len] }
+    }
+
+    pub fn iter(&self) -> ArenaVecIter<T> {
+        ArenaVecIter {
+            cursor: 0,
+            items: self.as_slice()
+        }
+    }
+
+    pub fn iter_mut(&mut self) -> ArenaVecIterMut<T> {
+        ArenaVecIterMut {
+            cursor: 0,
+            owns: self
+        }
     }
 
     fn extend_if_needed(&mut self, incremental: usize) {
@@ -414,7 +429,52 @@ impl <T> Index<usize> for ArenaVec<T> {
 
 impl <T> IndexMut<usize> for ArenaVec<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.as_mut_slice()[index]
+        &mut self.as_slice_mut()[index]
+    }
+}
+
+impl <'a, T> IntoIterator for &'a ArenaVec<T> {
+    type Item = &'a T;
+    type IntoIter = ArenaVecIter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter { self.iter() }
+}
+
+pub struct ArenaVecIter<'a, T> {
+    cursor: usize,
+    items: &'a [T]
+}
+
+impl <'a, T> Iterator for ArenaVecIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor >= self.items.len() {
+            None
+        } else {
+            let index = self.cursor;
+            self.cursor += 1;
+            Some(&self.items[index])
+        }
+    }
+}
+
+pub struct ArenaVecIterMut<'a, T> {
+    cursor: usize,
+    owns: &'a mut ArenaVec<T>
+}
+
+impl <'a, T> Iterator for ArenaVecIterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor >= self.owns.len() {
+            None
+        } else {
+            let index = self.cursor;
+            self.cursor += 1;
+            let slice_mut = unsafe { self.owns.naked.as_mut() };
+            Some(&mut slice_mut[index])
+        }
     }
 }
 

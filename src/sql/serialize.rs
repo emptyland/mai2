@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::ops::DerefMut;
 use crate::base::ArenaStr;
 use crate::sql::ast::*;
 
@@ -7,12 +8,21 @@ pub struct YamlWriter<'a> {
     indent: u32,
 }
 
-impl <'a> YamlWriter<'a> {
+impl<'a> YamlWriter<'a> {
     pub fn new(writer: &'a mut dyn Write, indent: u32) -> Self {
         Self {
             writer,
             indent,
         }
+    }
+
+    fn emit_item<T: Statement + ?Sized>(&mut self, node: &mut T) {
+        self.emit_child("- ", node)
+    }
+
+    fn emit_child<T: Statement + ?Sized>(&mut self, prefix: &str, node: &mut T) {
+        self.emit_prefix(prefix);
+        node.accept(self);
     }
 
     fn emit_prefix(&mut self, prefix: &str) {
@@ -27,7 +37,7 @@ impl <'a> YamlWriter<'a> {
     }
 }
 
-pub fn serialize_yaml_to_string(ast: &mut dyn Statement) -> String {
+pub fn serialize_yaml_to_string<T: Statement + ?Sized>(ast: &mut T) -> String {
     let mut wr = Vec::<u8>::new();
     let mut encoder = YamlWriter::new(&mut wr, 0);
     ast.accept(&mut encoder);
@@ -37,6 +47,12 @@ pub fn serialize_yaml_to_string(ast: &mut dyn Statement) -> String {
 macro_rules! emit {
     ($self:ident, $($arg:tt)*) => {
         $self.emit_indent();
+        writeln!($self.writer, $($arg)+).unwrap();
+    }
+}
+
+macro_rules! emit_header {
+    ($self:ident, $($arg:tt)*) => {
         writeln!($self.writer, $($arg)+).unwrap();
     }
 }
@@ -51,7 +67,7 @@ macro_rules! indent {
 
 impl Visitor for YamlWriter<'_> {
     fn visit_create_table(&mut self, this: &mut CreateTable) {
-        emit!(self, "CreateTable:");
+        emit_header!(self, "CreateTable:");
         self.indent += 1;
         emit!(self, "table_name: {}", this.table_name);
         emit!(self, "if_not_exists: {}", this.if_not_exists);
@@ -67,8 +83,7 @@ impl Visitor for YamlWriter<'_> {
                     emit!(self, "not_null: {}", col.not_null);
                     emit!(self, "auto_increment: {}", col.auto_increment);
                     if let Some(expr) = &mut col.default_val {
-                        emit!(self, "default_val:");
-                        expr.accept(self);
+                        self.emit_child("default_val: ", expr.deref_mut());
                     }
                 }
             }
@@ -86,7 +101,7 @@ impl Visitor for YamlWriter<'_> {
     }
 
     fn visit_drop_table(&mut self, this: &mut DropTable) {
-        emit!(self, "DropTable");
+        emit_header!(self, "DropTable");
         indent! {self;
             emit!(self, "table_name: {}", this.table_name);
             emit!(self, "if_exists: {}", this.if_exists);
@@ -94,31 +109,41 @@ impl Visitor for YamlWriter<'_> {
     }
 
     fn visit_insert_into_table(&mut self, this: &mut InsertIntoTable) {
-        emit!(self, "InsertIntoTable");
+        emit_header!(self, "InsertIntoTable");
         indent! {self;
             emit!(self, "table_name: {}", this.table_name);
             if this.columns_name.len() > 0 {
                 emit!(self, "columns_name:");
-            };
-            indent! {self;
-                for i in 0..this.columns_name.len() {
-                    emit!(self, "- {}", this.columns_name[i]);
+                indent! {self;
+                    for name in &this.columns_name {
+                        emit!(self, "- {}", name);
+                    }
                 }
             };
             emit!(self, "values:");
+            indent! {self;
+                for row in this.values.iter_mut() {
+                    self.emit_prefix("- row:\n");
+                    indent!{ self;
+                        for value in row.iter_mut() {
+                            self.emit_item(value.deref_mut());
+                        }
+                    }
+                }
+            };
         }
     }
 
     fn visit_identifier(&mut self, this: &mut Identifier) {
-        emit!(self, "Identifier: {}", this.symbol);
+        emit_header!(self, "Identifier: {}", this.symbol);
     }
 
     fn visit_full_qualified_name(&mut self, this: &mut FullyQualifiedName) {
-        emit!(self, "FullQualifiedName: {}.{}", this.prefix, this.suffix);
+        emit_header!(self, "FullQualifiedName: {}.{}", this.prefix, this.suffix);
     }
 
     fn visit_unary_expression(&mut self, this: &mut UnaryExpression) {
-        emit!(self, "UnaryExpression");
+        emit_header!(self, "UnaryExpression:");
         indent! {self;
             emit!(self, "op: {}", this.op());
             emit!(self, "operand:");
@@ -129,23 +154,31 @@ impl Visitor for YamlWriter<'_> {
     }
 
     fn visit_binary_expression(&mut self, this: &mut BinaryExpression) {
-        this.lhs_mut().accept(self);
-        this.rhs_mut().accept(self);
-
-        todo!()
+        emit_header!(self, "BinaryExpression:");
+        indent! {self;
+            emit!(self, "op: {}", this.op());
+            emit!(self, "lhs:");
+            indent! {self;
+                self.emit_child("", this.lhs_mut().deref_mut());
+            };
+            emit!(self, "rhs:");
+            indent! {self;
+                self.emit_child("", this.rhs_mut().deref_mut());
+            }
+        }
     }
 
     fn visit_call_function(&mut self, this: &mut CallFunction) {
-        emit!(self, "CallFunction:");
+        emit_header!(self, "CallFunction:");
         indent! {self;
-            emit!(self, "name: {}", this.name);
+            emit!(self, "name: {}", this.callee_name);
+            emit!(self, "distinct: {}", this.distinct);
             emit!(self, "in_args_star: {}", this.in_args_star);
             if this.args.len() > 0 {
                 emit!(self, "args:");
                 indent! {self;
-                    for arg in this.args.as_mut_slice() {
-                        self.emit_prefix("- ");
-                        arg.accept(self);
+                    for arg in this.args.iter_mut() {
+                        self.emit_item(arg.deref_mut());
                     }
                 }
             }
@@ -153,19 +186,19 @@ impl Visitor for YamlWriter<'_> {
     }
 
     fn visit_int_literal(&mut self, this: &mut Literal<i64>) {
-        emit!(self, "IntLiteral: {}", this.data);
+        emit_header!(self, "IntLiteral: {}", this.data);
     }
 
     fn visit_float_literal(&mut self, this: &mut Literal<f64>) {
-        emit!(self, "FloatLiteral: {}", this.data);
+        emit_header!(self, "FloatLiteral: {}", this.data);
     }
 
     fn visit_str_literal(&mut self, this: &mut Literal<ArenaStr>) {
-        emit!(self, "StrLiteral: {}", this.data);
+        emit_header!(self, "StrLiteral: {}", this.data);
     }
 
     fn visit_null_literal(&mut self, _this: &mut Literal<()>) {
-        emit!(self, "NullLiteral: NULL");
+        emit_header!(self, "NullLiteral: NULL");
     }
 }
 

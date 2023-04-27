@@ -19,7 +19,7 @@ pub struct DB {
     storage: Arc<dyn storage::DB>,
     default_column_family: Arc<dyn storage::ColumnFamily>,
     //tables: Mutex<HashMap<String, Box>>
-    tables_handle: Mutex<HashMap<String, TableHandle>>,
+    tables_handle: Mutex<HashMap<String, TableRef>>,
 
     next_table_id: AtomicU64,
     next_conn_id: AtomicU64,
@@ -27,13 +27,16 @@ pub struct DB {
     // TODO:
 }
 
-type LockingTables<'a> = MutexGuard<'a, HashMap<String, TableHandle>>;
+type TableRef = Arc<Mutex<TableHandle>>;
+type LockingTables<'a> = MutexGuard<'a, HashMap<String, TableRef>>;
 
 impl DB {
     const META_COL_TABLE_NAMES: &'static [u8] = "__metadata_table_names__".as_bytes();
     const META_COL_TABLE_PREFIX: &'static str = "__metadata_table__.";
     const META_COL_NEXT_TABLE_ID: &'static [u8] = "__metadata_next_table_id__".as_bytes();
     const METADATA_FILE_NAME: &'static str = "__METADATA__";
+
+    pub const ANONYMOUS_ROW_KEY: &'static str = "#anonymous_row_key#";
 
     pub fn open(dir: String, name: String) -> Result<Arc<Self>> {
         let options = Options::with()
@@ -143,8 +146,9 @@ impl DB {
                         return Err(Status::corrupted(message));
                     }
                     let mut locking = self.tables_handle.lock().unwrap();
-                    locking.insert(table.name.clone(),
-                                   TableHandle::new(cf.unwrap(), table));
+                    let table_name = table.name.clone();
+                    let table_handle = TableHandle::new(cf.unwrap(), table);
+                    locking.insert(table_name, Arc::new(Mutex::new(table_handle)));
                 }
             }
             log_debug!(self.logger, "load table:\n {}", yaml);
@@ -215,8 +219,10 @@ impl DB {
                 Err(e)
             }
             Ok(()) => {
-                tables.insert(table_metadata.name.clone(),
-                              TableHandle::new(column_family, table_metadata));
+                let table_name = table_metadata.name.clone();
+                let table_handle = TableHandle::new(column_family, table_metadata);
+                let table_ref = Arc::new(Mutex::new(table_handle));
+                tables.insert(table_name, table_ref);
                 Ok(id)
             }
         }
@@ -227,10 +233,13 @@ impl DB {
         if rs.is_none() {
             return Err(Status::corrupted(format!("Table `{}` not found", name)));
         }
-        let cf = rs.unwrap().column_family.clone();
-        let table = rs.unwrap().metadata.clone();
+        let table_ref = rs.unwrap().clone();
+        let table_handle = table_ref.lock().unwrap();
+        let cf = table_handle.column_family.clone();
+        let table = table_handle.metadata.clone();
         let table_id = table.borrow().id;
         drop(rs);
+        drop(table_handle);
 
         self.storage.drop_column_family(cf)?;
         // TODO: delete secondary indexes
@@ -255,13 +264,21 @@ impl DB {
     fn get_table_handle(&self, name: &String) -> Option<(Arc<dyn ColumnFamily>, Arc<RefCell<TableMetadata>>)> {
         let tables = self.tables_handle.lock().unwrap();
         match tables.get(name) {
-            Some(handle) => Some((handle.column_family.clone(), handle.metadata.clone())),
+            Some(handle) => {
+                let locking = handle.lock().unwrap();
+                Some((locking.column_family.clone(), locking.metadata.clone()))
+            },
             None => None
         }
     }
 
     pub fn lock_tables(&self) -> LockingTables {
         self.tables_handle.lock().unwrap()
+    }
+
+    pub fn is_table_exists(&self, table_name: &String) -> bool {
+        let locking = self.lock_tables();
+        locking.contains_key(table_name)
     }
 
     fn sync_tables_name(&self, names: &[String]) -> Result<()> {
@@ -282,22 +299,43 @@ impl DB {
 }
 
 pub struct TableHandle {
-    column_family: Arc<dyn ColumnFamily>,
+    pub column_family: Arc<dyn ColumnFamily>,
     secondary_indexes: Vec<Arc<dyn ColumnFamily>>,
     anonymous_row_key_counter: AtomicU64,
     auto_increment_counter: AtomicU64,
-    metadata: Arc<RefCell<TableMetadata>>,
+    columns_by_name: HashMap<String, usize>,
+    columns_by_id: HashMap<u32, usize>,
+    pub metadata: Arc<RefCell<TableMetadata>>,
 }
 
 impl TableHandle {
     fn new(column_family: Arc<dyn ColumnFamily>, metadata: TableMetadata) -> Self {
+        let mut columns_by_name = HashMap::new();
+        let mut columns_by_id = HashMap::new();
+        for i in 0..metadata.columns.len() {
+            let col = &metadata.columns[i];
+            columns_by_name.insert(col.name.clone(), i);
+            columns_by_id.insert(col.id, i);
+        }
         Self {
             column_family,
             secondary_indexes: Vec::default(),
             anonymous_row_key_counter: AtomicU64::new(0),
             auto_increment_counter: AtomicU64::new(0),
+            columns_by_name,
+            columns_by_id,
             metadata: Arc::new(RefCell::new(metadata))
         }
+    }
+
+    pub fn get_col_by_name(&self, name: &String) -> Option<&ColumnMetadata> {
+        match self.columns_by_name.get(name) {
+            Some(index) => {
+                Some(& unsafe{&*self.metadata.as_ptr()}.columns[*index])
+            }
+            None => None
+        }
+        //self.metadata.borrow().columns
     }
 }
 
@@ -310,6 +348,7 @@ pub struct TableMetadata {
     pub raw_ast: String,
     pub rows: usize,
     pub primary_keys: Vec<u32>,
+    pub auto_increment_keys: Vec<u32>,
     pub columns: Vec<ColumnMetadata>,
 }
 
@@ -318,6 +357,8 @@ pub struct ColumnMetadata {
     pub name: String,
     pub id: u32,
     pub ty: ColumnType,
+    pub primary_key: bool,
+    pub auto_increment: bool,
     pub not_null: bool,
     pub default_value: String,
 }
