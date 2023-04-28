@@ -2,9 +2,9 @@ use std::cell::RefCell;
 use std::io::Read;
 use std::rc::Rc;
 use std::sync::Weak;
-use crate::base::Arena;
+use crate::base::{Arena, ArenaBox, ArenaVec};
 use crate::exec::db::DB;
-use crate::exec::executor::Executor;
+use crate::exec::executor::{Executor, PreparedStatement};
 use crate::Result;
 use crate::storage::MemorySequentialFile;
 
@@ -28,6 +28,19 @@ impl Connection {
 
     pub fn execute(&self, reader: &mut dyn Read, arena: &Rc<RefCell<Arena>>) -> Result<()> {
         self.executor.borrow_mut().execute(reader, arena)
+    }
+
+    pub fn execute_prepared_statement(&self, prepared: &mut ArenaBox<PreparedStatement>, arena: &Rc<RefCell<Arena>>) -> Result<()> {
+        self.executor.borrow_mut().execute_prepared_statement(prepared, arena)
+    }
+
+    pub fn prepare_str(&self, sql: &str, arena: &Rc<RefCell<Arena>>) -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
+        let mut rd = MemorySequentialFile::new(sql.to_string().into());
+        self.prepare(&mut rd, arena)
+    }
+
+    pub fn prepare(&self, reader: &mut dyn Read, arena: &Rc<RefCell<Arena>>) -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
+        self.executor.borrow_mut().prepare(reader, arena)
     }
 }
 

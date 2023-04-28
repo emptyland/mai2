@@ -81,6 +81,8 @@ pub enum Token {
     Semi,
     // .
     Dot,
+    // ?
+    Question,
 }
 
 unsafe impl Sync for Token {}
@@ -196,6 +198,7 @@ impl<'a> Lexer<'a> {
                 ')' => return self.move_to_single_token(Token::RParent),
                 ';' => return self.move_to_single_token(Token::Semi),
                 '.' => return self.move_to_single_token(Token::Dot),
+                '?' => return self.move_to_single_token(Token::Question),
                 '\'' => return self.parse_str_literal('\''),
                 '\"' => return self.parse_str_literal('\"'),
                 '`' => {

@@ -200,6 +200,10 @@ impl Visitor for YamlWriter<'_> {
     fn visit_null_literal(&mut self, _this: &mut Literal<()>) {
         emit_header!(self, "NullLiteral: NULL");
     }
+
+    fn visit_placeholder(&mut self, this: &mut Placeholder) {
+        emit_header!(self, "Placeholder: {}", this.order);
+    }
 }
 
 #[cfg(test)]

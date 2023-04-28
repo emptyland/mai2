@@ -228,7 +228,7 @@ pub struct ArenaBox<T: ?Sized> {
     owns: Rc<RefCell<Arena>>,
 }
 
-impl <T> ArenaBox<T> {
+impl<T> ArenaBox<T> {
     pub fn new(data: T, owns: &Rc<RefCell<Arena>>) -> Self {
         let layout = Layout::new::<T>();
         let chunk = owns.borrow_mut().allocate(layout).unwrap();
@@ -244,7 +244,8 @@ impl <T> ArenaBox<T> {
 impl<T: ?Sized> ArenaBox<T> {
     pub fn from_ptr(naked: NonNull<T>, owns: Rc<RefCell<Arena>>) -> Self {
         Self {
-            naked, owns
+            naked,
+            owns,
         }
     }
 
@@ -266,7 +267,7 @@ impl<T: ?Sized> DerefMut for ArenaBox<T> {
     }
 }
 
-impl <T: ?Sized> Clone for ArenaBox<T> {
+impl<T: ?Sized> Clone for ArenaBox<T> {
     fn clone(&self) -> Self {
         Self {
             naked: self.naked.clone(),
@@ -275,7 +276,7 @@ impl <T: ?Sized> Clone for ArenaBox<T> {
     }
 }
 
-impl <T: Debug> Debug for ArenaBox<T> {
+impl<T: Debug> Debug for ArenaBox<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("ArenaBox<T>")
             .field(self.deref())
@@ -284,7 +285,7 @@ impl <T: Debug> Debug for ArenaBox<T> {
 }
 
 pub struct ArenaStr {
-    naked: NonNull<str>
+    naked: NonNull<str>,
 }
 
 impl ArenaStr {
@@ -292,10 +293,16 @@ impl ArenaStr {
         let layout = Layout::from_size_align(str.len(), 4).unwrap();
         let mut chunk = alloc.allocate(layout).unwrap();
         let naked = unsafe {
-            copy_nonoverlapping(str.as_ptr(), &mut chunk.as_mut()[0], str.len());
+            if !str.is_empty() {
+                copy_nonoverlapping(str.as_ptr(), &mut chunk.as_mut()[0], str.len());
+            }
             NonNull::new(chunk.as_ptr() as *mut str).unwrap()
         };
         Self { naked }
+    }
+
+    pub fn from_arena(str: &str, arena: &Rc<RefCell<Arena>>) -> Self {
+        Self::new(str, arena.borrow_mut().deref_mut())
     }
 
     pub fn from_string(str: &String, alloc: &mut dyn Allocator) -> Self {
@@ -345,7 +352,7 @@ impl Display for ArenaStr {
 pub struct ArenaVec<T> {
     naked: NonNull<[T]>,
     len: usize,
-    owns: Rc<RefCell<Arena>>,
+    pub owns: Rc<RefCell<Arena>>,
 }
 
 impl<T> ArenaVec<T> {
@@ -358,6 +365,22 @@ impl<T> ArenaVec<T> {
             len: 0,
             owns: owns.clone(),
         }
+    }
+
+    pub fn with_init<Fn>(owns: &Rc<RefCell<Arena>>, init: Fn, count: usize) -> Self
+        where Fn: FnOnce(usize) -> T + Copy {
+        let naked = unsafe {
+            Self::new_uninitialized(owns.borrow_mut().deref_mut(), count)
+        };
+        let mut this = Self {
+            naked,
+            len: 0,
+            owns: owns.clone(),
+        };
+        for i in 0..count {
+            this.push(init(i));
+        }
+        this
     }
 
     pub fn push(&mut self, elem: T) {
@@ -380,14 +403,14 @@ impl<T> ArenaVec<T> {
     pub fn iter(&self) -> ArenaVecIter<T> {
         ArenaVecIter {
             cursor: 0,
-            items: self.as_slice()
+            items: self.as_slice(),
         }
     }
 
     pub fn iter_mut(&mut self) -> ArenaVecIterMut<T> {
         ArenaVecIterMut {
             cursor: 0,
-            owns: self
+            owns: self,
         }
     }
 
@@ -419,7 +442,7 @@ impl<T> ArenaVec<T> {
     }
 }
 
-impl <T> Index<usize> for ArenaVec<T> {
+impl<T> Index<usize> for ArenaVec<T> {
     type Output = T;
 
     fn index(&self, index: usize) -> &Self::Output {
@@ -427,13 +450,13 @@ impl <T> Index<usize> for ArenaVec<T> {
     }
 }
 
-impl <T> IndexMut<usize> for ArenaVec<T> {
+impl<T> IndexMut<usize> for ArenaVec<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.as_slice_mut()[index]
     }
 }
 
-impl <'a, T> IntoIterator for &'a ArenaVec<T> {
+impl<'a, T> IntoIterator for &'a ArenaVec<T> {
     type Item = &'a T;
     type IntoIter = ArenaVecIter<'a, T>;
     fn into_iter(self) -> Self::IntoIter { self.iter() }
@@ -441,10 +464,10 @@ impl <'a, T> IntoIterator for &'a ArenaVec<T> {
 
 pub struct ArenaVecIter<'a, T> {
     cursor: usize,
-    items: &'a [T]
+    items: &'a [T],
 }
 
-impl <'a, T> Iterator for ArenaVecIter<'a, T> {
+impl<'a, T> Iterator for ArenaVecIter<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -460,10 +483,10 @@ impl <'a, T> Iterator for ArenaVecIter<'a, T> {
 
 pub struct ArenaVecIterMut<'a, T> {
     cursor: usize,
-    owns: &'a mut ArenaVec<T>
+    owns: &'a mut ArenaVec<T>,
 }
 
-impl <'a, T> Iterator for ArenaVecIterMut<'a, T> {
+impl<'a, T> Iterator for ArenaVecIterMut<'a, T> {
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -478,7 +501,7 @@ impl <'a, T> Iterator for ArenaVecIterMut<'a, T> {
     }
 }
 
-impl <T: Debug> Debug for ArenaVec<T> {
+impl<T: Debug> Debug for ArenaVec<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut r = f.debug_list();
         for i in 0..self.len {

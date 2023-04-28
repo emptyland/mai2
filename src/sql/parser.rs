@@ -1,15 +1,14 @@
-use std::arch::x86_64::_mm256_permute4x64_epi64;
 use std::io::Read;
 use crate::base::{ArenaVec, ArenaBox, ArenaStr};
 use crate::sql::{ParseError, Result, SourceLocation, SourcePosition};
-use crate::sql::ast::{ColumnDeclaration, CreateTable, DropTable, Expression, Factory, Identifier, InsertIntoTable, Operator, Statement, TypeDeclaration};
+use crate::sql::ast::{ColumnDeclaration, CreateTable, DropTable, Expression, Factory, Identifier, InsertIntoTable, Operator, Placeholder, Statement, TypeDeclaration};
 use crate::sql::lexer::{Lexer, Token, TokenPart};
-use crate::{Corrupting, Status};
 
 pub struct Parser<'a> {
     factory: Factory,
     lexer: Lexer<'a>,
     lookahead: TokenPart,
+    placeholder_order: usize,
 }
 
 impl <'a> Parser<'a> {
@@ -20,17 +19,23 @@ impl <'a> Parser<'a> {
             factory,
             lexer,
             lookahead,
+            placeholder_order: 0,
         })
     }
 
     pub fn parse(&mut self) -> Result<ArenaVec<ArenaBox<dyn Statement>>> {
-        let mut stmts: ArenaVec<ArenaBox<dyn Statement>> = ArenaVec::new(&self.factory.arena);
+        self.parse_with_processor(|x,_|{x})
+    }
+
+    pub fn parse_with_processor<T, Fn>(&mut self, proc: Fn) -> Result<ArenaVec<T>>
+    where Fn: FnOnce(ArenaBox<dyn Statement>, usize)->T + Copy {
+        let mut stmts: ArenaVec<T> = ArenaVec::new(&self.factory.arena);
         loop {
+            self.placeholder_order = 0;
             let part = self.peek();
             if part.token == Token::Eof {
                 break;
             }
-
             match part.token {
                 Token::Empty => unreachable!(),
                 Token::Eof => break,
@@ -38,7 +43,11 @@ impl <'a> Parser<'a> {
                     let start_pos = self.lexer.current_position();
                     self.move_next()?;
                     match self.peek().token {
-                        Token::Table => stmts.push(self.parse_create_table(start_pos)?.into()),
+                        Token::Table => {
+                            let rv = proc(self.parse_create_table(start_pos)?.into(),
+                                          self.placeholder_order);
+                            stmts.push(rv);
+                        }
                         _ => Err(self.concat_syntax_error(start_pos, "Unexpected `table'".to_string()))?
                     }
                 }
@@ -46,11 +55,18 @@ impl <'a> Parser<'a> {
                     let start_pos = self.lexer.current_position();
                     self.move_next()?;
                     match self.peek().token {
-                        Token::Table => stmts.push(self.parse_drop_table(start_pos)?.into()),
+                        Token::Table => {
+                            let rv = proc(self.parse_drop_table(start_pos)?.into(),
+                                          self.placeholder_order);
+                            stmts.push(rv);
+                        }
                         _ => Err(self.concat_syntax_error(start_pos, "Unexpected `table'".to_string()))?
                     }
                 }
-                Token::Insert => stmts.push(self.parse_insert_into_table()?.into()),
+                Token::Insert => {
+                    let rv = proc(self.parse_insert_into_table()?.into(), self.placeholder_order);
+                    stmts.push(rv);
+                }
                 _ => Err(self.current_syntax_error("Unexpected statement".to_string()))?
             }
 
@@ -248,6 +264,12 @@ impl <'a> Parser<'a> {
             Token::False => {
                 self.move_next()?;
                 Ok(self.factory.new_literal(0i64).into())
+            }
+            Token::Question => {
+                self.move_next()?;
+                let placeholder = self.factory.new_placeholder(self.placeholder_order);
+                self.placeholder_order += 1;
+                Ok(placeholder.into())
             }
             _ => self.parse_primary()
         }

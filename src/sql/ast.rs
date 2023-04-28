@@ -53,6 +53,7 @@ ast_nodes_impl![
     (Literal<f64>, visit_float_literal),
     (Literal<ArenaStr>, visit_str_literal),
     (Literal<()>, visit_null_literal),
+    (Placeholder, visit_placeholder),
 ];
 
 
@@ -276,6 +277,12 @@ impl Expression for CallFunction {
     fn operands_mut(&mut self) -> &mut [ArenaBox<dyn Expression>] { self.args.as_slice_mut() }
 }
 
+pub struct Placeholder {
+    pub order: usize,
+}
+
+expression_impl!(Placeholder);
+
 pub struct Factory {
     pub arena: Rc<RefCell<Arena>>,
 }
@@ -379,6 +386,12 @@ impl Factory {
     pub fn new_literal<T>(&self, data: T) -> ArenaBox<Literal<T>> {
         ArenaBox::new(Literal {
             data,
+        }, &self.arena)
+    }
+
+    pub fn new_placeholder(&self, order: usize) -> ArenaBox<Placeholder> {
+        ArenaBox::new(Placeholder {
+            order,
         }, &self.arena)
     }
 

@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use crate::{Corrupting, Result, Status};
 use crate::base::{Arena, ArenaStr};
-use crate::sql::ast::{BinaryExpression, CallFunction, CreateTable, DropTable, Expression, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Operator, UnaryExpression, Visitor};
+use crate::sql::ast::{BinaryExpression, CallFunction, CreateTable, DropTable, Expression, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Operator, Placeholder, UnaryExpression, Visitor};
 
 pub struct Evaluator {
     arena: Rc<RefCell<Arena>>,
@@ -19,6 +19,7 @@ pub trait Context {
     fn resolve(&self, name: &str) -> Value;
     fn resolve_fully_qualified(&self, prefix: &str, suffix: &str) -> Value;
     fn invoke(&self, callee: &str, args: &[Value]) -> Value;
+    fn bound_param(&self, order: usize) -> Value;
     // aggregate
 }
 
@@ -245,5 +246,9 @@ impl Visitor for Evaluator {
 
     fn visit_null_literal(&mut self, this: &mut Literal<()>) {
         self.ret(Value::Null);
+    }
+
+    fn visit_placeholder(&mut self, this: &mut Placeholder) {
+        self.ret(self.env().bound_param(this.order))
     }
 }

@@ -1,13 +1,17 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::default::Default;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::exec::connection::Connection;
 use crate::{Corrupting, log_debug, Status, storage};
-use crate::base::Logger;
+use crate::base::{Arena, ArenaBox, Logger};
+use crate::exec::evaluator::Value;
+use crate::exec::executor::{ColumnSet, Tuple};
 use crate::storage::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME, Env, from_io_result, Options, ReadOptions, WriteBatch, WriteOptions};
 use crate::Result;
 
@@ -261,6 +265,74 @@ impl DB {
         Ok(table_id)
     }
 
+    pub fn insert_rows(&self, column_family: &Arc<dyn ColumnFamily>, table_name: &String, tuples: &[Tuple]) -> Result<usize> {
+        let mut batch = WriteBatch::new();
+        let wr_opts = WriteOptions::default();
+        assert_eq!(column_family.name(), table_name.as_str());
+
+        let mut key = Vec::new();
+        for tuple in tuples {
+            let prefix_key_len = tuple.row_key().len();
+            key.write(tuple.row_key()).unwrap();
+            for col in &tuple.columns().columns {
+                let value = tuple.get(col.order);
+                assert!(!value.is_unit());
+                if value.is_null() {
+                    continue;
+                }
+                key.write(format!("#{}", col.name).as_bytes()).unwrap();
+                let row_key_len = key.len();
+
+                Self::encode_column_value(tuple.get(col.order), &col.ty, &mut key);
+                batch.insert(column_family, &key[..row_key_len], &key[row_key_len..]);
+
+                key.truncate(prefix_key_len); // keep row key prefix.
+            }
+            key.clear();
+        }
+
+        self.storage.write(&wr_opts, batch)?;
+        log_debug!(self.logger, "rows: {} insert ok", tuples.len());
+        Ok(tuples.len())
+    }
+
+    pub fn encode_anonymous_row_key(counter: u64, row_key: &mut Vec<u8>) {
+        row_key.write(&counter.to_be_bytes()).unwrap();
+    }
+
+    pub fn encode_column_value(value: &Value, ty: &ColumnType, buf: &mut Vec<u8>) {
+        match ty {
+            ColumnType::TinyInt(_)
+            | ColumnType::SmallInt(_)
+            | ColumnType::Int(_)
+            | ColumnType::BigInt(_) => {
+                match value {
+                    Value::Int(n) => buf.write(&n.to_le_bytes()).unwrap(),
+                    _ => unreachable!()
+                };
+            }
+            ColumnType::Float(_, _) => unreachable!(),
+            ColumnType::Double(_, _) => unreachable!(),
+            ColumnType::Char(_) => unreachable!(),
+            ColumnType::Varchar(_) => unreachable!(),
+        }
+    }
+
+    pub fn decode_column_value(ty: &ColumnType, value: &[u8]) -> Value {
+        match ty {
+            ColumnType::TinyInt(_)
+                | ColumnType::SmallInt(_)
+                | ColumnType::Int(_)
+                | ColumnType::BigInt(_) => {
+                Value::Int(i64::from_le_bytes(value.try_into().unwrap()))
+            }
+            ColumnType::Float(_, _) => unreachable!(),
+            ColumnType::Double(_, _) => unreachable!(),
+            ColumnType::Char(_) => unreachable!(),
+            ColumnType::Varchar(_) => unreachable!(),
+        }
+    }
+
     fn get_table_handle(&self, name: &String) -> Option<(Arc<dyn ColumnFamily>, Arc<RefCell<TableMetadata>>)> {
         let tables = self.tables_handle.lock().unwrap();
         match tables.get(name) {
@@ -296,12 +368,35 @@ impl DB {
             }
         }
     }
+
+    pub fn _test_get_row(&self, table_name: &String,
+                         columns_set: &ArenaBox<ColumnSet>,
+                         row_key: &[u8],
+                         arena: &Rc<RefCell<Arena>>) -> Result<Tuple> {
+        let tables = self.tables_handle.lock().unwrap();
+        let table_ref = tables.get(table_name).unwrap().clone();
+        let table = table_ref.lock().unwrap();
+        let mut key = Vec::new();
+        key.write(row_key).unwrap();
+        let rd_opts = ReadOptions::default();
+        let mut tuple = Tuple::new(&columns_set, &key, &[], arena);
+        for col in &columns_set.columns {
+            key.write("#".as_bytes()).unwrap();
+            key.write(col.name.as_bytes()).unwrap();
+
+            let value = self.storage.get_pinnable(&rd_opts, &table.column_family, &key)?;
+            tuple.set(col.order, Self::decode_column_value(&col.ty, value.value()));
+            key.truncate(row_key.len());
+
+        }
+        Ok(tuple)
+    }
 }
 
 pub struct TableHandle {
     pub column_family: Arc<dyn ColumnFamily>,
     secondary_indexes: Vec<Arc<dyn ColumnFamily>>,
-    anonymous_row_key_counter: AtomicU64,
+    pub anonymous_row_key_counter: AtomicU64,
     auto_increment_counter: AtomicU64,
     columns_by_name: HashMap<String, usize>,
     columns_by_id: HashMap<u32, usize>,
@@ -432,6 +527,47 @@ mod tests {
         let conn = db.connect();
         conn.execute_str(sql, &arena)?;
         assert!(db.get_table_handle(&"t1".to_string()).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn insert_into_table() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db103");
+        let arena = Arena::new_rc();
+        let db = DB::open("tests".to_string(), "db103".to_string())?;
+        let sql = " create table t1 {\n\
+                a int(11) not null,\n\
+                b int(11)\n\
+            };\n\
+            insert into table t1(a,b) values(?,?), (3,4), (5,6);\n\
+            ";
+        let conn = db.connect();
+        let mut stmts = conn.prepare_str(sql, &arena)?;
+        conn.execute_prepared_statement(&mut stmts[0], &arena)?;
+
+        let mut stmt = stmts[1].clone();
+        assert_eq!(2, stmt.parameters_len());
+        stmt.bind_i64(0, 1);
+        stmt.bind_i64(1, 2);
+        conn.execute_prepared_statement(&mut stmt, &arena)?;
+
+        let mut column_set = ArenaBox::new(ColumnSet::new("t1", &arena), &arena);
+        column_set.append("a", "", ColumnType::Int(11));
+        column_set.append("b", "", ColumnType::Int(11));
+
+        let tuple = db._test_get_row(&"t1".to_string(),
+                                     &column_set,
+                                     &1i64.to_be_bytes(), &arena)?;
+        assert_eq!(Some(1), tuple.get_i64(0));
+        assert_eq!(Some(2), tuple.get_i64(1));
+        drop(tuple);
+
+        let tuple = db._test_get_row(&"t1".to_string(),
+                                     &column_set,
+                                     &2i64.to_be_bytes(), &arena)?;
+        assert_eq!(Some(3), tuple.get_i64(0));
+        assert_eq!(Some(4), tuple.get_i64(1));
+        drop(tuple);
         Ok(())
     }
 }
