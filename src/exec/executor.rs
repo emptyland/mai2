@@ -3,11 +3,11 @@ use std::arch::x86_64::_tzcnt_u32;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::intrinsics::copy_nonoverlapping;
-use std::io::Read;
-use std::ops::{Deref, DerefMut, Index};
+use std::io::{Read, Write};
+use std::ops::{AddAssign, Deref, DerefMut, Index};
 use std::ptr::{addr_of, addr_of_mut, NonNull, slice_from_raw_parts_mut};
 use std::rc::Rc;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::Ordering;
 
 use crate::base::{Allocator, Arena, ArenaBox, ArenaStr, ArenaVec};
@@ -119,7 +119,7 @@ impl PreparedStatement {
 
     pub fn is_bound(&self, i: usize) -> bool { !self.parameters[i].is_unit() }
 
-    pub fn bind_i64(&mut self, i: usize, value: i64) { self.bind(i,Value::Int(value)); }
+    pub fn bind_i64(&mut self, i: usize, value: i64) { self.bind(i, Value::Int(value)); }
     pub fn bind_f64(&mut self, i: usize, value: f64) { self.bind(i, Value::Float(value)); }
     pub fn bind_str(&mut self, i: usize, value: &str) { todo!() }
     pub fn bind(&mut self, i: usize, value: Value) { self.parameters[i] = value; }
@@ -174,6 +174,7 @@ impl Visitor for Executor {
             }
             let col = ColumnMetadata {
                 name: col_decl.name.to_string(),
+                order: i,
                 id: i as u32,
                 ty: ty.unwrap(),
                 primary_key: col_decl.primary_key,
@@ -234,34 +235,28 @@ impl Visitor for Executor {
         if !tables.contains_key(&this.table_name.to_string()) {
             visit_error!(self, "Table `{}` not found", this.table_name);
         }
-        let table_ref = tables.get(&this.table_name.to_string()).unwrap().clone();
+        let table = tables.get(&this.table_name.to_string()).unwrap().clone();
         drop(tables);
 
-
         let mut insertion_cols = Vec::new();
-        let table = table_ref.lock().unwrap();
         let mut columns = {
             let tmp = ColumnSet::new(
-                table.metadata.borrow().name.as_str(), &self.arena);
+                table.metadata.name.as_str(), &self.arena);
             ArenaBox::new(tmp, &self.arena)
         };
         for col_name in &this.columns_name {
             match table.get_col_by_name(&col_name.to_string()) {
-                Some(col) => {
-                    columns.append(col.name.as_str(),
-                                   "",
-                                   col.ty.clone());
-                    insertion_cols.push(col.id)
-                }
+                Some(col) => insertion_cols.push(col.id),
                 None => visit_error!(self, "Column: `{}` not found in table: `{}`",
                     col_name.as_str(), this.table_name)
             }
         }
+        for col in &table.metadata.columns {
+            columns.append(col.name.as_str(), "", col.ty.clone());
+        }
 
-        let use_anonymous_row_key = table.metadata.borrow().primary_keys.is_empty();
-        let anonymous_row_key_counter =  addr_of!(table.anonymous_row_key_counter);
+        let use_anonymous_row_key = table.metadata.primary_keys.is_empty();
         let cf = table.column_family.clone();
-        drop(table);
 
         for row in &this.values {
             if row.len() < insertion_cols.len() {
@@ -270,30 +265,77 @@ impl Visitor for Executor {
             }
         }
 
+        let mut anonymous_row_key_counter = if use_anonymous_row_key {
+            Some(table.anonymous_row_key_counter.lock().unwrap())
+        } else {
+            None
+        };
+        let mut auto_increment_counter = if table.has_auto_increment_fields() {
+            Some(table.auto_increment_counter.lock().unwrap())
+        } else {
+            None
+        };
+
+        let name_to_order = {
+            let mut tmp = HashMap::new();
+            for i in 0..this.columns_name.len() {
+                tmp.insert(this.columns_name[i].as_str(), i);
+            }
+            tmp
+        };
+
         let mut evaluator = Evaluator::new(&self.arena);
         let context = Arc::new(TupleContext::new(self.prepared_stmts.back().cloned()));
         let mut tuples = Vec::new();
         for row in this.values.iter_mut() {
             let mut row_key = Vec::new();
-            if use_anonymous_row_key {
-                let n = unsafe { &*anonymous_row_key_counter }.fetch_add(1, Ordering::AcqRel) + 1;
-                DB::encode_anonymous_row_key(n, &mut row_key);
+            if let Some(counter) = auto_increment_counter.as_mut() {
+                counter.add_assign(1);
             }
-            let mut tuple = Tuple::new(&columns, &row_key, &[], &self.arena);
-            for i in 0..row.len() {
-                let expr = &mut row[i];
-                match evaluator.evaluate(expr.deref_mut(), context.clone()) {
-                    Err(e) => {
+            if let Some(counter) = anonymous_row_key_counter.as_mut() {
+                counter.add_assign(1);
+                DB::encode_anonymous_row_key(counter.clone(), &mut row_key);
+            }
+            let mut tuple = Tuple::new(&columns, &row_key, &self.arena);
+            for col in &table.metadata.columns {
+                if let Some(order) = name_to_order.get(col.name.as_str()) {
+                    let expr = &mut row[*order];
+                    match evaluator.evaluate(expr.deref_mut(), context.clone()) {
+                        Err(e) => {
+                            self.rs = Err(e);
+                            return;
+                        }
+                        Ok(value) => tuple.set(col.order, value)
+                    }
+                } else if col.auto_increment {
+                    let value = auto_increment_counter.as_ref().unwrap();
+                    tuple.set(col.order, Value::Int(**value.clone() as i64));
+                } else {
+                    tuple.set(col.order, Value::Null);
+                }
+            }
+
+            if !table.metadata.primary_keys.is_empty() {
+                row_key.clear();
+                row_key.write(&DB::PRIMARY_KEY_ID_BYTES).unwrap();
+                for id in &table.metadata.primary_keys {
+                    let col = table.get_col_by_id(*id).unwrap();
+                    if let Err(e) = DB::encode_row_key(tuple.get(col.order), &col.ty,
+                                                       &mut row_key) {
                         self.rs = Err(e);
                         return;
                     }
-                    Ok(value) => tuple.set(i, value)
                 }
+                tuple.associate_row_key(&row_key);
             }
+
             tuples.push(tuple);
         }
+        let anonymous_row_key_value = anonymous_row_key_counter.map(|x| { *x });
+        let auto_increment_value = auto_increment_counter.map(|x| { *x });
 
-        match db.insert_rows(&cf, &this.table_name.to_string(), &tuples) {
+        match db.insert_rows(&cf, table.metadata.id, &tuples,
+                             anonymous_row_key_value, auto_increment_value) {
             Ok(_) => (),
             Err(e) => self.rs = Err(e)
         }
@@ -351,10 +393,10 @@ pub struct Tuple {
     columns_set: ArenaBox<ColumnSet>,
 }
 
-static EMPTY_ARRAY_DUMMY: [u8;0] = [0;0];
+static EMPTY_ARRAY_DUMMY: [u8; 0] = [0; 0];
 
 impl Tuple {
-    pub fn new(columns: &ArenaBox<ColumnSet>, key: &[u8], suffix: &[u8], arena: &Rc<RefCell<Arena>>) -> Tuple {
+    pub fn new(columns: &ArenaBox<ColumnSet>, key: &[u8], arena: &Rc<RefCell<Arena>>) -> Tuple {
         let len = columns.columns.len();
         let value_layout = Layout::new::<Value>();
         let layout = Layout::from_size_align(value_layout.size() * len, value_layout.align()).unwrap();
@@ -364,22 +406,8 @@ impl Tuple {
             let ptr = slice_from_raw_parts_mut(addr, len);
             NonNull::new(ptr).unwrap()
         };
-        let row_key: NonNull<[u8]> = if key.is_empty() {
-            let ptr = addr_of!(EMPTY_ARRAY_DUMMY) as *mut u8;
-            NonNull::new(slice_from_raw_parts_mut(ptr, 0)).unwrap()
-        } else {
-            let layout = Layout::from_size_align(key.len() + suffix.len(), 4).unwrap();
-            arena.borrow_mut().allocate(layout).unwrap()
-        };
+        let row_key = Self::new_row_key(key, arena);
         unsafe {
-            if !key.is_empty() {
-                let dst = row_key.as_ptr() as *mut u8;
-                copy_nonoverlapping(addr_of!(key[0]), dst, key.len());
-                if !suffix.is_empty() {
-                    let dst  = dst.add(key.len());
-                    copy_nonoverlapping(addr_of!(suffix[0]), dst, suffix.len());
-                }
-            }
             for i in 0..len {
                 items.as_mut()[i] = Value::Unit;
             }
@@ -389,6 +417,27 @@ impl Tuple {
             items,
             columns_set: columns.clone(),
         }
+    }
+
+    pub fn associate_row_key(&mut self, key: &[u8]) {
+        self.row_key = Self::new_row_key(key, &self.columns_set.arena);
+    }
+
+    fn new_row_key(key: &[u8], arena: &Rc<RefCell<Arena>>) -> NonNull<[u8]> {
+        let row_key: NonNull<[u8]> = if key.is_empty() {
+            let ptr = addr_of!(EMPTY_ARRAY_DUMMY) as *mut u8;
+            NonNull::new(slice_from_raw_parts_mut(ptr, 0)).unwrap()
+        } else {
+            let layout = Layout::from_size_align(key.len(), 4).unwrap();
+            arena.borrow_mut().allocate(layout).unwrap()
+        };
+        unsafe {
+            if !key.is_empty() {
+                let dst = row_key.as_ptr() as *mut u8;
+                copy_nonoverlapping(addr_of!(key[0]), dst, key.len());
+            }
+        }
+        row_key
     }
 
     pub fn columns(&self) -> &ArenaBox<ColumnSet> { &self.columns_set }
@@ -430,7 +479,7 @@ struct TupleContext {
 
 impl TupleContext {
     pub fn new(prepared_stmt: Option<ArenaBox<PreparedStatement>>) -> Self {
-        Self {prepared_stmt}
+        Self { prepared_stmt }
     }
 }
 

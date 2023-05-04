@@ -31,7 +31,7 @@ pub struct DB {
     // TODO:
 }
 
-type TableRef = Arc<Mutex<TableHandle>>;
+type TableRef = Arc<TableHandle>;
 type LockingTables<'a> = MutexGuard<'a, HashMap<String, TableRef>>;
 
 impl DB {
@@ -40,7 +40,14 @@ impl DB {
     const META_COL_NEXT_TABLE_ID: &'static [u8] = "__metadata_next_table_id__".as_bytes();
     const METADATA_FILE_NAME: &'static str = "__METADATA__";
 
+    const DATA_COL_TABLE_PREFIX: &'static str = "__table__";
+
+    const PRIMARY_KEY_ID: u32 = 0;
+    pub const PRIMARY_KEY_ID_BYTES: [u8;4] = Self::PRIMARY_KEY_ID.to_be_bytes();
+
     pub const ANONYMOUS_ROW_KEY: &'static str = "#anonymous_row_key#";
+    pub const ANONYMOUS_ROW_KEY_KEY: &'static [u8] = Self::ANONYMOUS_ROW_KEY.as_bytes();
+    pub const AUTO_INCREMENT_KEY: &'static [u8] = "#auto_increment#".as_bytes();
 
     pub fn open(dir: String, name: String) -> Result<Arc<Self>> {
         let options = Options::with()
@@ -74,47 +81,55 @@ impl DB {
     }
 
     fn try_load_column_family_descriptors(env: &Arc<dyn Env>, dir: &String, name: &String)
-        -> Result<Vec<ColumnFamilyDescriptor>> {
+                                          -> Result<Vec<ColumnFamilyDescriptor>> {
         let db_path = if dir.is_empty() {
             PathBuf::from(name)
         } else {
             PathBuf::from(dir).join(Path::new(name))
         };
         if env.file_not_exists(&db_path) {
-            return Ok(vec![ColumnFamilyDescriptor{
+            return Ok(vec![ColumnFamilyDescriptor {
                 name: DEFAULT_COLUMN_FAMILY_NAME.to_string(),
                 options: ColumnFamilyOptions::default(),
             }]);
         }
         let abs_db_path = from_io_result(env.get_absolute_path(&db_path))?;
-        let mut tables = Self::try_load_tables_name(env, &abs_db_path)?;
-        tables.push(DEFAULT_COLUMN_FAMILY_NAME.to_string());
-        Ok(tables.iter().map(|x| {
-            ColumnFamilyDescriptor {
-                name: x.clone(),
-                options: ColumnFamilyOptions::default(),
-            }
-        }).collect())
+        let tables = Self::try_load_tables_name_to_id(env, &abs_db_path)?;
+        let mut cfds: Vec<ColumnFamilyDescriptor> = tables.values()
+            .cloned()
+            .map(|x|{
+                ColumnFamilyDescriptor {
+                    name: format!("{}{}", Self::DATA_COL_TABLE_PREFIX, x),
+                    options: ColumnFamilyOptions::default(),
+                }
+            }).collect();
+        cfds.push(ColumnFamilyDescriptor {
+            name: DEFAULT_COLUMN_FAMILY_NAME.to_string(),
+            options: ColumnFamilyOptions::default(),
+        });
+        Ok(cfds)
     }
 
-    fn try_load_tables_name(env: &Arc<dyn Env>, abs_db_path: &Path) -> Result<Vec<String>> {
+    fn try_load_tables_name_to_id(env: &Arc<dyn Env>, abs_db_path: &Path) -> Result<HashMap<String, u64>> {
         let metadata_path = abs_db_path.to_path_buf().join(Path::new(Self::METADATA_FILE_NAME));
         if env.file_not_exists(&metadata_path) {
-            return Ok(vec![DEFAULT_COLUMN_FAMILY_NAME.to_string()]);
+            return Ok(HashMap::default());
         }
 
-        let parts = from_io_result(env.read_to_string(&metadata_path))?;
-        Ok(parts.split(",").map(|x|{x.to_string()}).collect())
+        let yaml = from_io_result(env.read_to_string(&metadata_path))?;
+        match serde_yaml::from_str(yaml.as_str()) {
+            Ok(name_to_id) => Ok(name_to_id),
+            Err(e) => Err(Status::corrupted(e.to_string()))
+        }
     }
 
     fn prepare(&self) -> Result<()> {
         let rd_opts = ReadOptions::default();
 
-        let tables_name: Vec<String>;
-        let rs = self.storage.get_pinnable(&rd_opts,
-                                           &self.default_column_family,
-                                           Self::META_COL_TABLE_NAMES);
-        match rs {
+        let tables_name_to_id: HashMap<String, u64>;
+        match self.storage.get_pinnable(&rd_opts,
+                                        &self.default_column_family,
+                                        Self::META_COL_TABLE_NAMES) {
             Err(status) => {
                 return if status == Status::NotFound {
                     Ok(())
@@ -123,19 +138,19 @@ impl DB {
                 };
             }
             Ok(pin_val) => {
-                //pin_val.to_utf8_string().split(",").collect();
-                let parts = pin_val.to_utf8_string();
-                log_debug!(self.logger, "tables: {}", parts);
-                tables_name = parts.split(",").map(|x| { x.to_string() }).collect()
+                let yaml = pin_val.to_utf8_string();
+                log_debug!(self.logger, "tables: {}", yaml);
+                tables_name_to_id = serde_yaml::from_str(yaml.as_str()).unwrap();
             }
         }
 
         let cfs = self.storage.get_all_column_families()?;
-        for name in tables_name {
-            let col_name = format!("{}{}", Self::META_COL_TABLE_PREFIX, &name);
+        for (_, id) in tables_name_to_id {
+            let meta_col_name = format!("{}{}", Self::META_COL_TABLE_PREFIX, id);
             let yaml = self.storage.get_pinnable(&rd_opts,
                                                  &self.default_column_family,
-                                                 col_name.as_bytes())?.to_utf8_string();
+                                                 meta_col_name.as_bytes())?.to_utf8_string();
+            let data_col_name = format!("{}{}", Self::DATA_COL_TABLE_PREFIX, id);
             match serde_yaml::from_str::<TableMetadata>(&yaml) {
                 Err(e) => {
                     let message = format!("Parse yaml fail: {}", e.to_string());
@@ -144,28 +159,51 @@ impl DB {
                 Ok(table) => {
                     let cf = cfs.iter()
                         .cloned()
-                        .find(|x| { x.name() == table.name });
+                        .find(|x| { x.name() == data_col_name });
                     if cf.is_none() {
                         let message = format!("Can not find table column family: {}", &table.name);
                         return Err(Status::corrupted(message));
                     }
-                    let mut locking = self.tables_handle.lock().unwrap();
-                    let table_name = table.name.clone();
-                    let table_handle = TableHandle::new(cf.unwrap(), table);
-                    locking.insert(table_name, Arc::new(Mutex::new(table_handle)));
+                    self.prepare_table(cf.unwrap(), table)?;
                 }
             }
             log_debug!(self.logger, "load table:\n {}", yaml);
         }
 
-        let next_id = self.storage.get_pinnable(&rd_opts,
-                                                &self.default_column_family,
-                                                Self::META_COL_NEXT_TABLE_ID)?
-            .to_utf8_string();
+        let next_id = self.storage.get_pinnable(&rd_opts, &self.default_column_family,
+                                                Self::META_COL_NEXT_TABLE_ID)?.to_utf8_string();
         self.next_table_id.store(u64::from_str_radix(&next_id, 10).unwrap(),
                                  Ordering::Relaxed);
         log_debug!(self.logger, "next table id: {}", &next_id);
         Ok(())
+    }
+
+    fn prepare_table(&self, cf: Arc<dyn ColumnFamily>, table: TableMetadata) -> Result<()> {
+        let mut locking = self.tables_handle.lock().unwrap();
+        let table_name = table.name.clone();
+        let anonymous_row_key_counter = self.load_counter_of_table(&cf, Self::ANONYMOUS_ROW_KEY_KEY)?;
+        let auto_increment_counter = self.load_counter_of_table(&cf, Self::AUTO_INCREMENT_KEY)?;
+
+        let table_handle = TableHandle::new(cf,
+                                            anonymous_row_key_counter,
+                                            auto_increment_counter,
+                                            table);
+        locking.insert(table_name, Arc::new(table_handle));
+        Ok(())
+    }
+
+    fn load_counter_of_table(&self, cf: &Arc<dyn ColumnFamily>, key: &[u8]) -> Result<u64> {
+        let rd_opts = ReadOptions::default();
+        match self.storage.get_pinnable(&rd_opts, &cf, key) {
+            Ok(value) => {
+                Ok(u64::from_le_bytes(value.value().try_into().unwrap()))
+            }
+            Err(status) => if status == Status::NotFound {
+                Ok(0)
+            } else {
+                return Err(status);
+            }
+        }
     }
 
     pub fn connect(&self) -> Arc<Connection> {
@@ -188,13 +226,15 @@ impl DB {
 
     pub fn create_table(&self, table_metadata: TableMetadata, tables: &mut LockingTables) -> Result<u64> {
         let mut batch = WriteBatch::new();
-        //let mut tables = self.tables_handle.lock().unwrap();
 
-        let mut names: Vec<String> = tables.keys().cloned().collect();
-        names.push(table_metadata.name.clone());
-        self.sync_tables_name(&names)?;
+        let mut name_to_id: HashMap<String, u64> = tables.values()
+            .cloned()
+            .map(|x| { (x.metadata.name.clone(), x.metadata.id) })
+            .collect();
+        name_to_id.insert(table_metadata.name.clone(), table_metadata.id);
+        let yaml = self.sync_tables_name_to_id(&name_to_id)?;
         batch.insert(&self.default_column_family, Self::META_COL_TABLE_NAMES,
-                     names.join(",").as_bytes());
+                     yaml.as_bytes());
 
         match serde_yaml::to_string(&table_metadata) {
             Err(e) => {
@@ -202,7 +242,7 @@ impl DB {
                 return Err(Status::corrupted(message));
             }
             Ok(yaml) => {
-                let col_name = format!("{}{}", Self::META_COL_TABLE_PREFIX, &table_metadata.name);
+                let col_name = format!("{}{}", Self::META_COL_TABLE_PREFIX, table_metadata.id);
                 batch.insert(&self.default_column_family, col_name.as_bytes(),
                              yaml.as_bytes());
             }
@@ -210,10 +250,8 @@ impl DB {
         let id = table_metadata.id;
 
         let column_family = self.storage.new_column_family(
-            table_metadata.name.as_str(),
+            format!("{}{}", Self::DATA_COL_TABLE_PREFIX, table_metadata.id).as_str(),
             ColumnFamilyOptions::default())?;
-        // [kkkkk.a] = [value]
-        // [kkkkk.b] = [value]
 
         let mut wr_opts = WriteOptions::default();
         wr_opts.sync = true;
@@ -224,9 +262,11 @@ impl DB {
             }
             Ok(()) => {
                 let table_name = table_metadata.name.clone();
-                let table_handle = TableHandle::new(column_family, table_metadata);
-                let table_ref = Arc::new(Mutex::new(table_handle));
-                tables.insert(table_name, table_ref);
+                let table_handle = TableHandle::new(column_family,
+                                                    0,
+                                                    0,
+                                                    table_metadata);
+                tables.insert(table_name, Arc::new(table_handle));
                 Ok(id)
             }
         }
@@ -237,22 +277,27 @@ impl DB {
         if rs.is_none() {
             return Err(Status::corrupted(format!("Table `{}` not found", name)));
         }
-        let table_ref = rs.unwrap().clone();
-        let table_handle = table_ref.lock().unwrap();
+        let table_handle = rs.unwrap().clone();
         let cf = table_handle.column_family.clone();
         let table = table_handle.metadata.clone();
-        let table_id = table.borrow().id;
+        let table_id = table.id;
         drop(rs);
         drop(table_handle);
 
         self.storage.drop_column_family(cf)?;
         // TODO: delete secondary indexes
 
-        let names: Vec<String> = tables.keys().cloned().filter(|x| {x != name}).collect();
-        self.sync_tables_name(&names)?;
+        // let names: Vec<String> = tables.keys().cloned().filter(|x| { x != name }).collect();
+        // self.sync_tables_name(&names)?;
+        let name_to_id: HashMap<String, u64> = tables.values()
+            .cloned()
+            .filter(|x| { name.ne(&x.metadata.name) })
+            .map(|x| { (x.metadata.name.clone(), x.metadata.id) })
+            .collect();
+        let yaml = self.sync_tables_name_to_id(&name_to_id)?;
         let mut batch = WriteBatch::new();
         batch.insert(&self.default_column_family, Self::META_COL_TABLE_NAMES,
-                     names.join(",").as_bytes());
+                     yaml.as_bytes());
 
         let col_name = format!("{}{}", Self::META_COL_TABLE_PREFIX, name);
         batch.delete(&self.default_column_family, col_name.as_bytes());
@@ -265,10 +310,14 @@ impl DB {
         Ok(table_id)
     }
 
-    pub fn insert_rows(&self, column_family: &Arc<dyn ColumnFamily>, table_name: &String, tuples: &[Tuple]) -> Result<usize> {
+    pub fn insert_rows(&self, column_family: &Arc<dyn ColumnFamily>, table_id: u64,
+                       tuples: &[Tuple],
+                       anonymous_row_key_value: Option<u64>,
+                       auto_increment_value: Option<u64>)
+        -> Result<usize> {
         let mut batch = WriteBatch::new();
         let wr_opts = WriteOptions::default();
-        assert_eq!(column_family.name(), table_name.as_str());
+        assert_eq!(column_family.name(), format!("{}{}", Self::DATA_COL_TABLE_PREFIX, table_id));
 
         let mut key = Vec::new();
         for tuple in tuples {
@@ -291,13 +340,57 @@ impl DB {
             key.clear();
         }
 
+        if let Some(value) = anonymous_row_key_value {
+            batch.insert(column_family, Self::ANONYMOUS_ROW_KEY_KEY, &value.to_le_bytes());
+        }
+        if let Some(value) = auto_increment_value {
+            batch.insert(column_family, Self::AUTO_INCREMENT_KEY, &value.to_le_bytes());
+        }
+
         self.storage.write(&wr_opts, batch)?;
         log_debug!(self.logger, "rows: {} insert ok", tuples.len());
         Ok(tuples.len())
     }
 
     pub fn encode_anonymous_row_key(counter: u64, row_key: &mut Vec<u8>) {
+        row_key.write(&Self::PRIMARY_KEY_ID_BYTES).unwrap(); // primary key id always is 0
         row_key.write(&counter.to_be_bytes()).unwrap();
+    }
+
+    pub fn encode_row_key(value: &Value, ty: &ColumnType, buf: &mut Vec<u8>) -> Result<()> {
+        match ty {
+            ColumnType::TinyInt(_)
+            | ColumnType::SmallInt(_)
+            | ColumnType::Int(_)
+            | ColumnType::BigInt(_) => {
+                match value {
+                    Value::Int(n) => { buf.write(&n.to_be_bytes()).unwrap(); }
+                    _ => unreachable!()
+                }
+            }
+            ColumnType::Float(_, _) => match value {
+                Value::Float(n) => { buf.write(&n.to_be_bytes()).unwrap(); }
+                _ => unreachable!()
+            },
+            ColumnType::Double(_, _) => match value {
+                Value::Float(n) => { buf.write(&n.to_be_bytes()).unwrap(); }
+                _ => unreachable!()
+            },
+            ColumnType::Char(n) => match value {
+                Value::Str(s) => {
+                    if s.len() > *n as usize {
+                        return Err(Status::corrupted("Char type too long"));
+                    }
+                    buf.write(s.as_bytes()).unwrap();
+                    for _ in 0..*n as usize - s.len() {
+                        buf.push(13);
+                    }
+                }
+                _ => unreachable!()
+            },
+            ColumnType::Varchar(_) => unreachable!(),
+        }
+        Ok(())
     }
 
     pub fn encode_column_value(value: &Value, ty: &ColumnType, buf: &mut Vec<u8>) {
@@ -321,9 +414,9 @@ impl DB {
     pub fn decode_column_value(ty: &ColumnType, value: &[u8]) -> Value {
         match ty {
             ColumnType::TinyInt(_)
-                | ColumnType::SmallInt(_)
-                | ColumnType::Int(_)
-                | ColumnType::BigInt(_) => {
+            | ColumnType::SmallInt(_)
+            | ColumnType::Int(_)
+            | ColumnType::BigInt(_) => {
                 Value::Int(i64::from_le_bytes(value.try_into().unwrap()))
             }
             ColumnType::Float(_, _) => unreachable!(),
@@ -333,13 +426,11 @@ impl DB {
         }
     }
 
-    fn get_table_handle(&self, name: &String) -> Option<(Arc<dyn ColumnFamily>, Arc<RefCell<TableMetadata>>)> {
+    fn get_table_handle(&self, name: &String) -> Option<(Arc<dyn ColumnFamily>, Arc<TableMetadata>)> {
         let tables = self.tables_handle.lock().unwrap();
         match tables.get(name) {
-            Some(handle) => {
-                let locking = handle.lock().unwrap();
-                Some((locking.column_family.clone(), locking.metadata.clone()))
-            },
+            Some(handle) =>
+                Some((handle.column_family.clone(), handle.metadata.clone())),
             None => None
         }
     }
@@ -353,10 +444,15 @@ impl DB {
         locking.contains_key(table_name)
     }
 
-    fn sync_tables_name(&self, names: &[String]) -> Result<()> {
+    fn sync_tables_name_to_id(&self, name_to_id: &HashMap<String, u64>) -> Result<String> {
         let metadata_path = self.abs_db_path.join(Path::new(Self::METADATA_FILE_NAME));
-        from_io_result(self.env.write_all(&metadata_path, names.join(",").as_bytes()))?;
-        Ok(())
+        match serde_yaml::to_string(name_to_id) {
+            Ok(yaml) => {
+                from_io_result(self.env.write_all(&metadata_path, yaml.as_bytes()))?;
+                Ok(yaml)
+            }
+            Err(e) => Err(Status::corrupted(e.to_string()))
+        }
     }
 
     pub fn remove_connection(&self, conn: &Connection) {
@@ -374,20 +470,19 @@ impl DB {
                          row_key: &[u8],
                          arena: &Rc<RefCell<Arena>>) -> Result<Tuple> {
         let tables = self.tables_handle.lock().unwrap();
-        let table_ref = tables.get(table_name).unwrap().clone();
-        let table = table_ref.lock().unwrap();
+        let table = tables.get(table_name).unwrap().clone();
         let mut key = Vec::new();
+        key.write(&Self::PRIMARY_KEY_ID_BYTES).unwrap();
         key.write(row_key).unwrap();
         let rd_opts = ReadOptions::default();
-        let mut tuple = Tuple::new(&columns_set, &key, &[], arena);
+        let mut tuple = Tuple::new(&columns_set, &key, arena);
         for col in &columns_set.columns {
             key.write("#".as_bytes()).unwrap();
             key.write(col.name.as_bytes()).unwrap();
 
             let value = self.storage.get_pinnable(&rd_opts, &table.column_family, &key)?;
             tuple.set(col.order, Self::decode_column_value(&col.ty, value.value()));
-            key.truncate(row_key.len());
-
+            key.truncate(row_key.len() + 4);
         }
         Ok(tuple)
     }
@@ -395,16 +490,19 @@ impl DB {
 
 pub struct TableHandle {
     pub column_family: Arc<dyn ColumnFamily>,
-    secondary_indexes: Vec<Arc<dyn ColumnFamily>>,
-    pub anonymous_row_key_counter: AtomicU64,
-    auto_increment_counter: AtomicU64,
+    pub anonymous_row_key_counter: Arc<Mutex<u64>>,
+    pub auto_increment_counter: Arc<Mutex<u64>>,
     columns_by_name: HashMap<String, usize>,
     columns_by_id: HashMap<u32, usize>,
-    pub metadata: Arc<RefCell<TableMetadata>>,
+    pub mutex: Arc<Mutex<u64>>,
+    pub metadata: Arc<TableMetadata>,
 }
 
 impl TableHandle {
-    fn new(column_family: Arc<dyn ColumnFamily>, metadata: TableMetadata) -> Self {
+    fn new(column_family: Arc<dyn ColumnFamily>,
+           anonymous_row_key_counter: u64,
+           auto_increment_counter: u64,
+           metadata: TableMetadata) -> Self {
         let mut columns_by_name = HashMap::new();
         let mut columns_by_id = HashMap::new();
         for i in 0..metadata.columns.len() {
@@ -414,27 +512,44 @@ impl TableHandle {
         }
         Self {
             column_family,
-            secondary_indexes: Vec::default(),
-            anonymous_row_key_counter: AtomicU64::new(0),
-            auto_increment_counter: AtomicU64::new(0),
+            anonymous_row_key_counter: Arc::new(Mutex::new(anonymous_row_key_counter)),
+            auto_increment_counter: Arc::new(Mutex::new(auto_increment_counter)),
             columns_by_name,
             columns_by_id,
-            metadata: Arc::new(RefCell::new(metadata))
+            mutex: Arc::new(Mutex::new(0)),
+            metadata: Arc::new(metadata),
         }
     }
 
     pub fn get_col_by_name(&self, name: &String) -> Option<&ColumnMetadata> {
         match self.columns_by_name.get(name) {
             Some(index) => {
-                Some(& unsafe{&*self.metadata.as_ptr()}.columns[*index])
+                Some(&self.metadata.columns[*index])
             }
             None => None
         }
-        //self.metadata.borrow().columns
+    }
+
+    pub fn get_col_by_id(&self, id: u32) -> Option<&ColumnMetadata> {
+        match self.columns_by_id.get(&id) {
+            Some(index) => {
+                Some(&self.metadata.columns[*index])
+            }
+            None => None
+        }
+    }
+
+    pub fn has_auto_increment_fields(&self) -> bool {
+        for col in &self.metadata.columns {
+            if col.auto_increment {
+                return true;
+            }
+        }
+        return false;
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableMetadata {
     pub name: String,
     pub id: u64,
@@ -447,9 +562,10 @@ pub struct TableMetadata {
     pub columns: Vec<ColumnMetadata>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnMetadata {
     pub name: String,
+    pub order: usize,
     pub id: u32,
     pub ty: ColumnType,
     pub primary_key: bool,
@@ -486,8 +602,8 @@ mod tests {
         conn.execute_str("create table a { a tinyint(1) not null } ", &arena)?;
 
         let (cf, tb) = db.get_table_handle(&"a".to_string()).unwrap();
-        assert_eq!("a", cf.name());
-        assert_eq!("a", tb.borrow().name);
+        assert_eq!("__table__1", cf.name());
+        assert_eq!("a", tb.name);
         Ok(())
     }
 
@@ -507,9 +623,9 @@ mod tests {
 
         let db = DB::open("tests".to_string(), "db101".to_string())?;
         let (cf1, t1) = db.get_table_handle(&"t1".to_string()).unwrap();
-        assert_eq!("t1", cf1.name());
-        assert_eq!("t1", t1.borrow().name);
-        assert_eq!(2, t1.borrow().columns.len());
+        assert_eq!("__table__1", cf1.name());
+        assert_eq!("t1", t1.name);
+        assert_eq!(2, t1.columns.len());
         Ok(())
     }
 
@@ -568,6 +684,42 @@ mod tests {
         assert_eq!(Some(3), tuple.get_i64(0));
         assert_eq!(Some(4), tuple.get_i64(1));
         drop(tuple);
+        Ok(())
+    }
+
+    #[test]
+    fn insert_with_auto_increment() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db104");
+        let arena = Arena::new_rc();
+        let db = DB::open("tests".to_string(), "db104".to_string())?;
+        let sql = " create table t1 {\n\
+                a int(11) primary key auto_increment,\n\
+                b int(11),\n\
+                c int(11)\n\
+            };\n\
+            insert into table t1(b,c) values(1,2), (3,4), (5,6);\n\
+            ";
+        let conn = db.connect();
+        conn.execute_str(sql, &arena)?;
+
+        let mut column_set = ArenaBox::new(ColumnSet::new("t1", &arena), &arena);
+        column_set.append("a", "", ColumnType::Int(11));
+        column_set.append("b", "", ColumnType::Int(11));
+        column_set.append("c", "", ColumnType::Int(11));
+
+        let tuple = db._test_get_row(&"t1".to_string(),
+                                     &column_set,
+                                     &1i64.to_be_bytes(), &arena)?;
+        assert_eq!(Some(1), tuple.get_i64(0));
+        assert_eq!(Some(1), tuple.get_i64(1));
+        assert_eq!(Some(2), tuple.get_i64(2));
+
+        let tuple = db._test_get_row(&"t1".to_string(),
+                                     &column_set,
+                                     &2i64.to_be_bytes(), &arena)?;
+        assert_eq!(Some(2), tuple.get_i64(0));
+        assert_eq!(Some(3), tuple.get_i64(1));
+        assert_eq!(Some(4), tuple.get_i64(2));
         Ok(())
     }
 }

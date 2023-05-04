@@ -313,6 +313,8 @@ impl ArenaStr {
         self.as_str().to_string()
     }
 
+    pub fn len(&self) -> usize { self.as_str().len() }
+
     pub fn as_str(&self) -> &str {
         unsafe { self.naked.as_ref() }
     }
