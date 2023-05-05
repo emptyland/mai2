@@ -353,6 +353,7 @@ impl DB {
 
         let mut key = Vec::new();
         for tuple in tuples {
+            // key = [row_key(n bytes)|col_id(4 bytes)]
             let prefix_key_len = tuple.row_key().len();
             key.write(tuple.row_key()).unwrap();
             for col in &tuple.columns().columns {
@@ -361,7 +362,7 @@ impl DB {
                 if value.is_null() {
                     continue;
                 }
-                key.write(format!("#{}", col.name).as_bytes()).unwrap();
+                key.write(&col.id.to_be_bytes()).unwrap();
                 let row_key_len = key.len();
 
                 Self::encode_column_value(tuple.get(col.order), &col.ty, &mut key);
@@ -608,8 +609,8 @@ impl DB {
         let rd_opts = ReadOptions::default();
         let mut tuple = Tuple::new(&columns_set, &key, arena);
         for col in &columns_set.columns {
-            key.write("#".as_bytes()).unwrap();
-            key.write(col.name.as_bytes()).unwrap();
+            let col_meta = table.get_col_by_name(&col.name.to_string()).unwrap();
+            key.write(&col_meta.id.to_be_bytes()).unwrap();
 
             let value = self.storage.get_pinnable(&rd_opts, &table.column_family, &key)?;
             tuple.set(col.order, Self::decode_column_value(&col.ty, value.value()));
@@ -905,8 +906,8 @@ mod tests {
         conn.execute_prepared_statement(&mut stmt, &arena)?;
 
         let mut column_set = ArenaBox::new(ColumnSet::new("t1", &arena), &arena);
-        column_set.append("a", "", ColumnType::Int(11));
-        column_set.append("b", "", ColumnType::Int(11));
+        column_set.append_with_name("a", ColumnType::Int(11));
+        column_set.append_with_name("b", ColumnType::Int(11));
 
         let tuple = db._test_get_row(&"t1".to_string(),
                                      &column_set,
@@ -940,9 +941,9 @@ mod tests {
         conn.execute_str(sql, &arena)?;
 
         let mut column_set = ArenaBox::new(ColumnSet::new("t1", &arena), &arena);
-        column_set.append("a", "", ColumnType::Int(11));
-        column_set.append("b", "", ColumnType::Int(11));
-        column_set.append("c", "", ColumnType::Int(11));
+        column_set.append_with_name("a", ColumnType::Int(11));
+        column_set.append_with_name("b", ColumnType::Int(11));
+        column_set.append_with_name("c", ColumnType::Int(11));
 
         let tuple = db._test_get_row(&"t1".to_string(),
                                      &column_set,

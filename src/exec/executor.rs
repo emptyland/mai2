@@ -290,7 +290,7 @@ impl Visitor for Executor {
             }
         }
         for col in &table.metadata.columns {
-            columns.append(col.name.as_str(), "", col.ty.clone());
+            columns.append(col.name.as_str(), "", col.id, col.ty.clone());
         }
 
         let use_anonymous_row_key = table.metadata.primary_keys.is_empty();
@@ -421,11 +421,16 @@ impl ColumnSet {
         }
     }
 
-    pub fn append(&mut self, name: &str, desc: &str, ty: ColumnType) {
+    pub fn append_with_name(&mut self, name: &str, ty: ColumnType) {
+        self.append(name, "", 0, ty);
+    }
+
+    pub fn append(&mut self, name: &str, desc: &str, id: u32, ty: ColumnType) {
         let order = self.columns.len();
         self.columns.push(Column {
             name: ArenaStr::from_arena(name, &self.arena),
             desc: ArenaStr::from_arena(desc, &self.arena),
+            id,
             ty,
             order,
         });
@@ -436,6 +441,7 @@ impl ColumnSet {
 pub struct Column {
     pub name: ArenaStr,
     pub desc: ArenaStr,
+    pub id: u32,
     pub ty: ColumnType,
     pub order: usize,
 }
