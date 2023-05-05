@@ -45,6 +45,9 @@ pub enum Token {
     True,
     False,
     Distinct,
+    Unique,
+    Index,
+    Comment,
 
     // types:
     Char,
@@ -127,6 +130,9 @@ impl Keywords {
                 True,
                 False,
                 Distinct,
+                Unique,
+                Index,
+                Comment,
 
                 Char,
                 Varchar,
@@ -137,7 +143,7 @@ impl Keywords {
                 Float,
                 Double,
             ]
-        };
+        }
         Self {
             words
         }
@@ -284,7 +290,8 @@ impl<'a> Lexer<'a> {
 
     fn parse_str_literal(&mut self, quote: char) -> Result<TokenPart> {
         let start_pos = self.current_position();
-        assert_eq!(quote, self.move_next()?);
+        assert_eq!(quote, self.peek());
+        self.move_next()?;
         let mut buf = String::new();
         while self.peek() != quote {
             let ch = self.peek();
@@ -293,7 +300,9 @@ impl<'a> Lexer<'a> {
                                                   self.current_position()));
             }
             buf.push(ch);
+            self.move_next()?;
         }
+        self.move_next()?;
         let str = ArenaStr::new(buf.as_str(), self.arena.borrow_mut().deref_mut());
         Ok(self.to_concat_token(Token::StringLiteral(str), start_pos))
     }
@@ -395,6 +404,22 @@ mod tests {
         assert_eq!(Token::FloatLiteral(0.111), part.token);
         part = lexer.next()?;
         assert_eq!(Token::Eof, part.token);
+        Ok(())
+    }
+
+    #[test]
+    fn strings() -> Result<()> {
+        let arena = Arena::new_rc();
+        let txt = Vec::from("\"\" \'\' \'a\'");
+        let mut file = MemorySequentialFile::new(txt);
+        let mut lexer = Lexer::new(&mut file, &arena);
+
+        let mut part = lexer.next()?;
+        assert_eq!(Token::StringLiteral(ArenaStr::from_arena("", &arena)), part.token);
+        part = lexer.next()?;
+        assert_eq!(Token::StringLiteral(ArenaStr::from_arena("", &arena)), part.token);
+        part = lexer.next()?;
+        assert_eq!(Token::StringLiteral(ArenaStr::from_arena("a", &arena)), part.token);
         Ok(())
     }
 }

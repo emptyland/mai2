@@ -172,7 +172,8 @@ pub struct CreateTable {
     pub table_name: ArenaStr,
     pub if_not_exists: bool,
     pub columns: ArenaVec<ArenaBox<ColumnDeclaration>>,
-    pub primary_keys: ArenaVec<ArenaStr>
+    pub primary_keys: ArenaVec<ArenaStr>,
+    pub secondary_indices: ArenaVec<ArenaBox<IndexDeclaration>>
 }
 
 pub struct ColumnDeclaration {
@@ -189,6 +190,13 @@ pub struct TypeDeclaration {
     pub token: Token,
     pub len: usize,
     pub len_part: usize,
+}
+
+#[derive(Debug)]
+pub struct IndexDeclaration {
+    pub name: ArenaStr,
+    pub unique: bool,
+    pub key_parts: ArenaVec<ArenaStr>,
 }
 
 #[derive(Debug)]
@@ -306,6 +314,7 @@ impl Factory {
             if_not_exists,
             columns: ArenaVec::new(&self.arena),
             primary_keys: ArenaVec::new(&self.arena),
+            secondary_indices: ArenaVec::new(&self.arena),
         }, &self.arena)
     }
 
@@ -337,6 +346,14 @@ impl Factory {
             token,
             len,
             len_part,
+        }, &self.arena)
+    }
+
+    pub fn new_index_decl(&self, name: ArenaStr, unique: bool) -> ArenaBox<IndexDeclaration> {
+        ArenaBox::new(IndexDeclaration {
+            name,
+            unique,
+            key_parts: ArenaVec::new(&self.arena),
         }, &self.arena)
     }
 

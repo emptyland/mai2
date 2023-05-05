@@ -1,7 +1,9 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::{iter, ptr};
+use std::cmp::min;
 use std::fmt::{Debug, Display, Formatter};
+use std::io::Write;
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut, Index, IndexMut};
@@ -161,7 +163,8 @@ impl NormalPage {
 
             let base = self as *mut Self as *mut u8;
             let limit = base.add(size_of::<Self>());
-            assert!(self.free > base && self.free <= limit);
+            assert!(self.free > base);
+            assert!(self.free <= limit);
         }
         self.remaining -= layout.size() + padding_size;
         NonNull::new(slice_from_raw_parts_mut(aligned, layout.size()))
@@ -290,6 +293,12 @@ pub struct ArenaStr {
 
 impl ArenaStr {
     pub fn new(str: &str, alloc: &mut dyn Allocator) -> Self {
+        static EMPTY_DUMMY: &str = "";
+        if str.is_empty() {
+            return Self {
+                naked: NonNull::new(EMPTY_DUMMY as *const str as *mut str).unwrap()
+            };
+        }
         let layout = Layout::from_size_align(str.len(), 4).unwrap();
         let mut chunk = alloc.allocate(layout).unwrap();
         let naked = unsafe {
@@ -315,12 +324,19 @@ impl ArenaStr {
 
     pub fn len(&self) -> usize { self.as_str().len() }
 
+    pub fn is_empty(&self) -> bool { self.as_str().is_empty() }
+
     pub fn as_str(&self) -> &str {
         unsafe { self.naked.as_ref() }
     }
 
     pub fn as_bytes(&self) -> &[u8] {
         self.as_str().as_bytes()
+    }
+
+    pub fn bytes_part(&self, start: usize, stop: usize) -> &[u8] {
+        let end = min(stop, self.len());
+        &self.as_bytes()[start..end]
     }
 }
 
@@ -416,7 +432,7 @@ impl<T> ArenaVec<T> {
         }
     }
 
-    fn extend_if_needed(&mut self, incremental: usize) {
+    fn extend_if_needed(&mut self, incremental: usize) -> &mut [T] {
         if self.len() + incremental > self.capacity() {
             let new_cap = self.capacity() * 2 + 4;
             let naked = unsafe {
@@ -430,8 +446,9 @@ impl<T> ArenaVec<T> {
                 ptr::copy_nonoverlapping(src, dst, self.len);
             }
         }
-
+        let rv = &mut unsafe { self.naked.as_mut() }[self.len..self.len + incremental];
         self.len += incremental;
+        rv
     }
 
     unsafe fn new_uninitialized(alloc: &mut dyn Allocator, capacity: usize) -> NonNull<[T]> {
@@ -501,6 +518,16 @@ impl<'a, T> Iterator for ArenaVecIterMut<'a, T> {
             Some(&mut slice_mut[index])
         }
     }
+}
+
+impl Write for ArenaVec<u8> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut dst = self.extend_if_needed(buf.len());
+        dst.write(buf).unwrap();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
 impl<T: Debug> Debug for ArenaVec<T> {

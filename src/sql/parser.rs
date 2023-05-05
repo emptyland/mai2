@@ -1,4 +1,5 @@
 use std::io::Read;
+use serde_yaml::to_string;
 use crate::base::{ArenaVec, ArenaBox, ArenaStr};
 use crate::sql::{ParseError, Result, SourceLocation, SourcePosition};
 use crate::sql::ast::{ColumnDeclaration, CreateTable, DropTable, Expression, Factory, Identifier, InsertIntoTable, Operator, Placeholder, Statement, TypeDeclaration};
@@ -48,6 +49,7 @@ impl <'a> Parser<'a> {
                                           self.placeholder_order);
                             stmts.push(rv);
                         }
+                        Token::Index => todo!(),
                         _ => Err(self.concat_syntax_error(start_pos, "Unexpected `table'".to_string()))?
                     }
                 }
@@ -112,6 +114,38 @@ impl <'a> Parser<'a> {
             self.match_expected(Token::RParent)?;
         }
 
+        // index name (xxx,xxx)
+        // key name (xxx,xxx)
+        // unique name (xxx,xxx)
+        loop {
+            let (has_index, is_unique) = if self.test(Token::Index)?
+                || self.test(Token::Key)? {
+                (true, false)
+            } else if self.test(Token::Unique)? { // unique [index|key]
+                if !self.test(Token::Index)? {
+                    self.test(Token::Key)?;
+                }
+                (true, true)
+            } else {
+                (false, false)
+            };
+            if !has_index {
+                break;
+            }
+
+            let name = self.match_id()?;
+            let mut index_decl = self.factory.new_index_decl(name, is_unique);
+            self.match_expected(Token::LParent)?;
+            loop {
+                index_decl.key_parts.push(self.match_id()?);
+                if !self.test(Token::Comma)? {
+                    break;
+                }
+            }
+            node.secondary_indices.push(index_decl);
+            self.match_expected(Token::RParent)?;
+        }
+
         self.match_expected(Token::RBrace)?;
         Ok(node)
     }
@@ -165,11 +199,7 @@ impl <'a> Parser<'a> {
         let part = self.peek().clone();
         match part.token {
             Token::Char
-            | Token::Varchar
-            | Token::TinyInt
-            | Token::SmallInt
-            | Token::Int
-            | Token::BigInt => {
+            | Token::Varchar => {
                 self.move_next()?;
                 self.match_expected(Token::LParent)?;
                 let pos = self.lexer.current_position();
@@ -179,6 +209,21 @@ impl <'a> Parser<'a> {
                 }
                 self.match_expected(Token::RParent)?;
                 Ok(self.factory.new_type_decl(part.token, len as usize, 0))
+            }
+            Token::TinyInt
+            | Token::SmallInt
+            | Token::Int
+            | Token::BigInt => {
+                self.move_next()?;
+                if self.test(Token::LParent)? {
+                    let pos = self.lexer.current_position();
+                    let len = self.match_int_literal()?;
+                    if len <= 0 {
+                        Err(self.concat_syntax_error(pos, "Invalid type len".to_string()))?;
+                    }
+                    self.match_expected(Token::RParent)?;
+                }
+                Ok(self.factory.new_type_decl(part.token, 11, 0))
             }
             _ => Err(self.current_syntax_error("Unexpected type".to_string()))
         }

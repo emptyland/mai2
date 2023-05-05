@@ -1,7 +1,7 @@
 use std::alloc::{alloc, Layout};
 use std::arch::x86_64::_tzcnt_u32;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::intrinsics::copy_nonoverlapping;
 use std::io::{Read, Write};
 use std::ops::{AddAssign, Deref, DerefMut, Index};
@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::Ordering;
 
 use crate::base::{Allocator, Arena, ArenaBox, ArenaStr, ArenaVec};
-use crate::exec::db::{ColumnMetadata, ColumnType, DB, TableMetadata};
+use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata};
 use crate::exec::from_sql_result;
 use crate::sql::ast::{BinaryExpression, CallFunction, CreateTable, DropTable, Factory, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Placeholder, Statement, TypeDeclaration, UnaryExpression, Visitor};
 use crate::sql::parser::Parser;
@@ -160,6 +160,7 @@ impl Visitor for Executor {
             raw_ast: serialize_yaml_to_string(this),
             rows: 0,
             primary_keys: Vec::default(),
+            secondary_indices: Vec::default(),
             auto_increment_keys: Vec::default(),
             columns: Vec::default(),
         };
@@ -192,6 +193,7 @@ impl Visitor for Executor {
             table.columns.push(col);
         }
 
+        let mut key_part_set = HashSet::new();
         for key in &this.primary_keys {
             match col_name_to_id.get(&key.to_string()) {
                 Some(col_id) => {
@@ -202,10 +204,46 @@ impl Visitor for Executor {
                         visit_error!(self, "Primary key: `{}` not found in declaration", key.as_str());
                     }
                     table.primary_keys.push(*col_id);
+                    key_part_set.insert(key.as_str());
                 }
                 None =>
                     visit_error!(self, "Primary key: `{}` not found in declaration", key.as_str())
             }
+        }
+
+        let mut idx_name_to_id = HashMap::new();
+        for index_decl in &this.secondary_indices {
+
+            if idx_name_to_id.contains_key(&index_decl.name.to_string()) {
+                visit_error!(self, "Duplicated index name: {}", index_decl.name.as_str());
+            }
+
+            let mut index = SecondaryIndexMetadata {
+                name: index_decl.name.to_string(),
+                id: 0,
+                key_parts: Vec::default(),
+                unique: index_decl.unique,
+                order_by: OrderBy::Asc,
+            };
+            for key_part in &index_decl.key_parts {
+                if key_part_set.contains(key_part.as_str()) {
+                    visit_error!(self, "In index {}, duplicated column name: {}", index.name, key_part.as_str());
+                }
+                key_part_set.insert(key_part.as_str());
+                if !col_name_to_id.contains_key(&key_part.to_string()) {
+                    visit_error!(self, "In index {}, column name: {} not found", index.name, key_part.as_str());
+                }
+                index.key_parts.push(*col_name_to_id.get(&key_part.to_string()).unwrap());
+            }
+
+            let rs = db.next_index_id();
+            if rs.is_err() {
+                self.rs = Err(rs.err().unwrap());
+                return;
+            }
+            index.id = rs.unwrap();
+            idx_name_to_id.insert(index.name.clone(), index.id);
+            table.secondary_indices.push(index);
         }
         match db.create_table(table, &mut locking_tables) {
             Err(e) => self.rs = Err(e),
@@ -287,6 +325,7 @@ impl Visitor for Executor {
         let mut evaluator = Evaluator::new(&self.arena);
         let context = Arc::new(TupleContext::new(self.prepared_stmts.back().cloned()));
         let mut tuples = Vec::new();
+        let mut secondary_indices = Vec::new();
         for row in this.values.iter_mut() {
             let mut row_key = Vec::new();
             if let Some(counter) = auto_increment_counter.as_mut() {
@@ -329,12 +368,26 @@ impl Visitor for Executor {
                 tuple.associate_row_key(&row_key);
             }
 
+            if !table.metadata.secondary_indices.is_empty() {
+                let mut bundle = SecondaryIndexBundle::new(&tuple, &self.arena);
+                for index in &table.metadata.secondary_indices {
+                    let mut buf = ArenaVec::<u8>::new(&self.arena);
+                    buf.write(&(index.id as u32).to_be_bytes()).unwrap();
+                    for id in &index.key_parts {
+                        let col = table.get_col_by_id(*id).unwrap();
+                        DB::encode_secondary_index(tuple.get(col.order), &col.ty, &mut buf);
+                    }
+                    bundle.index_keys.push(buf);
+                }
+                secondary_indices.push(bundle);
+            }
+
             tuples.push(tuple);
         }
         let anonymous_row_key_value = anonymous_row_key_counter.map(|x| { *x });
         let auto_increment_value = auto_increment_counter.map(|x| { *x });
 
-        match db.insert_rows(&cf, table.metadata.id, &tuples,
+        match db.insert_rows(&cf, table.metadata.id, &tuples, &secondary_indices,
                              anonymous_row_key_value, auto_increment_value) {
             Ok(_) => (),
             Err(e) => self.rs = Err(e)
@@ -470,6 +523,24 @@ impl Index<usize> for Tuple {
 
     fn index(&self, index: usize) -> &Self::Output {
         self.get(index)
+    }
+}
+
+pub struct SecondaryIndexBundle {
+    row_key: NonNull<[u8]>,
+    pub index_keys: ArenaVec<ArenaVec<u8>>,
+}
+
+impl SecondaryIndexBundle {
+    fn new(tuple: &Tuple, arena: &Rc<RefCell<Arena>>) -> Self {
+        Self {
+            row_key: tuple.row_key,
+            index_keys: ArenaVec::new(&arena)
+        }
+    }
+
+    pub fn row_key(&self) -> &[u8] {
+        unsafe { self.row_key.as_ref() }
     }
 }
 
