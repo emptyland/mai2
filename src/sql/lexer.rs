@@ -14,6 +14,7 @@ pub struct TokenPart {
     pub location: SourceLocation,
 }
 
+#[warn(non_camel_case_types)]
 #[derive(Debug, Default, PartialEq, Clone)]
 pub enum Token {
     #[default]

@@ -21,7 +21,7 @@ pub mod config;
 
 use std::sync::Arc;
 pub use env::*;
-pub use mai2::*;
+pub use self::mai2::*;
 pub use crate::status::*;
 pub use comparator::*;
 pub use iterator::*;
