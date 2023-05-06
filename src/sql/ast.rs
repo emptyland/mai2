@@ -42,6 +42,7 @@ macro_rules! expression_impl {
 
 ast_nodes_impl![
     (CreateTable, visit_create_table),
+    (CreateIndex, visit_create_index),
     (DropTable, visit_drop_table),
     (InsertIntoTable, visit_insert_into_table),
     (Identifier, visit_identifier),
@@ -200,6 +201,14 @@ pub struct IndexDeclaration {
 }
 
 #[derive(Debug)]
+pub struct CreateIndex {
+    pub name: ArenaStr,
+    pub unique: bool,
+    pub table_name: ArenaStr,
+    pub key_parts: ArenaVec<ArenaStr>,
+}
+
+#[derive(Debug)]
 pub struct DropTable {
     pub table_name: ArenaStr,
     pub if_exists: bool,
@@ -315,6 +324,15 @@ impl Factory {
             columns: ArenaVec::new(&self.arena),
             primary_keys: ArenaVec::new(&self.arena),
             secondary_indices: ArenaVec::new(&self.arena),
+        }, &self.arena)
+    }
+
+    pub fn new_create_index(&self, name: ArenaStr, unique: bool, table_name: ArenaStr) -> ArenaBox<CreateIndex> {
+        ArenaBox::new(CreateIndex {
+            name,
+            table_name,
+            unique,
+            key_parts: ArenaVec::new(&self.arena),
         }, &self.arena)
     }
 

@@ -100,6 +100,20 @@ impl Visitor for YamlWriter<'_> {
         self.indent -= 1;
     }
 
+    fn visit_create_index(&mut self, this: &mut CreateIndex) {
+        emit_header!(self, "CreateIndex");
+        indent! {self;
+            emit!(self, "name: {}", this.name);
+            emit!(self, "table_name: {}", this.table_name);
+            emit!(self, "key_parts:");
+            indent! {self;
+                for name in this.key_parts.iter_mut() {
+                    emit!(self, "- {}", name);
+                }
+            };
+        }
+    }
+
     fn visit_drop_table(&mut self, this: &mut DropTable) {
         emit_header!(self, "DropTable");
         indent! {self;

@@ -438,7 +438,7 @@ impl DB {
         }
 
         self.storage.write(&wr_opts, batch)?;
-        log_debug!(self.logger, "rows: {} insert ok", tuples.len());
+        //log_debug!(self.logger, "rows: {} insert ok", tuples.len());
         Ok(tuples.len())
     }
 
@@ -1117,6 +1117,35 @@ mod tests {
         assert!(rs.is_err());
         assert_eq!(Status::Corruption("Duplicated primary key, must be unique.".to_string()),
                    rs.unwrap_err());
+        Ok(())
+    }
+
+    #[test]
+    fn large_insert_into_table() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db110");
+        let arena = Arena::new_rc();
+        let db = DB::open("tests".to_string(), "db110".to_string())?;
+        let n = 300000;
+        let conn = db.connect();
+        let sql = " create table t1 {\n\
+                a int primary key auto_increment,\n\
+                b char(9)\n\
+            };\n\
+            ";
+        conn.execute_str(sql, &arena)?;
+
+        let sql = "insert into table t1(a,b) values (?, ?)";
+        let mut stmt = conn.prepare_str(sql, &arena)?.first().cloned().unwrap();
+
+        let jiffies = db.env.current_time_mills();
+        for i in 0..n {
+            stmt.bind_i64(0, i as i64);
+            stmt.bind_null(1);
+            conn.execute_prepared_statement(&mut stmt)?;
+        }
+        let cost = (db.env.current_time_mills() - jiffies) as f32 / 1000f32;
+        println!("qps: {}", n as f32 / cost);
+
         Ok(())
     }
 }

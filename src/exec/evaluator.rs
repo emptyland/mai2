@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use crate::{Corrupting, Result, Status};
 use crate::base::{Arena, ArenaStr};
-use crate::sql::ast::{BinaryExpression, CallFunction, CreateTable, DropTable, Expression, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Operator, Placeholder, UnaryExpression, Visitor};
+use crate::sql::ast::{BinaryExpression, CallFunction, CreateIndex, CreateTable, DropTable, Expression, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Operator, Placeholder, UnaryExpression, Visitor};
 
 pub struct Evaluator {
     arena: Rc<RefCell<Arena>>,
@@ -138,6 +138,7 @@ macro_rules! process_airth_op {
 
 impl Visitor for Evaluator {
     fn visit_create_table(&mut self, this: &mut CreateTable) { unreachable!() }
+    fn visit_create_index(&mut self, this: &mut CreateIndex) { unreachable!() }
     fn visit_drop_table(&mut self, this: &mut DropTable) { unreachable!() }
     fn visit_insert_into_table(&mut self, this: &mut InsertIntoTable) { unreachable!() }
 

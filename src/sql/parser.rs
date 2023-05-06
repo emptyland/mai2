@@ -2,7 +2,7 @@ use std::io::Read;
 use serde_yaml::to_string;
 use crate::base::{ArenaVec, ArenaBox, ArenaStr};
 use crate::sql::{ParseError, Result, SourceLocation, SourcePosition};
-use crate::sql::ast::{ColumnDeclaration, CreateTable, DropTable, Expression, Factory, Identifier, InsertIntoTable, Operator, Placeholder, Statement, TypeDeclaration};
+use crate::sql::ast::{ColumnDeclaration, CreateIndex, CreateTable, DropTable, Expression, Factory, Identifier, InsertIntoTable, Operator, Placeholder, Statement, TypeDeclaration};
 use crate::sql::lexer::{Lexer, Token, TokenPart};
 
 pub struct Parser<'a> {
@@ -49,7 +49,11 @@ impl <'a> Parser<'a> {
                                           self.placeholder_order);
                             stmts.push(rv);
                         }
-                        Token::Index => todo!(),
+                        Token::Index => {
+                            let rv = proc(self.parse_create_index(start_pos)?.into(),
+                                          self.placeholder_order);
+                            stmts.push(rv);
+                        },
                         _ => Err(self.concat_syntax_error(start_pos, "Unexpected `table'".to_string()))?
                     }
                 }
@@ -227,6 +231,26 @@ impl <'a> Parser<'a> {
             }
             _ => Err(self.current_syntax_error("Unexpected type".to_string()))
         }
+    }
+
+    fn parse_create_index(&mut self, _start_pos: SourcePosition) -> Result<ArenaBox<CreateIndex>> {
+        let is_unique = self.test(Token::Unique)?;
+        self.match_expected(Token::Index)?;
+        let name = self.match_id()?;
+        self.match_expected(Token::On)?;
+        let table_name = self.match_id()?;
+        let mut node = self.factory.new_create_index(name, is_unique, table_name);
+
+        self.match_expected(Token::LParent)?;
+        loop {
+            let key_part = self.match_id()?;
+            node.key_parts.push(key_part);
+            if !self.test(Token::Comma)? {
+                self.match_expected(Token::RParent)?;
+                break;
+            }
+        }
+        Ok(node)
     }
 
     fn parse_insert_into_table(&mut self) -> Result<ArenaBox<InsertIntoTable>> {

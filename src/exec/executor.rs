@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use crate::base::{Allocator, Arena, ArenaBox, ArenaStr, ArenaVec};
 use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata};
 use crate::exec::from_sql_result;
-use crate::sql::ast::{BinaryExpression, CallFunction, CreateTable, DropTable, Expression, Factory, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Placeholder, Statement, TypeDeclaration, UnaryExpression, Visitor};
+use crate::sql::ast::{BinaryExpression, CallFunction, CreateIndex, CreateTable, DropTable, Expression, Factory, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Placeholder, Statement, TypeDeclaration, UnaryExpression, Visitor};
 use crate::sql::parser::Parser;
 use crate::{Corrupting, Result, Status};
 use crate::exec::evaluator::{Context, Evaluator, Value};
@@ -204,6 +204,7 @@ impl PreparedStatement {
     pub fn bind_f64(&mut self, i: usize, value: f64) { self.bind(i, Value::Float(value)); }
     pub fn bind_str(&mut self, i: usize, value: &str) { todo!() }
     pub fn bind(&mut self, i: usize, value: Value) { self.parameters[i] = value; }
+    pub fn bind_null(&mut self, i: usize) { self.bind(i, Value::Null); }
 }
 
 macro_rules! visit_error {
@@ -329,6 +330,10 @@ impl Visitor for Executor {
             Err(e) => self.rs = Err(e),
             Ok(_) => ()
         }
+    }
+
+    fn visit_create_index(&mut self, this: &mut CreateIndex) {
+        todo!()
     }
 
     fn visit_drop_table(&mut self, this: &mut DropTable) {
