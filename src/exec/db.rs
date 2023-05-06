@@ -4,7 +4,7 @@ use std::default::Default;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::exec::connection::Connection;
@@ -12,6 +12,7 @@ use crate::{Corrupting, log_debug, Status, storage};
 use crate::base::{Arena, ArenaBox, ArenaStr, Logger};
 use crate::exec::evaluator::Value;
 use crate::exec::executor::{ColumnSet, SecondaryIndexBundle, Tuple};
+use crate::exec::locking::LockingManagement;
 use crate::storage::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME, Env, from_io_result, Options, ReadOptions, WriteBatch, WriteOptions};
 use crate::Result;
 
@@ -23,17 +24,20 @@ pub struct DB {
     storage: Arc<dyn storage::DB>,
     default_column_family: Arc<dyn storage::ColumnFamily>,
     //tables: Mutex<HashMap<String, Box>>
-    tables_handle: Mutex<HashMap<String, TableRef>>,
+    tables_handle: RwLock<HashMap<String, TableRef>>,
 
     next_table_id: AtomicU64,
     next_index_id: AtomicU64,
     next_conn_id: AtomicU64,
     connections: Mutex<Vec<Arc<Connection>>>,
+    locks: LockingManagement,
     // TODO:
 }
 
 type TableRef = Arc<TableHandle>;
-type LockingTables<'a> = MutexGuard<'a, HashMap<String, TableRef>>;
+type LockingTables<'a> = RwLockReadGuard<'a, HashMap<String, TableRef>>;
+type LockingTablesMut<'a> = RwLockWriteGuard<'a, HashMap<String, TableRef>>;
+
 
 impl DB {
     const META_COL_TABLE_NAMES: &'static [u8] = "__metadata_table_names__".as_bytes();
@@ -54,7 +58,7 @@ impl DB {
     const NOT_NULL_BYTES: [u8; 1] = [Self::NOT_NULL_BYTE; 1];
 
     const CHAR_FILLING_BYTE: u8 = ' ' as u8;
-    const CHAR_FILLING_BYTES: [u8;1] = [Self::CHAR_FILLING_BYTE; 1];
+    const CHAR_FILLING_BYTES: [u8; 1] = [Self::CHAR_FILLING_BYTE; 1];
 
     const VARCHAR_SEGMENT_LEN: usize = 9;
 
@@ -90,8 +94,9 @@ impl DB {
                 next_conn_id: AtomicU64::new(0),
                 next_table_id: AtomicU64::new(0),
                 next_index_id: AtomicU64::new(1), // 0 = primary key
-                tables_handle: Mutex::default(),
+                tables_handle: RwLock::default(),
                 connections: Mutex::default(),
+                locks: LockingManagement::new(),
             }
         });
         db.prepare()?;
@@ -200,7 +205,6 @@ impl DB {
     }
 
     fn prepare_table(&self, cf: Arc<dyn ColumnFamily>, table: TableMetadata) -> Result<()> {
-        let mut locking = self.tables_handle.lock().unwrap();
         let table_name = table.name.clone();
         let anonymous_row_key_counter = self.load_number(&cf, Self::ANONYMOUS_ROW_KEY_KEY, 0)?;
         let auto_increment_counter = self.load_number(&cf, Self::AUTO_INCREMENT_KEY, 0)?;
@@ -209,6 +213,9 @@ impl DB {
                                             anonymous_row_key_counter,
                                             auto_increment_counter,
                                             table);
+
+        let mut locking = self.tables_handle.write().unwrap();
+        self.locks.install(table_handle.metadata.id);
         locking.insert(table_name, Arc::new(table_handle));
         Ok(())
     }
@@ -255,7 +262,7 @@ impl DB {
         Ok(id)
     }
 
-    pub fn create_table(&self, table_metadata: TableMetadata, tables: &mut LockingTables) -> Result<u64> {
+    pub fn create_table(&self, table_metadata: TableMetadata, tables: &mut LockingTablesMut) -> Result<u64> {
         let mut batch = WriteBatch::new();
 
         let mut name_to_id: HashMap<String, u64> = tables.values()
@@ -297,13 +304,14 @@ impl DB {
                                                     0,
                                                     0,
                                                     table_metadata);
+                self.locks.install(table_handle.metadata.id);
                 tables.insert(table_name, Arc::new(table_handle));
                 Ok(id)
             }
         }
     }
 
-    pub fn drop_table(&self, name: &String, tables: &mut LockingTables) -> Result<u64> {
+    pub fn drop_table(&self, name: &String, tables: &mut LockingTablesMut) -> Result<u64> {
         let rs = tables.get(name);
         if rs.is_none() {
             return Err(Status::corrupted(format!("Table `{}` not found", name)));
@@ -338,21 +346,56 @@ impl DB {
         self.storage.write(&wr_opts, batch)?;
 
         tables.remove(name);
+        self.locks.uninstall(table_id);
         Ok(table_id)
     }
 
-    pub fn insert_rows(&self, column_family: &Arc<dyn ColumnFamily>, table_id: u64,
+    pub fn insert_rows(&self, column_family: &Arc<dyn ColumnFamily>,
+                       table: &Arc<TableMetadata>,
                        tuples: &[Tuple],
                        secondary_indices: &[SecondaryIndexBundle],
                        anonymous_row_key_value: Option<u64>,
-                       auto_increment_value: Option<u64>)
+                       auto_increment_value: Option<u64>,
+                       check_row_key_unique: bool)
                        -> Result<usize> {
         let mut batch = WriteBatch::new();
         let wr_opts = WriteOptions::default();
-        assert_eq!(column_family.name(), format!("{}{}", Self::DATA_COL_TABLE_PREFIX, table_id));
+        assert_eq!(column_family.name(), format!("{}{}", Self::DATA_COL_TABLE_PREFIX, &table.id));
+
+        let inst = self.locks.instance(table.id).unwrap();
+        let mut lock_group = inst.group();
+        if check_row_key_unique {
+            for tuple in tuples {
+                lock_group.add(tuple.row_key());
+            }
+        }
+        for index in secondary_indices {
+            for i in 0..table.secondary_indices.len() {
+                if table.secondary_indices[i].unique {
+                    lock_group.add(index.index_keys[i].as_slice());
+                }
+            }
+        }
+        let _locks = lock_group.exclusive_lock_all();
+
+        let rd_opts = ReadOptions::default();
+        let iter = if check_row_key_unique {
+            Some(self.storage.new_iterator(&rd_opts, column_family)?)
+        } else {
+            None
+        };
 
         let mut key = Vec::new();
         for tuple in tuples {
+            if check_row_key_unique {
+                let keep_it = iter.as_ref().cloned().unwrap();
+                let mut it = keep_it.borrow_mut();
+                it.seek(tuple.row_key());
+                if it.valid() && it.key().starts_with(tuple.row_key()) {
+                    Err(Status::corrupted("Duplicated primary key, must be unique."))?;
+                }
+            }
+
             // key = [row_key(n bytes)|col_id(4 bytes)]
             let prefix_key_len = tuple.row_key().len();
             key.write(tuple.row_key()).unwrap();
@@ -374,8 +417,16 @@ impl DB {
         }
 
         for index in secondary_indices {
-            for key in &index.index_keys {
-                batch.insert(column_family, key.as_slice(), index.row_key());
+            for i in 0..table.secondary_indices.len() {
+                let key = index.index_keys[i].as_slice();
+                if table.secondary_indices[i].unique {
+                    if self.storage.get_pinnable(&rd_opts, column_family, key).is_ok() {
+                        let message = format!("Duplicated secondary key, index {} is unique.",
+                                              table.secondary_indices[i].name);
+                        Err(Status::corrupted(message))?;
+                    }
+                }
+                batch.insert(column_family, key, index.row_key());
             }
         }
 
@@ -391,28 +442,28 @@ impl DB {
         Ok(tuples.len())
     }
 
-    pub fn encode_anonymous_row_key(counter: u64, row_key: &mut Vec<u8>) {
-        row_key.write(&Self::PRIMARY_KEY_ID_BYTES).unwrap(); // primary key id always is 0
-        row_key.write(&counter.to_be_bytes()).unwrap();
+    pub fn encode_anonymous_row_key<W: Write>(counter: u64, wr: &mut W) {
+        wr.write(&Self::PRIMARY_KEY_ID_BYTES).unwrap(); // primary key id always is 0
+        wr.write(&counter.to_be_bytes()).unwrap();
     }
 
-    pub fn encode_row_key(value: &Value, ty: &ColumnType, buf: &mut Vec<u8>) -> Result<()> {
+    pub fn encode_row_key<W: Write>(value: &Value, ty: &ColumnType, wr: &mut W) -> Result<()> {
         match ty {
             ColumnType::TinyInt(_)
             | ColumnType::SmallInt(_)
             | ColumnType::Int(_)
             | ColumnType::BigInt(_) => {
                 match value {
-                    Value::Int(n) => { buf.write(&n.to_be_bytes()).unwrap(); }
+                    Value::Int(n) => { wr.write(&n.to_be_bytes()).unwrap(); }
                     _ => unreachable!()
                 }
             }
             ColumnType::Float(_, _) => match value {
-                Value::Float(n) => { buf.write(&n.to_be_bytes()).unwrap(); }
+                Value::Float(n) => { wr.write(&n.to_be_bytes()).unwrap(); }
                 _ => unreachable!()
             },
             ColumnType::Double(_, _) => match value {
-                Value::Float(n) => { buf.write(&n.to_be_bytes()).unwrap(); }
+                Value::Float(n) => { wr.write(&n.to_be_bytes()).unwrap(); }
                 _ => unreachable!()
             },
             ColumnType::Char(n) => match value {
@@ -420,7 +471,7 @@ impl DB {
                     if s.len() > *n as usize {
                         return Err(Status::corrupted("Char type too long"));
                     }
-                    Self::encode_char_ty_for_key(s, *n as usize, buf);
+                    Self::encode_char_ty_for_key(s, *n as usize, wr);
                 }
                 _ => unreachable!()
             },
@@ -429,7 +480,7 @@ impl DB {
                     if s.len() > *n as usize {
                         return Err(Status::corrupted("Varchar type too long"));
                     }
-                    Self::encode_varchar_ty_for_key(s, buf);
+                    Self::encode_varchar_ty_for_key(s, wr);
                 }
                 _ => unreachable!()
             },
@@ -460,25 +511,25 @@ impl DB {
                     Value::Float(n) => wr.write(&(*n as f32).to_be_bytes()).unwrap(),
                     _ => unreachable!()
                 };
-            },
+            }
             ColumnType::Double(_, _) => {
                 match value {
                     Value::Float(n) => wr.write(&n.to_be_bytes()).unwrap(),
                     _ => unreachable!()
                 };
-            },
+            }
             ColumnType::Char(n) => {
                 match value {
                     Value::Str(s) => Self::encode_char_ty_for_key(s, *n as usize, wr),
                     _ => unreachable!()
                 }
-            },
+            }
             ColumnType::Varchar(n) => {
                 match value {
                     Value::Str(s) => Self::encode_varchar_ty_for_key(s, wr),
                     _ => unreachable!()
                 }
-            },
+            }
         }
     }
 
@@ -539,7 +590,7 @@ impl DB {
                     Value::Str(s) => wr.write(s.as_bytes()).unwrap(),
                     _ => unreachable!()
                 };
-            },
+            }
         }
     }
 
@@ -559,7 +610,7 @@ impl DB {
     }
 
     fn get_table_handle(&self, name: &String) -> Option<(Arc<dyn ColumnFamily>, Arc<TableMetadata>)> {
-        let tables = self.tables_handle.lock().unwrap();
+        let tables = self.tables_handle.read().unwrap();
         match tables.get(name) {
             Some(handle) =>
                 Some((handle.column_family.clone(), handle.metadata.clone())),
@@ -568,7 +619,11 @@ impl DB {
     }
 
     pub fn lock_tables(&self) -> LockingTables {
-        self.tables_handle.lock().unwrap()
+        self.tables_handle.read().unwrap()
+    }
+
+    pub fn lock_tables_mut(&self) -> LockingTablesMut {
+        self.tables_handle.write().unwrap()
     }
 
     pub fn is_table_exists(&self, table_name: &String) -> bool {
@@ -601,13 +656,13 @@ impl DB {
                          columns_set: &ArenaBox<ColumnSet>,
                          row_key: &[u8],
                          arena: &Rc<RefCell<Arena>>) -> Result<Tuple> {
-        let tables = self.tables_handle.lock().unwrap();
+        let tables = self.tables_handle.read().unwrap();
         let table = tables.get(table_name).unwrap().clone();
         let mut key = Vec::new();
         key.write(&Self::PRIMARY_KEY_ID_BYTES).unwrap();
         key.write(row_key).unwrap();
         let rd_opts = ReadOptions::default();
-        let mut tuple = Tuple::new(&columns_set, &key, arena);
+        let mut tuple = Tuple::from(&columns_set, &key, arena);
         for col in &columns_set.columns {
             let col_meta = table.get_col_by_name(&col.name.to_string()).unwrap();
             key.write(&col_meta.id.to_be_bytes()).unwrap();
@@ -786,7 +841,7 @@ mod tests {
         DB::encode_varchar_ty_for_key(&s, &mut buf);
 
         assert_eq!(9, buf.len());
-        let raw: [u8;9] = [
+        let raw: [u8; 9] = [
             97,
             32,
             32,
@@ -804,7 +859,7 @@ mod tests {
         DB::encode_varchar_ty_for_key(&s, &mut buf);
 
         assert_eq!(9, buf.len());
-        let raw: [u8;9] = [
+        let raw: [u8; 9] = [
             228,
             184,
             173,
@@ -822,7 +877,7 @@ mod tests {
         DB::encode_varchar_ty_for_key(&s, &mut buf);
 
         assert_eq!(18, buf.len());
-        let raw: [u8;18] = [
+        let raw: [u8; 18] = [
             49,
             50,
             51,
@@ -897,13 +952,13 @@ mod tests {
             ";
         let conn = db.connect();
         let mut stmts = conn.prepare_str(sql, &arena)?;
-        conn.execute_prepared_statement(&mut stmts[0], &arena)?;
+        conn.execute_prepared_statement(&mut stmts[0])?;
 
         let mut stmt = stmts[1].clone();
         assert_eq!(2, stmt.parameters_len());
         stmt.bind_i64(0, 1);
         stmt.bind_i64(1, 2);
-        conn.execute_prepared_statement(&mut stmt, &arena)?;
+        conn.execute_prepared_statement(&mut stmt)?;
 
         let mut column_set = ArenaBox::new(ColumnSet::new("t1", &arena), &arena);
         column_set.append_with_name("a", ColumnType::Int(11));
@@ -1023,6 +1078,45 @@ mod tests {
         let conn = db.connect();
         conn.execute_str(sql, &arena)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn insert_duplicated_row_key() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db108");
+        let arena = Arena::new_rc();
+        let db = DB::open("tests".to_string(), "db108".to_string())?;
+        let sql = " create table t1 {\n\
+                a int primary key auto_increment,\n\
+                b char(9)\n\
+            };\n\
+            insert into table t1(a,b) values (1, NULL);\n\
+            insert into table t1(a,b) values (1, NULL);\n\
+            ";
+        let conn = db.connect();
+        let rs = conn.execute_str(sql, &arena);
+        assert!(rs.is_err());
+        assert_eq!(Status::Corruption("Duplicated primary key, must be unique.".to_string()),
+                   rs.unwrap_err());
+        Ok(())
+    }
+
+    #[test]
+    fn insert_duplicated_row_key_at_same_statement() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db109");
+        let arena = Arena::new_rc();
+        let db = DB::open("tests".to_string(), "db109".to_string())?;
+        let sql = " create table t1 {\n\
+                a int primary key auto_increment,\n\
+                b char(9)\n\
+            };\n\
+            insert into table t1(a,b) values (1, NULL), (1, NULL);\n\
+            ";
+        let conn = db.connect();
+        let rs = conn.execute_str(sql, &arena);
+        assert!(rs.is_err());
+        assert_eq!(Status::Corruption("Duplicated primary key, must be unique.".to_string()),
+                   rs.unwrap_err());
         Ok(())
     }
 }

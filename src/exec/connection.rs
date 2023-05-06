@@ -30,8 +30,9 @@ impl Connection {
         self.executor.borrow_mut().execute(reader, arena)
     }
 
-    pub fn execute_prepared_statement(&self, prepared: &mut ArenaBox<PreparedStatement>, arena: &Rc<RefCell<Arena>>) -> Result<()> {
-        self.executor.borrow_mut().execute_prepared_statement(prepared, arena)
+    pub fn execute_prepared_statement(&self, prepared: &mut ArenaBox<PreparedStatement>) -> Result<()> {
+        let arena = Arena::new_rc();
+        self.executor.borrow_mut().execute_prepared_statement(prepared, &arena)
     }
 
     pub fn prepare_str(&self, sql: &str, arena: &Rc<RefCell<Arena>>) -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {

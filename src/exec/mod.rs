@@ -4,6 +4,7 @@ mod db;
 mod executor;
 mod connection;
 mod evaluator;
+mod locking;
 
 #[inline]
 pub fn from_sql_result<T>(input: sql::Result<T>) -> crate::Result<T> {

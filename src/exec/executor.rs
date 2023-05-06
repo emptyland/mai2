@@ -4,16 +4,17 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::intrinsics::copy_nonoverlapping;
 use std::io::{Read, Write};
+use std::iter::repeat;
 use std::ops::{AddAssign, Deref, DerefMut, Index};
 use std::ptr::{addr_of, addr_of_mut, NonNull, slice_from_raw_parts_mut};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::sync::atomic::Ordering;
 
 use crate::base::{Allocator, Arena, ArenaBox, ArenaStr, ArenaVec};
 use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata};
 use crate::exec::from_sql_result;
-use crate::sql::ast::{BinaryExpression, CallFunction, CreateTable, DropTable, Factory, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Placeholder, Statement, TypeDeclaration, UnaryExpression, Visitor};
+use crate::sql::ast::{BinaryExpression, CallFunction, CreateTable, DropTable, Expression, Factory, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Placeholder, Statement, TypeDeclaration, UnaryExpression, Visitor};
 use crate::sql::parser::Parser;
 use crate::{Corrupting, Result, Status};
 use crate::exec::evaluator::{Context, Evaluator, Value};
@@ -98,6 +99,86 @@ impl Executor {
             _ => Err(Status::corrupted("Bad type token!"))
         }
     }
+
+    fn build_insertion_tuples(&self,
+                              table: &Arc<TableHandle>,
+                              values: &mut ArenaVec<ArenaVec<ArenaBox<dyn Expression>>>,
+                              columns: &ArenaBox<ColumnSet>,
+                              anonymous_row_key_counter: &mut Option<MutexGuard<u64>>,
+                              auto_increment_counter: &mut Option<MutexGuard<u64>>,
+                              name_to_order: &HashMap<&str, usize>)
+                              -> Result<(ArenaVec<Tuple>, ArenaVec<SecondaryIndexBundle>)> {
+        let mut evaluator = Evaluator::new(&self.arena);
+        let context = Arc::new(TupleContext::new(self.prepared_stmts.back().cloned()));
+        let mut tuples = ArenaVec::new(&self.arena); // Vec::new();
+        let mut secondary_indices = ArenaVec::new(&self.arena);
+        let mut unique_row_keys = HashSet::new();
+        let mut unique_keys = Vec::from_iter(repeat(HashSet::<Vec<u8>>::new())
+            .take(table.metadata.secondary_indices.len()));
+        for row in values.iter_mut() {
+            let mut row_key = ArenaVec::new(&self.arena);
+            if let Some(counter) = auto_increment_counter.as_mut() {
+                counter.add_assign(1);
+            }
+            if let Some(counter) = anonymous_row_key_counter.as_mut() {
+                counter.add_assign(1);
+                DB::encode_anonymous_row_key(counter.clone(), &mut row_key);
+            }
+            let mut tuple = Tuple::new(columns, &self.arena);
+            for col in &table.metadata.columns {
+                if let Some(order) = name_to_order.get(col.name.as_str()) {
+                    let expr = &mut row[*order];
+                    let value = evaluator.evaluate(expr.deref_mut(), context.clone())?;
+                    tuple.set(col.order, value);
+                } else if col.auto_increment {
+                    let value = auto_increment_counter.as_ref().unwrap();
+                    tuple.set(col.order, Value::Int(**value.clone() as i64));
+                } else {
+                    tuple.set(col.order, Value::Null);
+                }
+            }
+
+            if !table.metadata.primary_keys.is_empty() {
+                assert!(row_key.is_empty());
+                row_key.write(&DB::PRIMARY_KEY_ID_BYTES).unwrap();
+                for id in &table.metadata.primary_keys {
+                    let col = table.get_col_by_id(*id).unwrap();
+                    DB::encode_row_key(tuple.get(col.order), &col.ty, &mut row_key)?;
+                }
+                tuple.associate_row_key(&row_key);
+                if !unique_row_keys.insert(row_key) { // already exists
+                    Err(Status::corrupted("Duplicated primary key, must be unique."))?;
+                }
+            } else {
+                tuple.associate_row_key(&row_key);
+            }
+
+            if !table.metadata.secondary_indices.is_empty() {
+                let mut bundle = SecondaryIndexBundle::new(&tuple, &self.arena);
+                //for index in &table.metadata.secondary_indices {
+                for i in 0..table.metadata.secondary_indices.len() {
+                    let index = &table.metadata.secondary_indices[i];
+                    let mut key = ArenaVec::<u8>::new(&self.arena);
+                    key.write(&(index.id as u32).to_be_bytes()).unwrap();
+                    for id in &index.key_parts {
+                        let col = table.get_col_by_id(*id).unwrap();
+                        DB::encode_secondary_index(tuple.get(col.order), &col.ty, &mut key);
+                    }
+                    if !unique_keys[i].insert(key.to_vec()) {
+                        let message = format!("Duplicated secondary key, index {} is unique.",
+                                              table.metadata.secondary_indices[i].name);
+                        Err(Status::corrupted(message))?;
+                    }
+                    bundle.index_keys.push(key);
+                }
+                secondary_indices.push(bundle);
+            }
+
+            tuples.push(tuple);
+        }
+
+        Ok((tuples, secondary_indices))
+    }
 }
 
 pub struct PreparedStatement {
@@ -138,7 +219,7 @@ macro_rules! visit_error {
 impl Visitor for Executor {
     fn visit_create_table(&mut self, this: &mut CreateTable) {
         let db = self.db.upgrade().unwrap();
-        let mut locking_tables = db.lock_tables();
+        let mut locking_tables = db.lock_tables_mut();
         if locking_tables.contains_key(&this.table_name.to_string()) {
             if !this.if_not_exists {
                 self.rs = Err(Status::corrupted(format!("Duplicated type name: {}",
@@ -213,7 +294,6 @@ impl Visitor for Executor {
 
         let mut idx_name_to_id = HashMap::new();
         for index_decl in &this.secondary_indices {
-
             if idx_name_to_id.contains_key(&index_decl.name.to_string()) {
                 visit_error!(self, "Duplicated index name: {}", index_decl.name.as_str());
             }
@@ -253,7 +333,7 @@ impl Visitor for Executor {
 
     fn visit_drop_table(&mut self, this: &mut DropTable) {
         let db = self.db.upgrade().unwrap();
-        let mut locking_tables = db.lock_tables();
+        let mut locking_tables = db.lock_tables_mut();
         if !locking_tables.contains_key(&this.table_name.to_string()) {
             if !this.if_exists {
                 self.rs = Err(Status::corrupted(format!("Table `{}` not found",
@@ -322,73 +402,20 @@ impl Visitor for Executor {
             tmp
         };
 
-        let mut evaluator = Evaluator::new(&self.arena);
-        let context = Arc::new(TupleContext::new(self.prepared_stmts.back().cloned()));
-        let mut tuples = Vec::new();
-        let mut secondary_indices = Vec::new();
-        for row in this.values.iter_mut() {
-            let mut row_key = Vec::new();
-            if let Some(counter) = auto_increment_counter.as_mut() {
-                counter.add_assign(1);
-            }
-            if let Some(counter) = anonymous_row_key_counter.as_mut() {
-                counter.add_assign(1);
-                DB::encode_anonymous_row_key(counter.clone(), &mut row_key);
-            }
-            let mut tuple = Tuple::new(&columns, &row_key, &self.arena);
-            for col in &table.metadata.columns {
-                if let Some(order) = name_to_order.get(col.name.as_str()) {
-                    let expr = &mut row[*order];
-                    match evaluator.evaluate(expr.deref_mut(), context.clone()) {
-                        Err(e) => {
-                            self.rs = Err(e);
-                            return;
-                        }
-                        Ok(value) => tuple.set(col.order, value)
-                    }
-                } else if col.auto_increment {
-                    let value = auto_increment_counter.as_ref().unwrap();
-                    tuple.set(col.order, Value::Int(**value.clone() as i64));
-                } else {
-                    tuple.set(col.order, Value::Null);
-                }
-            }
-
-            if !table.metadata.primary_keys.is_empty() {
-                row_key.clear();
-                row_key.write(&DB::PRIMARY_KEY_ID_BYTES).unwrap();
-                for id in &table.metadata.primary_keys {
-                    let col = table.get_col_by_id(*id).unwrap();
-                    if let Err(e) = DB::encode_row_key(tuple.get(col.order), &col.ty,
-                                                       &mut row_key) {
-                        self.rs = Err(e);
-                        return;
-                    }
-                }
-                tuple.associate_row_key(&row_key);
-            }
-
-            if !table.metadata.secondary_indices.is_empty() {
-                let mut bundle = SecondaryIndexBundle::new(&tuple, &self.arena);
-                for index in &table.metadata.secondary_indices {
-                    let mut buf = ArenaVec::<u8>::new(&self.arena);
-                    buf.write(&(index.id as u32).to_be_bytes()).unwrap();
-                    for id in &index.key_parts {
-                        let col = table.get_col_by_id(*id).unwrap();
-                        DB::encode_secondary_index(tuple.get(col.order), &col.ty, &mut buf);
-                    }
-                    bundle.index_keys.push(buf);
-                }
-                secondary_indices.push(bundle);
-            }
-
-            tuples.push(tuple);
+        let rs = self.build_insertion_tuples(&table, &mut this.values, &columns,
+                                             &mut anonymous_row_key_counter,
+                                             &mut auto_increment_counter, &name_to_order);
+        if let Err(e) = rs {
+            self.rs = Err(e);
+            return;
         }
+        let (tuples, secondary_indices) = rs.unwrap();
         let anonymous_row_key_value = anonymous_row_key_counter.map(|x| { *x });
         let auto_increment_value = auto_increment_counter.map(|x| { *x });
 
-        match db.insert_rows(&cf, table.metadata.id, &tuples, &secondary_indices,
-                             anonymous_row_key_value, auto_increment_value) {
+        match db.insert_rows(&cf, &table.metadata, &tuples, &secondary_indices,
+                             anonymous_row_key_value, auto_increment_value,
+                             !use_anonymous_row_key) {
             Ok(_) => (),
             Err(e) => self.rs = Err(e)
         }
@@ -455,7 +482,7 @@ pub struct Tuple {
 static EMPTY_ARRAY_DUMMY: [u8; 0] = [0; 0];
 
 impl Tuple {
-    pub fn new(columns: &ArenaBox<ColumnSet>, key: &[u8], arena: &Rc<RefCell<Arena>>) -> Tuple {
+    pub fn new(columns: &ArenaBox<ColumnSet>, arena: &Rc<RefCell<Arena>>) -> Self {
         let len = columns.columns.len();
         let value_layout = Layout::new::<Value>();
         let layout = Layout::from_size_align(value_layout.size() * len, value_layout.align()).unwrap();
@@ -465,12 +492,13 @@ impl Tuple {
             let ptr = slice_from_raw_parts_mut(addr, len);
             NonNull::new(ptr).unwrap()
         };
-        let row_key = Self::new_row_key(key, arena);
-        unsafe {
+        let row_key = unsafe {
             for i in 0..len {
                 items.as_mut()[i] = Value::Unit;
             }
-        }
+            let ptr = addr_of!(EMPTY_ARRAY_DUMMY) as *mut u8;
+            NonNull::new(slice_from_raw_parts_mut(ptr, 0)).unwrap()
+        };
         Self {
             row_key,
             items,
@@ -478,8 +506,18 @@ impl Tuple {
         }
     }
 
-    pub fn associate_row_key(&mut self, key: &[u8]) {
-        self.row_key = Self::new_row_key(key, &self.columns_set.arena);
+    pub fn from(columns: &ArenaBox<ColumnSet>, key: &[u8], arena: &Rc<RefCell<Arena>>) -> Self {
+        let mut this = Self::new(columns, arena);
+        this.row_key = Self::new_row_key(key, arena);
+        this
+    }
+
+    pub fn associate_row_key(&mut self, key: &ArenaVec<u8>) {
+        unsafe {
+            let raw_ptr = key.raw_ptr();
+            let ptr = raw_ptr.as_ptr() as *mut u8;
+            self.row_key = NonNull::new(slice_from_raw_parts_mut(ptr, key.len())).unwrap();
+        }
     }
 
     fn new_row_key(key: &[u8], arena: &Rc<RefCell<Arena>>) -> NonNull<[u8]> {
@@ -541,7 +579,7 @@ impl SecondaryIndexBundle {
     fn new(tuple: &Tuple, arena: &Rc<RefCell<Arena>>) -> Self {
         Self {
             row_key: tuple.row_key,
-            index_keys: ArenaVec::new(&arena)
+            index_keys: ArenaVec::new(&arena),
         }
     }
 

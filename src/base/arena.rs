@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::{iter, ptr};
 use std::cmp::min;
 use std::fmt::{Debug, Display, Formatter};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -432,6 +433,8 @@ impl<T> ArenaVec<T> {
         }
     }
 
+    pub unsafe fn raw_ptr(&self) -> NonNull<[T]> { self.naked }
+
     fn extend_if_needed(&mut self, incremental: usize) -> &mut [T] {
         if self.len() + incremental > self.capacity() {
             let new_cap = self.capacity() * 2 + 4;
@@ -460,6 +463,40 @@ impl<T> ArenaVec<T> {
         NonNull::new(slice_from_raw_parts_mut(addr, capacity)).unwrap()
     }
 }
+
+impl <T: Clone> ArenaVec<T> {
+    pub fn to_vec(&self) -> Vec<T> {
+        Vec::from(self.as_slice())
+    }
+}
+
+impl <T> Deref for ArenaVec<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target { self.as_slice() }
+}
+
+impl Hash for ArenaVec<u8> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write(self.as_slice())
+    }
+}
+
+impl <T: PartialEq> PartialEq for ArenaVec<T> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() == other.len() {
+            for i in 0..self.len() {
+                if self[i] != other[i] {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+}
+
+impl <T: Eq> Eq for ArenaVec<T> {}
 
 impl<T> Index<usize> for ArenaVec<T> {
     type Output = T;
