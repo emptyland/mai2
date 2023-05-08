@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ops::{Add, DerefMut, Sub, Mul};
@@ -90,7 +91,8 @@ impl Evaluator {
             Value::Null => Value::Null,
             Value::Int(n) => Value::Int(*n),
             Value::Float(n) => Value::Int(*n as i64),
-            Value::Str(_) => Value::Int(1)
+            Value::Str(_) => Value::Int(1),
+            _ => unreachable!()
         }
     }
 

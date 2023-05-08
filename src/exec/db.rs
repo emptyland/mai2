@@ -1,20 +1,25 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::default::Default;
 use std::io::Write;
+use std::iter;
+use std::mem::size_of;
+use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::exec::connection::Connection;
 use crate::{Corrupting, log_debug, Status, storage};
-use crate::base::{Arena, ArenaBox, ArenaStr, Logger};
+use crate::base::{Allocator, Arena, ArenaBox, ArenaStr, Logger};
 use crate::exec::evaluator::Value;
 use crate::exec::executor::{ColumnSet, SecondaryIndexBundle, Tuple};
 use crate::exec::locking::LockingManagement;
 use crate::storage::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME, Env, from_io_result, Options, ReadOptions, WriteBatch, WriteOptions};
 use crate::Result;
+use crate::storage::config::MB;
 
 pub struct DB {
     this: Weak<DB>,
@@ -62,9 +67,18 @@ impl DB {
 
     const VARCHAR_SEGMENT_LEN: usize = 9;
 
-    pub const ANONYMOUS_ROW_KEY: &'static str = "#anonymous_row_key#";
-    pub const ANONYMOUS_ROW_KEY_KEY: &'static [u8] = Self::ANONYMOUS_ROW_KEY.as_bytes();
-    pub const AUTO_INCREMENT_KEY: &'static [u8] = "#auto_increment#".as_bytes();
+    const COL_ID_LEN: usize = size_of::<u32>();
+
+    pub const ANONYMOUS_ROW_KEY_KEY: &'static [u8] = &[
+        0xff, 0xff, 0xff, 0xff, // index id tag
+        0x80, // split
+        0x01, 0x00, 0x00, 0x00 // key id = 1
+    ];
+    pub const AUTO_INCREMENT_KEY: &'static [u8] = &[
+        0xff, 0xff, 0xff, 0xff, // index id tag
+        0x80, // split
+        0x02, 0x00, 0x00, 0x00 // key id = 2
+    ];
 
     const VARCHAR_CMP_LESS_THAN_SPACES: u8 = 1;
     const VARCHAR_CMP_EQUAL_TO_SPACES: u8 = 2;
@@ -324,10 +338,7 @@ impl DB {
         drop(table_handle);
 
         self.storage.drop_column_family(cf)?;
-        // TODO: delete secondary indexes
 
-        // let names: Vec<String> = tables.keys().cloned().filter(|x| { x != name }).collect();
-        // self.sync_tables_name(&names)?;
         let name_to_id: HashMap<String, u64> = tables.values()
             .cloned()
             .filter(|x| { name.ne(&x.metadata.name) })
@@ -348,6 +359,90 @@ impl DB {
         tables.remove(name);
         self.locks.uninstall(table_id);
         Ok(table_id)
+    }
+
+    pub fn write_table_metadata(&self, table_metadata: &TableMetadata) -> Result<()> {
+        match serde_yaml::to_string(table_metadata) {
+            Err(e) => {
+                let message = format!("Yaml serialize fail: {}", e.to_string());
+                Err(Status::corrupted(message))
+            }
+            Ok(yaml) => {
+                let col_name = format!("{}{}", Self::META_COL_TABLE_PREFIX, table_metadata.id);
+                let mut wr_opts = WriteOptions::default();
+                wr_opts.sync = true;
+                self.storage.insert(&wr_opts, &self.default_column_family,
+                                    col_name.as_bytes(), yaml.as_bytes())
+            }
+        }
+    }
+
+    pub fn build_secondary_index(&self, table: &TableHandle, secondary_index_id: u64) -> Result<u64> {
+        let secondary_index = table.get_2rd_idx_by_id(secondary_index_id).unwrap();
+        let rd_opts = ReadOptions::default();
+        let iter_box = self.storage.new_iterator(&rd_opts, &table.column_family)?;
+        let mut iter = iter_box.borrow_mut();
+        let col_id_to_idx = {
+            let mut tmp = HashMap::new();
+            for i in 0..secondary_index.key_parts.len() {
+                let col_id = secondary_index.key_parts[i];
+                tmp.insert(secondary_index.key_parts[i],
+                           (i, table.get_col_by_id(col_id).unwrap()));
+            }
+            tmp
+        };
+
+        let mut arena = Arena::new_rc();
+
+        let mut affected_rows = 0;
+        let mut col_vals = Vec::from_iter(iter::repeat(Value::Null)
+            .take(secondary_index.key_parts.len()));
+        let mut row_key = Vec::default();
+        let mut key = Vec::<u8>::default();
+        key.write(&(secondary_index_id as u32).to_be_bytes()).unwrap();
+
+        iter.seek(&Self::PRIMARY_KEY_ID_BYTES);
+        while iter.valid() {
+            if iter.key().len() <= Self::PRIMARY_KEY_ID_BYTES.len() + Self::COL_ID_LEN {
+                return Err(Status::corrupted("Incorrect primary key data, too small."));
+            }
+            let key_id = u32::from_be_bytes((&iter.key()[..4]).try_into().unwrap());
+            if key_id != Self::PRIMARY_KEY_ID {
+                break; // primary key only
+            }
+
+            let col_id_bytes = &iter.key()[iter.key().len() - Self::COL_ID_LEN..];
+            let col_id = u32::from_be_bytes(col_id_bytes.try_into().unwrap());
+            if let Some((idx, col)) = col_id_to_idx.get(&col_id) {
+                col_vals[*idx] = Self::decode_column_value(&col.ty, iter.value(),
+                                                           arena.borrow_mut().deref_mut());
+            }
+
+            let rk = &iter.key()[..iter.key().len() - Self::COL_ID_LEN];
+            if row_key != rk {
+                row_key.copy_from_slice(rk);
+                key.truncate(4); // still keep index id (4 bytes u32)
+                for i in 0..col_vals.len() {
+                    let col_id = secondary_index.key_parts[i];
+                    let (_, col) = col_id_to_idx.get(&col_id).unwrap();
+                    Self::encode_secondary_index(&col_vals[i], &col.ty, &mut key);
+                }
+                let wr_opts = WriteOptions::default();
+                self.storage.insert(&wr_opts, &table.column_family, &key, &row_key)?;
+                affected_rows += 1;
+                col_vals.fill(Value::Null);
+                if arena.borrow().rss_in_bytes > 10 * MB {
+                    arena = Arena::new_rc();
+                }
+            }
+            iter.move_next();
+        }
+
+        if iter.status().is_corruption() {
+            Err(iter.status())
+        } else {
+            Ok(affected_rows)
+        }
     }
 
     pub fn insert_rows(&self, column_family: &Arc<dyn ColumnFamily>,
@@ -594,7 +689,7 @@ impl DB {
         }
     }
 
-    pub fn decode_column_value(ty: &ColumnType, value: &[u8]) -> Value {
+    pub fn decode_column_value(ty: &ColumnType, value: &[u8], arena: &mut dyn Allocator) -> Value {
         match ty {
             ColumnType::TinyInt(_)
             | ColumnType::SmallInt(_)
@@ -604,8 +699,10 @@ impl DB {
             }
             ColumnType::Float(_, _) => unreachable!(),
             ColumnType::Double(_, _) => unreachable!(),
-            ColumnType::Char(_) => unreachable!(),
-            ColumnType::Varchar(_) => unreachable!(),
+            ColumnType::Char(_)
+            | ColumnType::Varchar(_) => {
+                Value::Str(ArenaStr::new(std::str::from_utf8(value).unwrap(), arena))
+            }
         }
     }
 
@@ -668,7 +765,8 @@ impl DB {
             key.write(&col_meta.id.to_be_bytes()).unwrap();
 
             let value = self.storage.get_pinnable(&rd_opts, &table.column_family, &key)?;
-            tuple.set(col.order, Self::decode_column_value(&col.ty, value.value()));
+            tuple.set(col.order, Self::decode_column_value(&col.ty, value.value(),
+                                                           arena.borrow_mut().deref_mut()));
             key.truncate(row_key.len() + 4);
         }
         Ok(tuple)
@@ -682,6 +780,9 @@ pub struct TableHandle {
     columns_by_name: HashMap<String, usize>,
     columns_by_id: HashMap<u32, usize>,
     secondary_indices_by_name: HashMap<String, usize>,
+    secondary_indices_by_id: HashMap<u64, usize>,
+    column_in_indices_by_id: HashMap<u32, usize>,
+    // [col_id -> 2rd_idx_index]
     pub mutex: Arc<Mutex<u64>>,
     pub metadata: Arc<TableMetadata>,
 }
@@ -691,28 +792,50 @@ impl TableHandle {
            anonymous_row_key_counter: u64,
            auto_increment_counter: u64,
            metadata: TableMetadata) -> Self {
-        let mut columns_by_name = HashMap::new();
-        let mut columns_by_id = HashMap::new();
-        for i in 0..metadata.columns.len() {
-            let col = &metadata.columns[i];
-            columns_by_name.insert(col.name.clone(), i);
-            columns_by_id.insert(col.id, i);
-        }
-        let mut secondary_indices_by_name = HashMap::new();
-        for i in 0..metadata.secondary_indices.len() {
-            let idx = &metadata.secondary_indices[i];
-            secondary_indices_by_name.insert(idx.name.clone(), i);
-        }
         Self {
             column_family,
             anonymous_row_key_counter: Arc::new(Mutex::new(anonymous_row_key_counter)),
             auto_increment_counter: Arc::new(Mutex::new(auto_increment_counter)),
-            columns_by_name,
-            columns_by_id,
-            secondary_indices_by_name,
+            columns_by_name: Default::default(),
+            columns_by_id: Default::default(),
+            secondary_indices_by_name: Default::default(),
+            secondary_indices_by_id: Default::default(),
+            column_in_indices_by_id: Default::default(),
             mutex: Arc::new(Mutex::new(0)),
             metadata: Arc::new(metadata),
+        }.prepare()
+    }
+
+    pub fn update(&self, metadata: TableMetadata) -> Self {
+        Self {
+            column_family: self.column_family.clone(),
+            anonymous_row_key_counter: self.anonymous_row_key_counter.clone(),
+            auto_increment_counter: self.auto_increment_counter.clone(),
+            columns_by_name: Default::default(),
+            columns_by_id: Default::default(),
+            secondary_indices_by_name: Default::default(),
+            secondary_indices_by_id: Default::default(),
+            column_in_indices_by_id: Default::default(),
+            mutex: self.mutex.clone(),
+            metadata: Arc::new(metadata),
+        }.prepare()
+    }
+
+    fn prepare(mut self) -> Self {
+        for i in 0..self.metadata.columns.len() {
+            let col = &self.metadata.columns[i];
+            self.columns_by_name.insert(col.name.clone(), i);
+            self.columns_by_id.insert(col.id, i);
         }
+        for i in 0..self.metadata.secondary_indices.len() {
+            let idx = &self.metadata.secondary_indices[i];
+            self.secondary_indices_by_name.insert(idx.name.clone(), i);
+            self.secondary_indices_by_id.insert(idx.id, i);
+            for col_id in &idx.key_parts {
+                self.column_in_indices_by_id.insert(*col_id, i);
+            }
+        }
+        self
     }
 
     pub fn get_col_by_name(&self, name: &String) -> Option<&ColumnMetadata> {
@@ -733,8 +856,34 @@ impl TableHandle {
         }
     }
 
+    pub fn get_col_be_part_of_2rd_idx_by_name(&self, name: &String) -> Option<&SecondaryIndexMetadata> {
+        match self.get_col_by_name(name) {
+            Some(col) => match self.column_in_indices_by_id.get(&col.id) {
+                Some(index) => Some(&self.metadata.secondary_indices[*index]),
+                None => None
+            }
+            None => None
+        }
+    }
+
+    pub fn is_col_be_part_of_primary_key_by_name(&self, name: &String) -> bool {
+        match self.get_col_by_name(name) {
+            Some(col) => self.metadata.primary_keys.contains(&col.id),
+            None => false
+        }
+    }
+
     pub fn get_2rd_idx_by_name(&self, name: &String) -> Option<&SecondaryIndexMetadata> {
         match self.secondary_indices_by_name.get(name) {
+            Some(index) => {
+                Some(&self.metadata.secondary_indices[*index])
+            }
+            None => None
+        }
+    }
+
+    pub fn get_2rd_idx_by_id(&self, id: u64) -> Option<&SecondaryIndexMetadata> {
+        match self.secondary_indices_by_id.get(&id) {
             Some(index) => {
                 Some(&self.metadata.secondary_indices[*index])
             }

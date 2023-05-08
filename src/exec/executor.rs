@@ -333,7 +333,63 @@ impl Visitor for Executor {
     }
 
     fn visit_create_index(&mut self, this: &mut CreateIndex) {
-        todo!()
+        let db = self.db.upgrade().unwrap();
+        let mut locking_tables = db.lock_tables_mut();
+        let may_table = locking_tables.get(&this.table_name.to_string()).cloned();
+        if may_table.is_none() {
+            visit_error!(self, "Table {} not found", this.table_name);
+        }
+        let table = may_table.unwrap();
+        let ddl_mutex = table.mutex.clone();
+        let _locking_ddl = ddl_mutex.lock().unwrap();
+
+        if table.get_2rd_idx_by_name(&this.name.to_string()).is_some() {
+            visit_error!(self, "Duplicated index name: {} in table {}", this.name, this.table_name);
+        }
+
+        for name_str in &this.key_parts {
+            let name = name_str.to_string();
+            if table.is_col_be_part_of_primary_key_by_name(&name) {
+                visit_error!(self, "Key part: {} has been part of primary key.", name_str);
+            }
+
+            if let Some(idx) = table.get_col_be_part_of_2rd_idx_by_name(&name) {
+                visit_error!(self, "Key part: {} has been part of secondary index: {}.", name_str,
+                    idx.name);
+            }
+        }
+
+        let idx = SecondaryIndexMetadata {
+            name: this.name.to_string(),
+            id: db.next_index_id().unwrap(),
+            key_parts: this.key_parts.iter()
+                .map(|x| {
+                    table.get_col_by_name(&x.to_string()).unwrap().id
+                })
+                .collect(),
+            unique: this.unique,
+            order_by: OrderBy::Asc,
+        };
+        let mut metadata = (*table.metadata).clone();
+        let idx_id = idx.id;
+        metadata.secondary_indices.push(idx);
+        let shadow_table = Arc::new(table.update(metadata));
+
+        locking_tables.insert(shadow_table.metadata.name.clone(), shadow_table.clone());
+        drop(locking_tables);
+
+        match db.build_secondary_index(&shadow_table, idx_id) {
+            Err(e) => {
+                let mut locking_tables = db.lock_tables_mut();
+                locking_tables.insert(table.metadata.name.clone(), table); // fall back
+                // TODO: clear dirty data.
+                self.rs = Err(e)
+            }
+            Ok(_) => {
+                db.write_table_metadata(&shadow_table.metadata).unwrap();
+                // TODO
+            }
+        }
     }
 
     fn visit_drop_table(&mut self, this: &mut DropTable) {
