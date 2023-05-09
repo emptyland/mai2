@@ -7,7 +7,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use crate::{Corrupting, Result, Status};
 use crate::base::{Arena, ArenaStr};
-use crate::sql::ast::{BinaryExpression, CallFunction, CreateIndex, CreateTable, DropTable, Expression, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Operator, Placeholder, UnaryExpression, Visitor};
+use crate::sql::ast::{BinaryExpression, CallFunction, CreateIndex, CreateTable, DropIndex, DropTable, Expression, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Operator, Placeholder, UnaryExpression, Visitor};
 
 pub struct Evaluator {
     arena: Rc<RefCell<Arena>>,
@@ -26,7 +26,7 @@ pub trait Context {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
-    Unit,
+    Undefined,
     Null,
     Int(i64),
     Float(f64),
@@ -35,7 +35,8 @@ pub enum Value {
 
 impl Value {
     pub fn is_null(&self) -> bool { self.eq(&Value::Null) }
-    pub fn is_unit(&self) -> bool { self.eq(&Value::Unit) }
+    pub fn is_not_null(&self) -> bool { !self.is_null() && !self.is_undefined() }
+    pub fn is_undefined(&self) -> bool { self.eq(&Value::Undefined) }
 }
 
 impl Evaluator {
@@ -87,7 +88,7 @@ impl Evaluator {
 
     fn require_int(origin: &Value) -> Value {
         match origin {
-            Value::Unit => Value::Unit,
+            Value::Undefined => Value::Undefined,
             Value::Null => Value::Null,
             Value::Int(n) => Value::Int(*n),
             Value::Float(n) => Value::Int(*n as i64),
@@ -140,13 +141,14 @@ macro_rules! process_airth_op {
 
 impl Visitor for Evaluator {
     fn visit_create_table(&mut self, this: &mut CreateTable) { unreachable!() }
-    fn visit_create_index(&mut self, this: &mut CreateIndex) { unreachable!() }
     fn visit_drop_table(&mut self, this: &mut DropTable) { unreachable!() }
+    fn visit_create_index(&mut self, this: &mut CreateIndex) { unreachable!() }
+    fn visit_drop_index(&mut self, this: &mut DropIndex) { unreachable!() }
     fn visit_insert_into_table(&mut self, this: &mut InsertIntoTable) { unreachable!() }
 
     fn visit_identifier(&mut self, this: &mut Identifier) {
         let value = self.env().resolve(this.symbol.as_str());
-        if value.is_unit() {
+        if value.is_undefined() {
             self.rs = Status::corrupted(format!("Unresolved symbol: {}", this.symbol.as_str()));
         }
         self.ret(value);
@@ -155,7 +157,7 @@ impl Visitor for Evaluator {
     fn visit_full_qualified_name(&mut self, this: &mut FullyQualifiedName) {
         let value = self.env().resolve_fully_qualified(this.prefix.as_str(),
                                                        this.suffix.as_str());
-        if value.is_unit() {
+        if value.is_undefined() {
             self.rs = Status::corrupted(format!("Unresolved symbol: {}.{}",
                                                 this.prefix.as_str(), this.suffix.as_str()));
         }

@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use crate::base::{Allocator, Arena, ArenaBox, ArenaStr, ArenaVec};
 use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata};
 use crate::exec::from_sql_result;
-use crate::sql::ast::{BinaryExpression, CallFunction, CreateIndex, CreateTable, DropTable, Expression, Factory, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Placeholder, Statement, TypeDeclaration, UnaryExpression, Visitor};
+use crate::sql::ast::{BinaryExpression, CallFunction, CreateIndex, CreateTable, DropIndex, DropTable, Expression, Factory, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Placeholder, Statement, TypeDeclaration, UnaryExpression, Visitor};
 use crate::sql::parser::Parser;
 use crate::{Corrupting, Result, Status};
 use crate::exec::evaluator::{Context, Evaluator, Value};
@@ -26,6 +26,7 @@ pub struct Executor {
     pub db: Weak<DB>,
     arena: Rc<RefCell<Arena>>,
     prepared_stmts: VecDeque<ArenaBox<PreparedStatement>>,
+    affected_rows: u64,
     rs: Result<()>,
 }
 
@@ -35,11 +36,12 @@ impl Executor {
             db: db.clone(),
             arena: Arena::new_rc(),
             prepared_stmts: VecDeque::default(),
+            affected_rows: 0,
             rs: Ok(()),
         }
     }
 
-    pub fn execute(&mut self, reader: &mut dyn Read, arena: &Rc<RefCell<Arena>>) -> Result<()> {
+    pub fn execute(&mut self, reader: &mut dyn Read, arena: &Rc<RefCell<Arena>>) -> Result<u64> {
         // clear latest result;
         self.rs = Ok(());
         self.arena = arena.clone();
@@ -52,11 +54,11 @@ impl Executor {
             stmt.accept(self);
             self.rs.clone()?;
         }
-        Ok(())
+        Ok(self.affected_rows)
     }
 
     pub fn execute_prepared_statement(&mut self, prepared: &mut ArenaBox<PreparedStatement>,
-                                      arena: &Rc<RefCell<Arena>>) -> Result<()> {
+                                      arena: &Rc<RefCell<Arena>>) -> Result<u64> {
         if !prepared.all_bound() {
             return Err(Status::corrupted("Not all value bound in PreparedStatement."));
         }
@@ -66,7 +68,8 @@ impl Executor {
         self.prepared_stmts.push_back(prepared.clone());
         prepared.statement.accept(self);
         self.prepared_stmts.pop_back();
-        self.rs.clone()
+        self.rs.clone()?;
+        Ok(self.affected_rows)
     }
 
     pub fn prepare(&mut self, reader: &mut dyn Read, arena: &Rc<RefCell<Arena>>)
@@ -81,7 +84,7 @@ impl Executor {
             parser.parse_with_processor(|stmt, n_params| {
                 let ps = PreparedStatement {
                     statement: stmt,
-                    parameters: ArenaVec::with_init(arena, |_| { Value::Unit }, n_params),
+                    parameters: ArenaVec::with_init(arena, |_| { Value::Undefined }, n_params),
                 };
                 ArenaBox::new(ps, arena)
             }))?;
@@ -198,11 +201,21 @@ impl PreparedStatement {
         true
     }
 
-    pub fn is_bound(&self, i: usize) -> bool { !self.parameters[i].is_unit() }
+    pub fn is_bound(&self, i: usize) -> bool { !self.parameters[i].is_undefined() }
 
     pub fn bind_i64(&mut self, i: usize, value: i64) { self.bind(i, Value::Int(value)); }
     pub fn bind_f64(&mut self, i: usize, value: f64) { self.bind(i, Value::Float(value)); }
-    pub fn bind_str(&mut self, i: usize, value: &str) { todo!() }
+
+    pub fn bind_string<A: Allocator>(&mut self, i: usize, value: String, arena: &mut A) {
+        self.bind_str(i, value.as_str(), arena);
+    }
+
+    pub fn bind_str<A: Allocator>(&mut self, i: usize, value: &str, arena: &mut A) {
+        let str = ArenaStr::new(value, arena);
+        self.bind_arena_str(i, str);
+    }
+
+    pub fn bind_arena_str(&mut self, i: usize, value: ArenaStr) { self.bind(i, Value::Str(value)) }
     pub fn bind(&mut self, i: usize, value: Value) { self.parameters[i] = value; }
     pub fn bind_null(&mut self, i: usize) { self.bind(i, Value::Null); }
 }
@@ -328,7 +341,7 @@ impl Visitor for Executor {
         }
         match db.create_table(table, &mut locking_tables) {
             Err(e) => self.rs = Err(e),
-            Ok(_) => ()
+            Ok(_) => self.affected_rows = 0,
         }
     }
 
@@ -381,14 +394,63 @@ impl Visitor for Executor {
         match db.build_secondary_index(&shadow_table, idx_id) {
             Err(e) => {
                 let mut locking_tables = db.lock_tables_mut();
+                db.remove_secondary_index(table.metadata.id, &table.column_family,
+                                          idx_id,  this.unique, false).unwrap();
+
                 locking_tables.insert(table.metadata.name.clone(), table); // fall back
-                // TODO: clear dirty data.
                 self.rs = Err(e)
             }
-            Ok(_) => {
+            Ok(affected_rows) => {
                 db.write_table_metadata(&shadow_table.metadata).unwrap();
                 // TODO
+                self.affected_rows = affected_rows;
             }
+        }
+    }
+
+    fn visit_drop_index(&mut self, this: &mut DropIndex) {
+        let db = self.db.upgrade().unwrap();
+        let mut locking_tables = db.lock_tables_mut();
+        let may_table = locking_tables.get(&this.table_name.to_string()).cloned();
+        if may_table.is_none() {
+            visit_error!(self, "Table {} not found", this.table_name);
+        }
+        let table = may_table.unwrap();
+        let ddl_mutex = table.mutex.clone();
+        let _locking_ddl = ddl_mutex.lock().unwrap();
+
+        let idx = table.get_2rd_idx_by_name(&this.name.to_string());
+        if idx.is_none() {
+            visit_error!(self, "Index {} not found in table: {}", this.name, this.table_name);
+        }
+        let secondary_index = idx.unwrap();
+        let secondary_index_id = secondary_index.id;
+        let unique = secondary_index.unique;
+        let shadow_table = Arc::new({
+            let mut metadata = (*table.metadata).clone();
+            for i in 0..metadata.secondary_indices.len() {
+                if metadata.secondary_indices[i].id == secondary_index.id {
+                    metadata.secondary_indices.remove(i);
+                    break;
+                }
+            }
+            debug_assert_eq!(table.metadata.secondary_indices.len() - 1,
+                             metadata.secondary_indices.len());
+            table.update(metadata)
+        });
+
+        locking_tables.insert(this.table_name.to_string(), shadow_table.clone());
+        drop(locking_tables);
+
+        match db.remove_secondary_index(shadow_table.metadata.id,
+                                        &shadow_table.column_family,
+                                        secondary_index_id, unique, true) {
+            Ok(affected_rows) => self.affected_rows = affected_rows,
+            Err(_) => {
+                // Eat error
+                self.affected_rows = 0;
+                // TODO: record warning message
+            },
         }
     }
 
@@ -404,7 +466,7 @@ impl Visitor for Executor {
         }
         match db.drop_table(&this.table_name.to_string(), &mut locking_tables) {
             Err(e) => self.rs = Err(e),
-            Ok(_) => ()
+            Ok(_) => self.affected_rows = 0,
         }
     }
 
@@ -477,7 +539,7 @@ impl Visitor for Executor {
         match db.insert_rows(&cf, &table.metadata, &tuples, &secondary_indices,
                              anonymous_row_key_value, auto_increment_value,
                              !use_anonymous_row_key) {
-            Ok(_) => (),
+            Ok(affected_rows) => self.affected_rows = affected_rows,
             Err(e) => self.rs = Err(e)
         }
     }
@@ -555,7 +617,7 @@ impl Tuple {
         };
         let row_key = unsafe {
             for i in 0..len {
-                items.as_mut()[i] = Value::Unit;
+                items.as_mut()[i] = Value::Undefined;
             }
             let ptr = addr_of!(EMPTY_ARRAY_DUMMY) as *mut u8;
             NonNull::new(slice_from_raw_parts_mut(ptr, 0)).unwrap()
@@ -661,27 +723,27 @@ impl TupleContext {
 
 impl Context for TupleContext {
     fn resolve(&self, _name: &str) -> Value {
-        Value::Unit
+        Value::Undefined
     }
 
     fn resolve_fully_qualified(&self, _prefix: &str, _suffix: &str) -> Value {
-        Value::Unit
+        Value::Undefined
     }
 
     fn invoke(&self, _callee: &str, _args: &[Value]) -> Value {
-        Value::Unit
+        Value::Undefined
     }
 
     fn bound_param(&self, order: usize) -> Value {
         match self.prepared_stmt.as_ref() {
             Some(ps) => {
                 if order >= ps.parameters_len() {
-                    Value::Unit
+                    Value::Undefined
                 } else {
                     ps.parameters[order].clone()
                 }
             }
-            None => Value::Unit
+            None => Value::Undefined
         }
     }
 }

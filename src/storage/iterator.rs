@@ -65,11 +65,11 @@ impl DBIterator {
         }
     }
 
-    fn find_next_user_entry(&mut self, mut skipping: bool) -> Option<Vec<u8>> {
+    fn find_next_user_entry(&mut self, mut skipping: bool) {
         // Loop until we hit an acceptable entry to yield
         assert!(self.iter.borrow().valid());
         assert_eq!(self.direction, Direction::Forward);
-        let mut skip = Option::<Vec<u8>>::None;
+        //let mut skip = Option::<Vec<u8>>::None;
         loop {
             let internal_key = InternalKey::parse(self.iter.borrow().key());
             if internal_key.sequence_number <= self.last_sequence_number {
@@ -77,16 +77,16 @@ impl DBIterator {
                     Tag::Deletion => {
                         // Arrange to skip all upcoming entries for this key since
                         // they are hidden by this deletion.
-                        skip = Some(internal_key.user_key.to_vec());
+                        self.saved_key = internal_key.user_key.to_vec();
                         skipping = true;
                     }
                     Tag::Key => {
-                        if skipping && self.cmp.le(internal_key.user_key, skip.as_ref().unwrap()) {
+                        if skipping && self.cmp.le(internal_key.user_key, &self.saved_key) {
                             // Hidden it
                         } else {
                             self.valid = true;
                             self.saved_key.clear();
-                            return skip;
+                            return;
                         }
                     }
                 }
@@ -98,7 +98,6 @@ impl DBIterator {
         }
         self.saved_key.clear();
         self.valid = false;
-        skip
     }
 
     fn find_prev_user_entry(&mut self) {
@@ -143,9 +142,10 @@ impl DBIterator {
 
     fn update_valid(&mut self) {
         if self.iter.borrow().valid() {
-            if let Some(key) = self.find_next_user_entry(false) {
-                self.saved_key = key;
-            }
+            // if let Some(key) = self.find_next_user_entry(false) {
+            //     self.saved_key = key;
+            // }
+            self.find_next_user_entry(false);
         } else {
             self.valid = false;
         }
@@ -205,9 +205,7 @@ impl Iterator for DBIterator {
             // Store in saved_key_ the current key so we skip it below.
             self.saved_key = InternalKey::extract_user_key(self.iter.borrow().key()).to_vec();
         }
-        if let Some(key) = self.find_next_user_entry(true) {
-            self.saved_key = key;
-        }
+        self.find_next_user_entry(true);
     }
 
     fn move_prev(&mut self) {

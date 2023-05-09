@@ -2,7 +2,7 @@ use std::io::Read;
 use serde_yaml::to_string;
 use crate::base::{ArenaVec, ArenaBox, ArenaStr};
 use crate::sql::{ParseError, Result, SourceLocation, SourcePosition};
-use crate::sql::ast::{ColumnDeclaration, CreateIndex, CreateTable, DropTable, Expression, Factory, Identifier, InsertIntoTable, Operator, Placeholder, Statement, TypeDeclaration};
+use crate::sql::ast::{ColumnDeclaration, CreateIndex, CreateTable, DropIndex, DropTable, Expression, Factory, Identifier, InsertIntoTable, Operator, Placeholder, Statement, TypeDeclaration};
 use crate::sql::lexer::{Lexer, Token, TokenPart};
 
 pub struct Parser<'a> {
@@ -63,6 +63,11 @@ impl <'a> Parser<'a> {
                     match self.peek().token {
                         Token::Table => {
                             let rv = proc(self.parse_drop_table(start_pos)?.into(),
+                                          self.placeholder_order);
+                            stmts.push(rv);
+                        }
+                        Token::Index => {
+                            let rv = proc(self.parse_drop_index(start_pos)?.into(),
                                           self.placeholder_order);
                             stmts.push(rv);
                         }
@@ -251,6 +256,20 @@ impl <'a> Parser<'a> {
             }
         }
         Ok(node)
+    }
+
+    fn parse_drop_index(&mut self, _start_pos: SourcePosition) -> Result<ArenaBox<DropIndex>> {
+        self.match_expected(Token::Index)?;
+        let (primary_key, name) = if self.test(Token::Primary)? {
+            (true, ArenaStr::from_arena("PRIMARY", &self.factory.arena))
+        } else {
+            (false, self.match_id()?)
+        };
+
+        self.match_expected(Token::On)?;
+        let table_name = self.match_id()?;
+
+        Ok(self.factory.new_drop_index(name, primary_key, table_name))
     }
 
     fn parse_insert_into_table(&mut self) -> Result<ArenaBox<InsertIntoTable>> {

@@ -1,6 +1,6 @@
-use std::borrow::Cow;
+use std::arch::x86_64::_mm_cmpestro;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::default::Default;
 use std::io::Write;
 use std::iter;
@@ -10,13 +10,14 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
+use rusty_pool::ThreadPool;
 
 use crate::exec::connection::Connection;
 use crate::{Corrupting, log_debug, Status, storage};
 use crate::base::{Allocator, Arena, ArenaBox, ArenaStr, Logger};
 use crate::exec::evaluator::Value;
 use crate::exec::executor::{ColumnSet, SecondaryIndexBundle, Tuple};
-use crate::exec::locking::LockingManagement;
+use crate::exec::locking::{LockingInstance, LockingManagement};
 use crate::storage::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME, Env, from_io_result, Options, ReadOptions, WriteBatch, WriteOptions};
 use crate::Result;
 use crate::storage::config::MB;
@@ -27,6 +28,8 @@ pub struct DB {
     abs_db_path: PathBuf,
     logger: Arc<dyn Logger>,
     storage: Arc<dyn storage::DB>,
+    rd_opts: ReadOptions,
+    wr_opts: WriteOptions,
     default_column_family: Arc<dyn storage::ColumnFamily>,
     //tables: Mutex<HashMap<String, Box>>
     tables_handle: RwLock<HashMap<String, TableRef>>,
@@ -35,6 +38,7 @@ pub struct DB {
     next_index_id: AtomicU64,
     next_conn_id: AtomicU64,
     connections: Mutex<Vec<Arc<Connection>>>,
+    worker_pool: ThreadPool,
     locks: LockingManagement,
     // TODO:
 }
@@ -104,12 +108,18 @@ impl DB {
                 abs_db_path,
                 logger,
                 storage,
+                rd_opts: ReadOptions::default(),
+                wr_opts: WriteOptions::default(),
                 default_column_family,
                 next_conn_id: AtomicU64::new(0),
                 next_table_id: AtomicU64::new(0),
                 next_index_id: AtomicU64::new(1), // 0 = primary key
                 tables_handle: RwLock::default(),
                 connections: Mutex::default(),
+                worker_pool: rusty_pool::Builder::new()
+                    .core_size(num_cpus::get())
+                    .max_size(num_cpus::get() * 2 + 2)
+                    .build(),
                 locks: LockingManagement::new(),
             }
         });
@@ -398,8 +408,11 @@ impl DB {
         let mut col_vals = Vec::from_iter(iter::repeat(Value::Null)
             .take(secondary_index.key_parts.len()));
         let mut row_key = Vec::default();
+
         let mut key = Vec::<u8>::default();
         key.write(&(secondary_index_id as u32).to_be_bytes()).unwrap();
+
+        let lock_inst = self.locks.instance(table.metadata.id).unwrap();
 
         iter.seek(&Self::PRIMARY_KEY_ID_BYTES);
         while iter.valid() {
@@ -413,31 +426,148 @@ impl DB {
 
             let col_id_bytes = &iter.key()[iter.key().len() - Self::COL_ID_LEN..];
             let col_id = u32::from_be_bytes(col_id_bytes.try_into().unwrap());
+            debug_assert!(table.get_col_by_id(col_id).is_some(), "Column id not exists!");
+            //dbg!(&table.get_col_by_id(col_id).unwrap().name);
+
             if let Some((idx, col)) = col_id_to_idx.get(&col_id) {
                 col_vals[*idx] = Self::decode_column_value(&col.ty, iter.value(),
                                                            arena.borrow_mut().deref_mut());
             }
 
             let rk = &iter.key()[..iter.key().len() - Self::COL_ID_LEN];
+            if row_key.is_empty() {
+                row_key.extend_from_slice(rk);
+                debug_assert_eq!(row_key, rk);
+            }
+
             if row_key != rk {
-                row_key.copy_from_slice(rk);
                 key.truncate(4); // still keep index id (4 bytes u32)
-                for i in 0..col_vals.len() {
-                    let col_id = secondary_index.key_parts[i];
-                    let (_, col) = col_id_to_idx.get(&col_id).unwrap();
-                    Self::encode_secondary_index(&col_vals[i], &col.ty, &mut key);
-                }
-                let wr_opts = WriteOptions::default();
-                self.storage.insert(&wr_opts, &table.column_family, &key, &row_key)?;
+                self.build_secondary_index_key(&table.column_family, &col_vals, secondary_index,
+                                               &col_id_to_idx, &lock_inst, &row_key, &mut key)?;
+
                 affected_rows += 1;
                 col_vals.fill(Value::Null);
+                if row_key.len() < rk.len() {
+                    row_key.extend_from_slice(rk);
+                } else {
+                    row_key.copy_from_slice(rk);
+                }
+                debug_assert_eq!(row_key, rk);
+
                 if arena.borrow().rss_in_bytes > 10 * MB {
                     arena = Arena::new_rc();
                 }
             }
             iter.move_next();
         }
+        if !row_key.is_empty() {
+            key.truncate(4); // still keep index id (4 bytes u32)
+            self.build_secondary_index_key(&table.column_family, &col_vals, secondary_index,
+                                           &col_id_to_idx, &lock_inst, &row_key, &mut key)?;
+            affected_rows += 1;
+        }
 
+        if iter.status().is_corruption() {
+            Err(iter.status())
+        } else {
+            Ok(affected_rows)
+        }
+    }
+
+    fn build_secondary_index_key(&self, column_family: &Arc<dyn ColumnFamily>,
+                                 col_vals: &[Value],
+                                 secondary_index: &SecondaryIndexMetadata,
+                                 col_id_to_idx: &HashMap<u32, (usize, &ColumnMetadata)>,
+                                 lock_inst: &Arc<LockingInstance>,
+                                 row_key: &[u8],
+                                 key: &mut Vec<u8>)
+                                 -> Result<()> {
+        for i in 0..col_vals.len() {
+            let col_id = secondary_index.key_parts[i];
+            let (_, col) = col_id_to_idx.get(&col_id).unwrap();
+            Self::encode_secondary_index(&col_vals[i], &col.ty, key);
+        }
+
+        let _may_locking = if secondary_index.unique {
+            Some(lock_inst.exclusive_lock(key))
+        } else {
+            None
+        };
+        if secondary_index.unique {
+            match self.storage.get_pinnable(&self.rd_opts, &column_family, &key) {
+                Ok(_) => {
+                    let message = format!("Duplicated secondary key, index {} is unique.",
+                                          secondary_index.name);
+                    return Err(Status::corrupted(message));
+                }
+                Err(e) => {
+                    if e != Status::NotFound {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        self.storage.insert(&self.wr_opts, &column_family, key, row_key)?;
+        Ok(())
+    }
+
+    pub fn remove_secondary_index(&self, table_id: u64,
+                                  column_family: &Arc<dyn ColumnFamily>,
+                                  secondary_index_id: u64,
+                                  unique: bool,
+                                  sync: bool) -> Result<u64> {
+        let lock_inst = self.locks.instance(table_id).unwrap();
+        if sync {
+            Self::remove_secondary_index_impl(lock_inst,
+                                              self.storage.clone(),
+                                              column_family.clone(),
+                                              secondary_index_id, unique)
+        } else {
+            let db = self.storage.clone();
+            let cf = column_family.clone();
+            self.worker_pool.execute(move || {
+                let rs = Self::remove_secondary_index_impl(lock_inst, db, cf,
+                                                                       secondary_index_id, unique);
+                match rs {
+                    Ok(affected_rows) => dbg!(affected_rows),
+                    _ => 0
+                };
+            });
+            Ok(0)
+        }
+    }
+
+    fn remove_secondary_index_impl(lock_inst: Arc<LockingInstance>,
+                                   storage: Arc<dyn storage::DB>,
+                                   column_family: Arc<dyn ColumnFamily>,
+                                   secondary_index_id: u64,
+                                   unique: bool) -> Result<u64> {
+        let wr_opts = WriteOptions::default();
+        let rd_opts = ReadOptions::default();
+        let iter_box = storage.new_iterator(&rd_opts, &column_family)?;
+        let mut iter = iter_box.borrow_mut();
+
+        let key_prefix = (secondary_index_id as u32).to_be_bytes();
+        iter.seek(&key_prefix);
+
+        let mut affected_rows = 0u64;
+        while iter.valid() {
+            let idx_id = Self::decode_idx_id(iter.key());
+            if idx_id != secondary_index_id {
+                break;
+            }
+
+            let _may_locking = if unique {
+                Some(lock_inst.exclusive_lock(iter.key()))
+            } else {
+                None
+            };
+
+            storage.delete(&wr_opts, &column_family, iter.key())?;
+            affected_rows += 1;
+            iter.move_next();
+        }
         if iter.status().is_corruption() {
             Err(iter.status())
         } else {
@@ -452,10 +582,11 @@ impl DB {
                        anonymous_row_key_value: Option<u64>,
                        auto_increment_value: Option<u64>,
                        check_row_key_unique: bool)
-                       -> Result<usize> {
+                       -> Result<u64> {
         let mut batch = WriteBatch::new();
         let wr_opts = WriteOptions::default();
-        assert_eq!(column_family.name(), format!("{}{}", Self::DATA_COL_TABLE_PREFIX, &table.id));
+        debug_assert_eq!(column_family.name(),
+                         format!("{}{}", Self::DATA_COL_TABLE_PREFIX, &table.id));
 
         let inst = self.locks.instance(table.id).unwrap();
         let mut lock_group = inst.group();
@@ -496,8 +627,9 @@ impl DB {
             key.write(tuple.row_key()).unwrap();
             for col in &tuple.columns().columns {
                 let value = tuple.get(col.order);
-                assert!(!value.is_unit());
+                debug_assert!(!value.is_undefined());
                 if value.is_null() {
+                    //dbg!(value);
                     continue;
                 }
                 key.write(&col.id.to_be_bytes()).unwrap();
@@ -534,12 +666,20 @@ impl DB {
 
         self.storage.write(&wr_opts, batch)?;
         //log_debug!(self.logger, "rows: {} insert ok", tuples.len());
-        Ok(tuples.len())
+        Ok(tuples.len() as u64)
     }
 
     pub fn encode_anonymous_row_key<W: Write>(counter: u64, wr: &mut W) {
         wr.write(&Self::PRIMARY_KEY_ID_BYTES).unwrap(); // primary key id always is 0
         wr.write(&counter.to_be_bytes()).unwrap();
+    }
+
+    pub fn encode_idx_id<W: Write>(id: u64, wr: &mut W) {
+        wr.write(&(id as u32).to_be_bytes()).unwrap();
+    }
+
+    pub fn decode_idx_id(buf: &[u8]) -> u64 {
+        u32::from_be_bytes((&buf[..4]).try_into().unwrap()) as u64
     }
 
     pub fn encode_row_key<W: Write>(value: &Value, ty: &ColumnType, wr: &mut W) -> Result<()> {
@@ -588,7 +728,7 @@ impl DB {
             wr.write(&Self::NULL_BYTES).unwrap();
             return;
         }
-        assert!(!value.is_unit());
+        assert!(!value.is_undefined());
 
         wr.write(&Self::NOT_NULL_BYTES).unwrap();
         match ty {
@@ -1295,6 +1435,83 @@ mod tests {
         let cost = (db.env.current_time_mills() - jiffies) as f32 / 1000f32;
         println!("qps: {}", n as f32 / cost);
 
+        Ok(())
+    }
+
+    #[test]
+    fn create_index_before_inserting() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db111");
+        let arena = Arena::new_rc();
+        let db = DB::open("tests".to_string(), "db111".to_string())?;
+        let n = 1000;
+        let conn = db.connect();
+        let sql = " create table t1 {\n\
+                a int primary key auto_increment,\n\
+                b char(9)\n\
+            };\n\
+            ";
+        conn.execute_str(sql, &arena)?;
+
+        let sql = "insert into table t1(a,b) values (?, ?)";
+        let mut stmt = conn.prepare_str(sql, &arena)?.first().cloned().unwrap();
+        for i in 0..n {
+            stmt.bind_i64(0, i);
+            stmt.bind_string(1, format!("{:03}", i), arena.borrow_mut().deref_mut());
+            conn.execute_prepared_statement(&mut stmt)?;
+        }
+
+        let sql = "create index idx_b on t1(b)";
+        let affected_rows = conn.execute_str(sql, &arena)?;
+        assert_eq!(1000, affected_rows);
+
+        let (cf, table) = db.get_table_handle(&"t1".to_string()).unwrap();
+        assert_eq!(1, table.secondary_indices.len());
+        assert_eq!(2, table.secondary_indices[0].id);
+
+        let iter_box = db.storage.new_iterator(&db.rd_opts, &cf)?;
+        let mut iter = iter_box.borrow_mut();
+        iter.seek(&(table.secondary_indices[0].id as u32).to_be_bytes());
+        assert!(iter.valid());
+        assert_eq!(Status::Ok, iter.status());
+        let mut i = 0u32;
+        while iter.valid() {
+            //dbg!(iter.key());
+            let index_id = u32::from_be_bytes((&iter.key()[..4]).try_into().unwrap());
+            if index_id != 2 {
+                break;
+            }
+
+            let null_byte = iter.key()[4];
+            assert_eq!(DB::NOT_NULL_BYTE, null_byte);
+
+            let key = std::str::from_utf8(&iter.key()[5..]).unwrap();
+            assert_eq!(9, key.len());
+            assert_eq!(i, u32::from_str_radix(key.trim(), 10).unwrap());
+
+            iter.move_next();
+            i += 1;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn drop_index_before_inserting() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db112");
+        let arena = Arena::new_rc();
+        let db = DB::open("tests".to_string(), "db112".to_string())?;
+        //let n = 10000;
+        let conn = db.connect();
+        let sql = " create table t1 {\n\
+                a int primary key auto_increment,\n\
+                b char(9)\n\
+                index idx_b(b)\n\
+            };\n\
+            insert into table t1(b) values (\"aaa\"),(\"bbb\"),(\"ccc\");\n\
+            ";
+        assert_eq!(3, conn.execute_str(sql, &arena)?);
+
+        let sql = "drop index idx_b on t1";
+        assert_eq!(3, conn.execute_str(sql, &arena)?);
         Ok(())
     }
 }

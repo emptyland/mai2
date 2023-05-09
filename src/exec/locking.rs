@@ -43,6 +43,9 @@ pub struct LockingInstance {
     arena: Mutex<Arena>
 }
 
+unsafe impl Sync for LockingInstance {}
+unsafe impl Send for LockingInstance {}
+
 impl LockingInstance {
     const NOT_INIT: *mut LockingStripe = ptr::null_mut();
     const PENDING_MASK: *mut LockingStripe = 1 as *mut LockingStripe;

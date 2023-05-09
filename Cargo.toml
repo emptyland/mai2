@@ -13,4 +13,6 @@ zstd = "0.12.3+zstd.1.5.2"
 lru = "0.10.0"
 serde_yaml = "0.9.19"
 serde = { version = "1.0.158", features = ["derive"] }
+rusty_pool = { version = "*" }
+num_cpus = "1.15.0"
 lazy_static = "1.4.0"

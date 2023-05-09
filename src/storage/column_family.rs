@@ -396,6 +396,8 @@ impl ColumnFamily for ColumnFamilyHandle {
     }
 }
 
+unsafe impl Send for ColumnFamilyHandle {}
+unsafe impl Sync for ColumnFamilyHandle {}
 
 pub struct ColumnFamilySet {
     owns: Weak<Mutex<VersionSet>>,

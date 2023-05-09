@@ -21,16 +21,16 @@ impl Connection {
         }
     }
 
-    pub fn execute_str(&self, sql: &str, arena: &Rc<RefCell<Arena>>) -> Result<()> {
+    pub fn execute_str(&self, sql: &str, arena: &Rc<RefCell<Arena>>) -> Result<u64> {
         let mut rd = MemorySequentialFile::new(sql.to_string().into());
         self.execute(&mut rd, arena)
     }
 
-    pub fn execute(&self, reader: &mut dyn Read, arena: &Rc<RefCell<Arena>>) -> Result<()> {
+    pub fn execute(&self, reader: &mut dyn Read, arena: &Rc<RefCell<Arena>>) -> Result<u64> {
         self.executor.borrow_mut().execute(reader, arena)
     }
 
-    pub fn execute_prepared_statement(&self, prepared: &mut ArenaBox<PreparedStatement>) -> Result<()> {
+    pub fn execute_prepared_statement(&self, prepared: &mut ArenaBox<PreparedStatement>) -> Result<u64> {
         let arena = Arena::new_rc();
         self.executor.borrow_mut().execute_prepared_statement(prepared, &arena)
     }

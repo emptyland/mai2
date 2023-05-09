@@ -100,6 +100,14 @@ impl Visitor for YamlWriter<'_> {
         self.indent -= 1;
     }
 
+    fn visit_drop_table(&mut self, this: &mut DropTable) {
+        emit_header!(self, "DropTable");
+        indent! {self;
+            emit!(self, "table_name: {}", this.table_name);
+            emit!(self, "if_exists: {}", this.if_exists);
+        }
+    }
+
     fn visit_create_index(&mut self, this: &mut CreateIndex) {
         emit_header!(self, "CreateIndex");
         indent! {self;
@@ -114,11 +122,11 @@ impl Visitor for YamlWriter<'_> {
         }
     }
 
-    fn visit_drop_table(&mut self, this: &mut DropTable) {
-        emit_header!(self, "DropTable");
+    fn visit_drop_index(&mut self, this: &mut DropIndex) {
+        emit_header!(self, "DropIndex");
         indent! {self;
+            emit!(self, "name: {}", this.name);
             emit!(self, "table_name: {}", this.table_name);
-            emit!(self, "if_exists: {}", this.if_exists);
         }
     }
 

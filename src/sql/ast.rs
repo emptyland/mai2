@@ -42,8 +42,9 @@ macro_rules! expression_impl {
 
 ast_nodes_impl![
     (CreateTable, visit_create_table),
-    (CreateIndex, visit_create_index),
     (DropTable, visit_drop_table),
+    (CreateIndex, visit_create_index),
+    (DropIndex, visit_drop_index),
     (InsertIntoTable, visit_insert_into_table),
     (Identifier, visit_identifier),
     (FullyQualifiedName, visit_full_qualified_name),
@@ -201,6 +202,12 @@ pub struct IndexDeclaration {
 }
 
 #[derive(Debug)]
+pub struct DropTable {
+    pub table_name: ArenaStr,
+    pub if_exists: bool,
+}
+
+#[derive(Debug)]
 pub struct CreateIndex {
     pub name: ArenaStr,
     pub unique: bool,
@@ -209,9 +216,10 @@ pub struct CreateIndex {
 }
 
 #[derive(Debug)]
-pub struct DropTable {
+pub struct DropIndex {
+    pub name: ArenaStr,
+    pub primary_key: bool,
     pub table_name: ArenaStr,
-    pub if_exists: bool,
 }
 
 pub struct InsertIntoTable {
@@ -327,6 +335,13 @@ impl Factory {
         }, &self.arena)
     }
 
+    pub fn new_drop_table(&self, table_name: ArenaStr, if_exists: bool) -> ArenaBox<DropTable> {
+        ArenaBox::new(DropTable {
+            table_name,
+            if_exists,
+        }, &self.arena)
+    }
+
     pub fn new_create_index(&self, name: ArenaStr, unique: bool, table_name: ArenaStr) -> ArenaBox<CreateIndex> {
         ArenaBox::new(CreateIndex {
             name,
@@ -336,10 +351,11 @@ impl Factory {
         }, &self.arena)
     }
 
-    pub fn new_drop_table(&self, table_name: ArenaStr, if_exists: bool) -> ArenaBox<DropTable> {
-        ArenaBox::new(DropTable {
+    pub fn new_drop_index(&self, name: ArenaStr, primary_key: bool, table_name: ArenaStr) -> ArenaBox<DropIndex> {
+        ArenaBox::new(DropIndex {
+            name,
+            primary_key,
             table_name,
-            if_exists,
         }, &self.arena)
     }
 
