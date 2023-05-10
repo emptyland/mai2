@@ -7,7 +7,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use crate::{Corrupting, Result, Status};
 use crate::base::{Arena, ArenaStr};
-use crate::sql::ast::{BinaryExpression, CallFunction, CreateIndex, CreateTable, DropIndex, DropTable, Expression, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Operator, Placeholder, UnaryExpression, Visitor};
+use crate::sql::ast::{BinaryExpression, CallFunction, Collection, CreateIndex, CreateTable, DropIndex, DropTable, Expression, FromClause, FullyQualifiedName, Identifier, InLiteralSet, InRelation, InsertIntoTable, JoinClause, Literal, Operator, Placeholder, Select, UnaryExpression, Visitor};
 
 pub struct Evaluator {
     arena: Rc<RefCell<Arena>>,
@@ -146,6 +146,22 @@ impl Visitor for Evaluator {
     fn visit_drop_index(&mut self, this: &mut DropIndex) { unreachable!() }
     fn visit_insert_into_table(&mut self, this: &mut InsertIntoTable) { unreachable!() }
 
+    fn visit_collection(&mut self, this: &mut Collection) {
+        todo!()
+    }
+
+    fn visit_select(&mut self, this: &mut Select) {
+        todo!()
+    }
+
+    fn visit_from_clause(&mut self, this: &mut FromClause) {
+        todo!()
+    }
+
+    fn visit_join_clause(&mut self, this: &mut JoinClause) {
+        todo!()
+    }
+
     fn visit_identifier(&mut self, this: &mut Identifier) {
         let value = self.env().resolve(this.symbol.as_str());
         if value.is_undefined() {
@@ -231,6 +247,14 @@ impl Visitor for Evaluator {
             }
             _ => unreachable!()
         }
+    }
+
+    fn visit_in_literal_set(&mut self, this: &mut InLiteralSet) {
+        todo!()
+    }
+
+    fn visit_in_relation(&mut self, this: &mut InRelation) {
+        todo!()
     }
 
     fn visit_call_function(&mut self, this: &mut CallFunction) {

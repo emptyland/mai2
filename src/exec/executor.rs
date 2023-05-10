@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use crate::base::{Allocator, Arena, ArenaBox, ArenaStr, ArenaVec};
 use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata};
 use crate::exec::from_sql_result;
-use crate::sql::ast::{BinaryExpression, CallFunction, CreateIndex, CreateTable, DropIndex, DropTable, Expression, Factory, FullyQualifiedName, Identifier, InsertIntoTable, Literal, Placeholder, Statement, TypeDeclaration, UnaryExpression, Visitor};
+use crate::sql::ast::{BinaryExpression, CallFunction, Collection, CreateIndex, CreateTable, DropIndex, DropTable, Expression, Factory, FromClause, FullyQualifiedName, Identifier, InLiteralSet, InRelation, InsertIntoTable, JoinClause, Literal, Placeholder, Select, Statement, TypeDeclaration, UnaryExpression, Visitor};
 use crate::sql::parser::Parser;
 use crate::{Corrupting, Result, Status};
 use crate::exec::evaluator::{Context, Evaluator, Value};
@@ -554,6 +554,30 @@ impl Visitor for Executor {
     fn visit_str_literal(&mut self, _: &mut Literal<ArenaStr>) { unreachable!() }
     fn visit_null_literal(&mut self, _: &mut Literal<()>) { unreachable!() }
     fn visit_placeholder(&mut self, _: &mut Placeholder) { unreachable!() }
+
+    fn visit_collection(&mut self, this: &mut Collection) {
+        todo!()
+    }
+
+    fn visit_select(&mut self, this: &mut Select) {
+        todo!()
+    }
+
+    fn visit_from_clause(&mut self, this: &mut FromClause) {
+        todo!()
+    }
+
+    fn visit_join_clause(&mut self, this: &mut JoinClause) {
+        todo!()
+    }
+
+    fn visit_in_literal_set(&mut self, this: &mut InLiteralSet) {
+        todo!()
+    }
+
+    fn visit_in_relation(&mut self, this: &mut InRelation) {
+        todo!()
+    }
 }
 
 pub struct ColumnSet {

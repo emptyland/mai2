@@ -294,11 +294,8 @@ pub struct ArenaStr {
 
 impl ArenaStr {
     pub fn new(str: &str, alloc: &mut dyn Allocator) -> Self {
-        static EMPTY_DUMMY: &str = "";
         if str.is_empty() {
-            return Self {
-                naked: NonNull::new(EMPTY_DUMMY as *const str as *mut str).unwrap()
-            };
+            return Self::default();
         }
         let layout = Layout::from_size_align(str.len(), 4).unwrap();
         let mut chunk = alloc.allocate(layout).unwrap();
@@ -338,6 +335,15 @@ impl ArenaStr {
     pub fn bytes_part(&self, start: usize, stop: usize) -> &[u8] {
         let end = min(stop, self.len());
         &self.as_bytes()[start..end]
+    }
+}
+
+impl Default for ArenaStr {
+    fn default() -> Self {
+        static EMPTY_DUMMY: &str = "";
+        Self {
+            naked: NonNull::new(EMPTY_DUMMY as *const str as *mut str).unwrap()
+        }
     }
 }
 

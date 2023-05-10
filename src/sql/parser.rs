@@ -2,7 +2,7 @@ use std::io::Read;
 use serde_yaml::to_string;
 use crate::base::{ArenaVec, ArenaBox, ArenaStr};
 use crate::sql::{ParseError, Result, SourceLocation, SourcePosition};
-use crate::sql::ast::{ColumnDeclaration, CreateIndex, CreateTable, DropIndex, DropTable, Expression, Factory, Identifier, InsertIntoTable, Operator, Placeholder, Statement, TypeDeclaration};
+use crate::sql::ast::{ColumnDeclaration, CreateIndex, CreateTable, DropIndex, DropTable, Expression, Factory, Identifier, InsertIntoTable, JoinOp, Operator, Placeholder, Relation, SelectColumn, SelectColumnItem, SetOp, Statement, TypeDeclaration};
 use crate::sql::lexer::{Lexer, Token, TokenPart};
 
 pub struct Parser<'a> {
@@ -12,7 +12,7 @@ pub struct Parser<'a> {
     placeholder_order: usize,
 }
 
-impl <'a> Parser<'a> {
+impl<'a> Parser<'a> {
     pub fn new(reader: &'a mut dyn Read, factory: Factory) -> Result<Self> {
         let mut lexer = Lexer::new(reader, &factory.arena);
         let lookahead = lexer.next()?;
@@ -25,11 +25,11 @@ impl <'a> Parser<'a> {
     }
 
     pub fn parse(&mut self) -> Result<ArenaVec<ArenaBox<dyn Statement>>> {
-        self.parse_with_processor(|x,_|{x})
+        self.parse_with_processor(|x, _| { x })
     }
 
     pub fn parse_with_processor<T, Fn>(&mut self, proc: Fn) -> Result<ArenaVec<T>>
-    where Fn: FnOnce(ArenaBox<dyn Statement>, usize)->T + Copy {
+        where Fn: FnOnce(ArenaBox<dyn Statement>, usize) -> T + Copy {
         let mut stmts: ArenaVec<T> = ArenaVec::new(&self.factory.arena);
         loop {
             self.placeholder_order = 0;
@@ -53,7 +53,7 @@ impl <'a> Parser<'a> {
                             let rv = proc(self.parse_create_index(start_pos)?.into(),
                                           self.placeholder_order);
                             stmts.push(rv);
-                        },
+                        }
                         _ => Err(self.concat_syntax_error(start_pos, "Unexpected `table'".to_string()))?
                     }
                 }
@@ -76,6 +76,10 @@ impl <'a> Parser<'a> {
                 }
                 Token::Insert => {
                     let rv = proc(self.parse_insert_into_table()?.into(), self.placeholder_order);
+                    stmts.push(rv);
+                }
+                Token::Select => {
+                    let rv = proc(self.parse_select()?, self.placeholder_order);
                     stmts.push(rv);
                 }
                 _ => Err(self.current_syntax_error("Unexpected statement".to_string()))?
@@ -309,6 +313,180 @@ impl <'a> Parser<'a> {
         Ok(node)
     }
 
+    fn parse_relation(&mut self) -> Result<ArenaBox<dyn Relation>> {
+        if self.test(Token::LParent)? {
+            let select = self.parse_select()?;
+            self.match_expected(Token::RParent)?;
+            Ok(select.into())
+        } else {
+            let name = self.match_id()?;
+            let from = self.factory.new_from_clause(name);
+            Ok(ArenaBox::<dyn Statement>::from(from).into())
+        }
+    }
+
+    fn parse_select(&mut self) -> Result<ArenaBox<dyn Statement>> {
+        self.match_expected(Token::Select)?;
+        let distinct = self.test(Token::Distinct)?;
+
+        let mut node = self.factory.new_select(distinct);
+        loop {
+            let item = self.parse_select_col_item()?;
+            node.columns.push(item);
+            if !self.test(Token::Comma)? {
+                break;
+            }
+        }
+
+        if self.test(Token::From)? {
+            if self.test(Token::LParent)? {
+                node.from_clause = Some(self.parse_relation()?);
+                self.match_expected(Token::RParent)?;
+            } else {
+                node.from_clause = Some(self.parse_relation()?)
+            }
+            if let Some(clause) = node.from_clause.as_mut() {
+                let alias = self.match_alias()?;
+                clause.alias_as(alias);
+
+                match self.parse_join_op()? {
+                    Some(join_op) => {
+                        let mut rhs = self.parse_relation()?;
+                        rhs.alias_as(self.match_alias()?);
+                        self.match_expected(Token::On)?;
+                        let on_clause = self.parse_expr()?;
+                        let join_node = self.factory.new_join_clause(join_op,
+                                                                     clause.clone(), rhs,
+                                                                     on_clause);
+                        node.from_clause = Some(ArenaBox::<dyn Statement>::from(join_node).into())
+                    }
+                    None => {}
+                }
+            }
+
+            if self.test(Token::Where)? {
+                let expr = self.parse_expr()?;
+                node.where_clause = Some(expr);
+            }
+
+            if self.test(Token::Group)? {
+                self.match_expected(Token::By)?;
+                self.parse_expr_at_least_one(&mut node.group_by_clause)?;
+            }
+
+            if self.test(Token::Order)? {
+                self.match_expected(Token::By)?;
+                self.parse_expr_at_least_one(&mut node.group_by_clause)?;
+            }
+
+            if self.test(Token::Limit)? {
+                node.limit_clause = Some(self.parse_expr()?);
+                if self.test(Token::Offset)? {
+                    node.offset_clause = Some(self.parse_expr()?);
+                }
+            }
+        }
+
+        if let Some(set_op) = self.parse_set_op()? {
+            let lhs: ArenaBox<dyn Statement> = node.into();
+            let rhs: ArenaBox<dyn Relation> = self.parse_select()?.into();
+            let node = self.factory.new_collection(set_op, lhs.into(), rhs);
+            Ok(node.into())
+        } else {
+            Ok(node.into())
+        }
+    }
+
+    fn parse_set_op(&mut self) -> Result<Option<SetOp>> {
+        if self.test(Token::Union)? {
+            if self.test(Token::All)? {
+                Ok(Some(SetOp::UnionAll))
+            } else if self.test(Token::Distinct)? {
+                Ok(Some(SetOp::UnionDistinct))
+            } else {
+                Ok(Some(SetOp::UnionDistinct))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn parse_join_op(&mut self) -> Result<Option<JoinOp>> {
+        let op = match self.peek().token {
+            Token::Left => {
+                self.move_next()?;
+                self.test(Token::Outer)?;
+                self.match_expected(Token::Join)?;
+                Some(JoinOp::LeftOuterJoin)
+            }
+            Token::Right => {
+                self.move_next()?;
+                self.test(Token::Outer)?;
+                self.match_expected(Token::Join)?;
+                Some(JoinOp::RightOuterJoin)
+            }
+            Token::Inner => {
+                self.move_next()?;
+                self.match_expected(Token::Join)?;
+                Some(JoinOp::InnerJoin)
+            }
+            Token::Cross => {
+                self.move_next()?;
+                self.match_expected(Token::Join)?;
+                Some(JoinOp::CrossJoin)
+            }
+            Token::Join => {
+                self.move_next()?;
+                Some(JoinOp::CrossJoin)
+            }
+            _ => None
+        };
+        Ok(op)
+    }
+
+    fn parse_expr_at_least_one(&mut self, list: &mut ArenaVec<ArenaBox<dyn Expression>>) -> Result<()> {
+        loop {
+            let expr = self.parse_expr()?;
+            list.push(expr);
+            if !self.test(Token::Comma)? {
+                break Ok(());
+            }
+        }
+    }
+
+    fn match_alias(&mut self) -> Result<ArenaStr> {
+        if self.test(Token::As)? {
+            self.match_id()
+        } else if matches!(self.peek().token, Token::Id(_)) {
+            self.match_id()
+        } else {
+            Ok(ArenaStr::default())
+        }
+    }
+
+    fn parse_select_col_item(&mut self) -> Result<SelectColumnItem> {
+        let item = match self.peek().token {
+            Token::Star => {
+                self.move_next()?;
+                SelectColumnItem {
+                    expr: SelectColumn::Star,
+                    alias: ArenaStr::default(),
+                }
+            }
+            // Token::Id(symbol) => {
+            //     self.move_next()?;
+            //
+            // }
+            _ => {
+                SelectColumnItem {
+                    expr: SelectColumn::Expr(self.parse_expr()?),
+                    alias: self.match_alias()?,
+                }
+            }
+        };
+        Ok(item)
+    }
+
     fn parse_expr(&mut self) -> Result<ArenaBox<dyn Expression>> {
         let mut next_op = None;
         let expr = self.parse_expr_with_priority(0, &mut next_op)?;
@@ -406,10 +584,9 @@ impl <'a> Parser<'a> {
                 } else {
                     Ok(self.factory.new_identifier(symbol).into())
                 }
-            },
+            }
             _ => unreachable!()
         }
-
     }
 
     fn current_syntax_error(&self, message: String) -> ParseError {
@@ -533,6 +710,117 @@ mod tests {
       - IntLiteral: 1
       - IntLiteral: 2
       - IntLiteral: 3
+", yaml);
+        Ok(())
+    }
+
+    #[test]
+    fn simple_select() -> Result<()> {
+        let arena = Arena::new_rc();
+        let yaml = parse_all_to_yaml(&arena, "select 1 as a")?;
+        println!("{}", yaml);
+        assert_eq!("Select:
+  distinct: false
+  columns:
+    - expr:
+        IntLiteral: 1
+      alias: a
+", yaml);
+        Ok(())
+    }
+
+    #[test]
+    fn simple_select_with_from_clause() -> Result<()> {
+        let arena = Arena::new_rc();
+        let yaml = parse_all_to_yaml(&arena, "select a as c1,b,c from t")?;
+        println!("{}", yaml);
+        assert_eq!("Select:
+  distinct: false
+  columns:
+    - expr:
+        Identifier: a
+      alias: c1
+    - expr:
+        Identifier: b
+    - expr:
+        Identifier: c
+  from:
+    FromClause:
+      name: t
+", yaml);
+        Ok(())
+    }
+
+    #[test]
+    fn select_with_from_join() -> Result<()> {
+        let arena = Arena::new_rc();
+        let yaml = parse_all_to_yaml(&arena, "select * from t t1 left join tt t2 on t1.id = t2.id")?;
+        println!("{}", yaml);
+        assert_eq!("Select:
+  distinct: false
+  columns:
+    - expr: *
+  from:
+    JoinClause:
+      op: LEFT OUTER JOIN
+      lhs:
+        FromClause:
+          name: t
+          alias: t1
+      rhs:
+        FromClause:
+          name: tt
+          alias: t2
+      on_clause:
+        BinaryExpression:
+          op: Eq(=)
+          lhs:
+            FullQualifiedName: t1.id
+          rhs:
+            FullQualifiedName: t2.id
+", yaml);
+        Ok(())
+    }
+
+    #[test]
+    fn select_with_from_join_subquery() -> Result<()> {
+        let arena = Arena::new_rc();
+        let sql = "select *
+from a t1
+left join
+(select id from b) t2
+on t1.id = t2.id
+        ";
+        let yaml = parse_all_to_yaml(&arena, sql)?;
+        println!("{}", yaml);
+        assert_eq!("Select:
+  distinct: false
+  columns:
+    - expr: *
+  from:
+    JoinClause:
+      op: LEFT OUTER JOIN
+      lhs:
+        FromClause:
+          name: a
+          alias: t1
+      rhs:
+        Select:
+          distinct: false
+          columns:
+            - expr:
+                Identifier: id
+          from:
+            FromClause:
+              name: b
+          alias: t2
+      on_clause:
+        BinaryExpression:
+          op: Eq(=)
+          lhs:
+            FullQualifiedName: t1.id
+          rhs:
+            FullQualifiedName: t2.id
 ", yaml);
         Ok(())
     }

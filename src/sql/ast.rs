@@ -46,10 +46,16 @@ ast_nodes_impl![
     (CreateIndex, visit_create_index),
     (DropIndex, visit_drop_index),
     (InsertIntoTable, visit_insert_into_table),
+    (Collection, visit_collection),
+    (Select, visit_select),
+    (FromClause, visit_from_clause),
+    (JoinClause, visit_join_clause),
     (Identifier, visit_identifier),
     (FullyQualifiedName, visit_full_qualified_name),
     (UnaryExpression, visit_unary_expression),
     (BinaryExpression, visit_binary_expression),
+    (InLiteralSet, visit_in_literal_set),
+    (InRelation, visit_in_relation),
     (CallFunction, visit_call_function),
     (Literal<i64>, visit_int_literal),
     (Literal<f64>, visit_float_literal),
@@ -73,14 +79,18 @@ macro_rules! ast_ops_impl {
             $($name,)+
         }
 
-        static OPS_META: [OpMeta; 15] = [
+        static OPS_META: [OpMeta; 17] = [
             $(OpMeta {name: stringify!($name), literal: $op, priority: $prio},)+
         ];
     }
 }
 
-ast_ops_impl! [
+ast_ops_impl![
     (Lit, "<lit>", 110),
+
+    (In, "in", 110),
+    (NotIn, "not in", 110),
+
     (Minus, "-", 110),
     (Not, "not", 110),
 
@@ -175,7 +185,7 @@ pub struct CreateTable {
     pub if_not_exists: bool,
     pub columns: ArenaVec<ArenaBox<ColumnDeclaration>>,
     pub primary_keys: ArenaVec<ArenaStr>,
-    pub secondary_indices: ArenaVec<ArenaBox<IndexDeclaration>>
+    pub secondary_indices: ArenaVec<ArenaBox<IndexDeclaration>>,
 }
 
 pub struct ColumnDeclaration {
@@ -225,8 +235,108 @@ pub struct DropIndex {
 pub struct InsertIntoTable {
     pub table_name: ArenaStr,
     pub columns_name: ArenaVec<ArenaStr>,
-    pub values: ArenaVec<ArenaVec<ArenaBox<dyn Expression>>>
+    pub values: ArenaVec<ArenaVec<ArenaBox<dyn Expression>>>,
 }
+
+pub trait Relation: Statement {
+    fn alias(&self) -> &ArenaStr;
+    fn alias_as(&mut self, name: ArenaStr);
+}
+
+// DCL
+#[derive(Debug)]
+pub enum SetOp {
+    UnionDistinct,
+    UnionAll,
+}
+
+pub struct Collection {
+    pub op: SetOp,
+    pub lhs: ArenaBox<dyn Relation>,
+    pub rhs: ArenaBox<dyn Relation>,
+    pub alias: ArenaStr,
+}
+
+impl Relation for Collection {
+    fn alias(&self) -> &ArenaStr { &self.alias }
+    fn alias_as(&mut self, name: ArenaStr) { self.alias = name; }
+}
+
+#[derive(Debug)]
+pub enum JoinOp {
+    LeftOuterJoin,
+    RightOuterJoin,
+    InnerJoin,
+    CrossJoin,
+}
+
+impl Display for JoinOp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JoinOp::LeftOuterJoin => f.write_str("LEFT OUTER JOIN"),
+            JoinOp::RightOuterJoin => f.write_str("RIGHT OUTER JOIN"),
+            JoinOp::InnerJoin => f.write_str("INNER JOIN"),
+            JoinOp::CrossJoin => f.write_str("CROSS JOIN"),
+        }
+    }
+}
+
+pub struct JoinClause {
+    pub op: JoinOp,
+    pub lhs: ArenaBox<dyn Relation>,
+    pub rhs: ArenaBox<dyn Relation>,
+    pub on_clause: ArenaBox<dyn Expression>,
+    pub alias: ArenaStr,
+}
+
+impl Relation for JoinClause {
+    fn alias(&self) -> &ArenaStr { &self.alias }
+    fn alias_as(&mut self, name: ArenaStr) { self.alias = name; }
+}
+
+// select * from b t1
+// left join b t2 on (t1.id = t2.id)
+// left join c t3 on (t2.id = t3.id)
+// where
+pub struct Select {
+    pub distinct: bool,
+    pub columns: ArenaVec<SelectColumnItem>,
+    pub from_clause: Option<ArenaBox<dyn Relation>>,
+    pub where_clause: Option<ArenaBox<dyn Expression>>,
+    pub group_by_clause: ArenaVec<ArenaBox<dyn Expression>>,
+    pub order_by_clause: ArenaVec<ArenaBox<dyn Expression>>,
+    pub limit_clause: Option<ArenaBox<dyn Expression>>,
+    pub offset_clause: Option<ArenaBox<dyn Expression>>,
+    pub alias: ArenaStr,
+}
+
+impl Relation for Select {
+    fn alias(&self) -> &ArenaStr { &self.alias }
+    fn alias_as(&mut self, name: ArenaStr) { self.alias = name; }
+}
+
+pub enum SelectColumn {
+    Expr(ArenaBox<dyn Expression>),
+    Star,
+    SuffixStar(ArenaStr),
+}
+
+pub struct SelectColumnItem {
+    pub expr: SelectColumn,
+    pub alias: ArenaStr,
+}
+
+pub struct FromClause {
+    pub name: ArenaStr,
+    pub alias: ArenaStr,
+}
+
+impl Relation for FromClause {
+    fn alias(&self) -> &ArenaStr { &self.alias }
+    fn alias_as(&mut self, name: ArenaStr) { self.alias = name; }
+}
+
+// Expression:
 
 pub struct Identifier {
     pub symbol: ArenaStr,
@@ -245,7 +355,7 @@ expression_impl!(Literal<()>);
 
 pub struct UnaryExpression {
     op: Operator,
-    operand: ArenaBox<dyn Expression>
+    operand: ArenaBox<dyn Expression>,
 }
 
 impl Expression for UnaryExpression {
@@ -264,7 +374,7 @@ impl Expression for UnaryExpression {
 
 pub struct BinaryExpression {
     op: Operator,
-    operands: [ArenaBox<dyn Expression>; 2]
+    operands: [ArenaBox<dyn Expression>; 2],
 }
 
 impl Expression for BinaryExpression {
@@ -293,13 +403,49 @@ pub struct CallFunction {
     pub callee_name: ArenaStr,
     pub distinct: bool,
     pub in_args_star: bool,
-    pub args: ArenaVec<ArenaBox<dyn Expression>>
+    pub args: ArenaVec<ArenaBox<dyn Expression>>,
 }
 
 impl Expression for CallFunction {
     fn op(&self) -> &Operator { &Operator::Lit }
     fn operands(&self) -> &[ArenaBox<dyn Expression>] { self.args.as_slice() }
     fn operands_mut(&mut self) -> &mut [ArenaBox<dyn Expression>] { self.args.as_slice_mut() }
+}
+
+pub struct InLiteralSet {
+    pub not_in: bool,
+    pub lhs: ArenaBox<dyn Expression>,
+    pub set: ArenaVec<ArenaBox<dyn Expression>>,
+}
+
+impl Expression for InLiteralSet {
+    fn op(&self) -> &Operator { if self.not_in { &Operator::NotIn } else { &Operator::In } }
+
+    fn operands(&self) -> &[ArenaBox<dyn Expression>] {
+        &[]
+    }
+
+    fn operands_mut(&mut self) -> &mut [ArenaBox<dyn Expression>] {
+        &mut []
+    }
+}
+
+pub struct InRelation {
+    pub not_in: bool,
+    pub lhs: ArenaBox<dyn Expression>,
+    pub set: ArenaVec<ArenaBox<dyn Relation>>,
+}
+
+impl Expression for InRelation {
+    fn op(&self) -> &Operator { if self.not_in { &Operator::NotIn } else { &Operator::In } }
+
+    fn operands(&self) -> &[ArenaBox<dyn Expression>] {
+        &[]
+    }
+
+    fn operands_mut(&mut self) -> &mut [ArenaBox<dyn Expression>] {
+        &mut []
+    }
 }
 
 pub struct Placeholder {
@@ -325,7 +471,8 @@ impl Factory {
         }
     }
 
-    pub fn new_create_table(&self, table_name: ArenaStr, if_not_exists: bool) -> ArenaBox<CreateTable> {
+    pub fn new_create_table(&self, table_name: ArenaStr, if_not_exists: bool)
+                            -> ArenaBox<CreateTable> {
         ArenaBox::new(CreateTable {
             table_name,
             if_not_exists,
@@ -342,7 +489,8 @@ impl Factory {
         }, &self.arena)
     }
 
-    pub fn new_create_index(&self, name: ArenaStr, unique: bool, table_name: ArenaStr) -> ArenaBox<CreateIndex> {
+    pub fn new_create_index(&self, name: ArenaStr, unique: bool, table_name: ArenaStr)
+                            -> ArenaBox<CreateIndex> {
         ArenaBox::new(CreateIndex {
             name,
             table_name,
@@ -351,11 +499,54 @@ impl Factory {
         }, &self.arena)
     }
 
-    pub fn new_drop_index(&self, name: ArenaStr, primary_key: bool, table_name: ArenaStr) -> ArenaBox<DropIndex> {
+    pub fn new_drop_index(&self, name: ArenaStr, primary_key: bool, table_name: ArenaStr)
+                          -> ArenaBox<DropIndex> {
         ArenaBox::new(DropIndex {
             name,
             primary_key,
             table_name,
+        }, &self.arena)
+    }
+
+    pub fn new_collection(&self, op: SetOp, lhs: ArenaBox<dyn Relation>, rhs: ArenaBox<dyn Relation>)
+                          -> ArenaBox<Collection> {
+        ArenaBox::new(Collection {
+            op,
+            lhs,
+            rhs,
+            alias: ArenaStr::default(),
+        }, &self.arena)
+    }
+
+    pub fn new_join_clause(&self, op: JoinOp, lhs: ArenaBox<dyn Relation>, rhs: ArenaBox<dyn Relation>,
+                           on_clause: ArenaBox<dyn Expression>) -> ArenaBox<JoinClause> {
+        ArenaBox::new(JoinClause {
+            op,
+            lhs,
+            rhs,
+            on_clause,
+            alias: ArenaStr::default(),
+        }, &self.arena)
+    }
+
+    pub fn new_from_clause(&self, name: ArenaStr) -> ArenaBox<FromClause> {
+        ArenaBox::new(FromClause {
+            name,
+            alias: ArenaStr::default(),
+        }, &self.arena)
+    }
+
+    pub fn new_select(&self, distinct: bool) -> ArenaBox<Select> {
+        ArenaBox::new(Select {
+            distinct,
+            columns: ArenaVec::new(&self.arena),
+            from_clause: None,
+            where_clause: None,
+            group_by_clause: ArenaVec::new(&self.arena),
+            order_by_clause: ArenaVec::new(&self.arena),
+            limit_clause: None,
+            offset_clause: None,
+            alias: ArenaStr::default(),
         }, &self.arena)
     }
 
@@ -364,7 +555,8 @@ impl Factory {
                            not_null: bool,
                            primary_key: bool,
                            type_decl: ArenaBox<TypeDeclaration>,
-                           default_val: Option<ArenaBox<dyn Expression>>) -> ArenaBox<ColumnDeclaration> {
+                           default_val: Option<ArenaBox<dyn Expression>>)
+                           -> ArenaBox<ColumnDeclaration> {
         ArenaBox::new(ColumnDeclaration {
             name,
             auto_increment,
@@ -375,7 +567,8 @@ impl Factory {
         }, &self.arena)
     }
 
-    pub fn new_type_decl(&self, token: Token, len: usize, len_part: usize) -> ArenaBox<TypeDeclaration> {
+    pub fn new_type_decl(&self, token: Token, len: usize, len_part: usize)
+                         -> ArenaBox<TypeDeclaration> {
         ArenaBox::new(TypeDeclaration {
             token,
             len,
@@ -402,7 +595,7 @@ impl Factory {
     pub fn new_unary_expr(&self, op: Operator, operand: ArenaBox<dyn Expression>) -> ArenaBox<UnaryExpression> {
         ArenaBox::new(UnaryExpression {
             op,
-            operand
+            operand,
         }, &self.arena)
     }
 
@@ -410,7 +603,7 @@ impl Factory {
                            rhs: ArenaBox<dyn Expression>) -> ArenaBox<BinaryExpression> {
         ArenaBox::new(BinaryExpression {
             op,
-            operands: [lhs, rhs]
+            operands: [lhs, rhs],
         }, &self.arena)
     }
 
@@ -428,9 +621,9 @@ impl Factory {
     }
 
     pub fn new_fully_qualified_name(&self, prefix: ArenaStr, suffix: ArenaStr) -> ArenaBox<FullyQualifiedName> {
-        ArenaBox::new(FullyQualifiedName{
+        ArenaBox::new(FullyQualifiedName {
             prefix,
-            suffix
+            suffix,
         }, &self.arena)
     }
 
@@ -451,29 +644,54 @@ impl Factory {
     }
 }
 
-impl <T: Statement + 'static> From<ArenaBox<T>> for ArenaBox<dyn Statement> {
+// impl From<ArenaBox<dyn Relation + 'static>> for ArenaBox<dyn Statement> {
+//     fn from(value: ArenaBox<dyn Relation>) -> Self {
+//         Self::from_ptr(value.ptr(), value.owns())
+//     }
+// }
+
+impl<T: Statement + 'static> From<ArenaBox<T>> for ArenaBox<dyn Statement> {
     fn from(value: ArenaBox<T>) -> Self {
         Self::from_ptr(value.ptr(), value.owns())
     }
 }
 
-impl <T: Statement + 'static> From<ArenaBox<dyn Statement>> for ArenaBox<T> {
+impl<T: Statement + 'static> From<ArenaBox<dyn Statement>> for ArenaBox<T> {
     fn from(value: ArenaBox<dyn Statement>) -> Self {
         let ptr = NonNull::from(value.as_any().downcast_ref::<T>().unwrap());
         Self::from_ptr(ptr, value.owns())
     }
 }
 
-impl <T: Expression + 'static> From<ArenaBox<T>> for ArenaBox<dyn Expression> {
+impl<T: Expression + 'static> From<ArenaBox<T>> for ArenaBox<dyn Expression> {
     fn from(value: ArenaBox<T>) -> Self {
         Self::from_ptr(value.ptr(), value.owns())
     }
 }
 
-impl <T: Expression + 'static> From<ArenaBox<dyn Expression>> for ArenaBox<T> {
+impl<T: Expression + 'static> From<ArenaBox<dyn Expression>> for ArenaBox<T> {
     fn from(value: ArenaBox<dyn Expression>) -> Self {
         let ptr = NonNull::from(value.as_any().downcast_ref::<T>().unwrap());
         Self::from_ptr(ptr, value.owns())
+    }
+}
+
+macro_rules! try_cast_to_relation {
+    ($value:ident, $ty:ty) => {
+        if $value.as_any().downcast_ref::<$ty>().is_some() {
+            let core = ArenaBox::<$ty>::from($value);
+            return ArenaBox::<dyn Relation>::from_ptr(core.ptr(), core.owns());
+        }
+    }
+}
+
+impl From<ArenaBox<dyn Statement>> for ArenaBox<dyn Relation> {
+    fn from(value: ArenaBox<dyn Statement>) -> Self {
+        try_cast_to_relation!(value, Select);
+        try_cast_to_relation!(value, Collection);
+        try_cast_to_relation!(value, JoinClause);
+        try_cast_to_relation!(value, FromClause);
+        unreachable!()
     }
 }
 

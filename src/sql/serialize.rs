@@ -16,11 +16,21 @@ impl<'a> YamlWriter<'a> {
         }
     }
 
-    fn emit_item<T: Statement + ?Sized>(&mut self, node: &mut T) {
+    fn emit_elem<T: Statement + ?Sized>(&mut self, node: &mut T) {
         self.emit_child("- ", node)
     }
 
     fn emit_child<T: Statement + ?Sized>(&mut self, prefix: &str, node: &mut T) {
+        self.emit_prefix(prefix);
+        node.accept(self);
+    }
+
+    fn emit_expr<T: Expression + ?Sized>(&mut self, prefix: &str, node: &mut T) {
+        self.emit_prefix(prefix);
+        node.accept(self);
+    }
+
+    fn emit_rel<T: Relation + ?Sized>(&mut self, prefix: &str, node: &mut T) {
         self.emit_prefix(prefix);
         node.accept(self);
     }
@@ -148,10 +158,105 @@ impl Visitor for YamlWriter<'_> {
                     self.emit_prefix("- row:\n");
                     indent!{ self;
                         for value in row.iter_mut() {
-                            self.emit_item(value.deref_mut());
+                            self.emit_elem(value.deref_mut());
                         }
                     }
                 }
+            };
+        }
+    }
+
+    fn visit_collection(&mut self, this: &mut Collection) {
+        todo!()
+    }
+
+    fn visit_select(&mut self, this: &mut Select) {
+        emit_header!(self, "Select:");
+        indent! { self;
+            emit!(self, "distinct: {}", this.distinct);
+            emit!(self, "columns:");
+            for col in this.columns.iter_mut() {
+                indent!{ self;
+                    match &mut col.expr {
+                        SelectColumn::Star => { emit!(self, "- expr: *");}
+                        SelectColumn::SuffixStar(prefix) => {
+                            emit!(self, "- expr: {}.*", prefix);
+                        }
+                        SelectColumn::Expr(expr) => {
+                            emit!(self, "- expr:");
+                            self.indent += 2;
+                            self.emit_expr("", expr.deref_mut());
+                            self.indent -= 2;
+                        }
+                    };
+                    if !col.alias.is_empty() {
+                        indent! { self;
+                            emit!(self, "alias: {}", col.alias);
+                        }
+                    }
+                }
+            };
+            if let Some(from) = &mut this.from_clause {
+                emit!(self, "from:");
+                indent! { self;
+                    self.emit_rel("", from.deref_mut());
+                }
+            };
+            if let Some(expr) = &mut this.where_clause {
+                emit!(self, "where:");
+                indent! { self;
+                    self.emit_expr("", expr.deref_mut());
+                }
+            };
+            if !this.group_by_clause.is_empty() {
+                emit!(self, "group_by: ");
+                for expr in this.group_by_clause.iter_mut() {
+                    self.emit_elem(expr.deref_mut())
+                }
+            };
+            if !this.order_by_clause.is_empty() {
+                emit!(self, "order_by: ");
+                for expr in this.order_by_clause.iter_mut() {
+                    self.emit_elem(expr.deref_mut())
+                }
+            };
+            if let Some(limit) = &mut this.limit_clause {
+                self.emit_expr("limit: ", limit.deref_mut());
+                if let Some(offset) = &mut this.offset_clause {
+                    self.emit_expr("offset: ", offset.deref_mut());
+                }
+            };
+            if !this.alias.is_empty() {
+                emit!(self, "alias: {}", this.alias);
+            }
+        }
+    }
+
+    fn visit_from_clause(&mut self, this: &mut FromClause) {
+        emit_header!(self, "FromClause:");
+        indent! { self;
+            emit!(self, "name: {}", this.name);
+            if !this.alias.is_empty() {
+                emit!(self, "alias: {}", this.alias);
+            }
+        }
+    }
+
+    fn visit_join_clause(&mut self, this: &mut JoinClause) {
+        emit_header!(self, "JoinClause:");
+        indent! { self;
+            emit!(self, "op: {}", this.op);
+            emit!(self, "lhs:");
+            indent! { self;
+                self.emit_rel("", this.lhs.deref_mut());
+            };
+            emit!(self, "rhs:");
+            indent! { self;
+                self.emit_rel("", this.rhs.deref_mut());
+            };
+            emit!(self, "on_clause:");
+            indent! { self;
+                self.emit_expr("", this.on_clause.deref_mut());
             };
         }
     }
@@ -190,6 +295,14 @@ impl Visitor for YamlWriter<'_> {
         }
     }
 
+    fn visit_in_literal_set(&mut self, this: &mut InLiteralSet) {
+        todo!()
+    }
+
+    fn visit_in_relation(&mut self, this: &mut InRelation) {
+        todo!()
+    }
+
     fn visit_call_function(&mut self, this: &mut CallFunction) {
         emit_header!(self, "CallFunction:");
         indent! {self;
@@ -200,7 +313,7 @@ impl Visitor for YamlWriter<'_> {
                 emit!(self, "args:");
                 indent! {self;
                     for arg in this.args.iter_mut() {
-                        self.emit_item(arg.deref_mut());
+                        self.emit_elem(arg.deref_mut());
                     }
                 }
             }
