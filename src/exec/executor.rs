@@ -118,7 +118,6 @@ impl Executor {
         let mut unique_row_keys = HashSet::new();
         let mut unique_keys = Vec::from_iter(repeat(HashSet::<Vec<u8>>::new())
             .take(table.metadata.secondary_indices.len()));
-        let mut arena = self.arena.clone();
         for row in values.iter_mut() {
             let mut row_key = ArenaVec::new(&self.arena);
             if let Some(counter) = auto_increment_counter.as_mut() {
@@ -128,7 +127,7 @@ impl Executor {
                 counter.add_assign(1);
                 DB::encode_anonymous_row_key(counter.clone(), &mut row_key);
             }
-            let mut tuple = Tuple::with(columns, &mut arena);
+            let mut tuple = Tuple::with(columns, &self.arena);
             for col in &table.metadata.columns {
                 if let Some(order) = name_to_order.get(col.name.as_str()) {
                     let expr = &mut row[*order];
@@ -158,7 +157,7 @@ impl Executor {
             }
 
             if !table.metadata.secondary_indices.is_empty() {
-                let mut bundle = SecondaryIndexBundle::new(&tuple, &mut arena);
+                let mut bundle = SecondaryIndexBundle::new(&tuple, &self.arena);
                 //for index in &table.metadata.secondary_indices {
                 for i in 0..table.metadata.secondary_indices.len() {
                     let index = &table.metadata.secondary_indices[i];
@@ -655,13 +654,13 @@ impl Tuple {
         }
     }
 
-    pub fn with(columns: &ArenaBox<ColumnSet>, arena: &mut ArenaMut<Arena>) -> Self {
-        Self::new(columns, arena.deref_mut())
+    pub fn with(columns: &ArenaBox<ColumnSet>, arena: &ArenaMut<Arena>) -> Self {
+        Self::new(columns, arena.get_mut())
     }
 
-    pub fn with_row_key(columns: &ArenaBox<ColumnSet>, key: &[u8], arena: &mut ArenaMut<Arena>) -> Self {
-        let mut this = Self::new(columns, arena.deref_mut());
-        this.row_key = Self::new_row_key(key, arena.deref_mut());
+    pub fn with_row_key(columns: &ArenaBox<ColumnSet>, key: &[u8], arena: &ArenaMut<Arena>) -> Self {
+        let mut this = Self::new(columns, arena.get_mut());
+        this.row_key = Self::new_row_key(key, arena.get_mut());
         this
     }
 
@@ -729,7 +728,7 @@ pub struct SecondaryIndexBundle {
 }
 
 impl SecondaryIndexBundle {
-    fn new(tuple: &Tuple, arena: &mut ArenaMut<Arena>) -> Self {
+    fn new(tuple: &Tuple, arena: &ArenaMut<Arena>) -> Self {
         Self {
             row_key: tuple.row_key,
             index_keys: ArenaVec::new(arena),

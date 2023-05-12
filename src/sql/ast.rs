@@ -467,89 +467,81 @@ impl Factory {
 
     pub fn new_create_table(&self, table_name: ArenaStr, if_not_exists: bool)
                             -> ArenaBox<CreateTable> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(CreateTable {
             table_name,
             if_not_exists,
-            columns: ArenaVec::new(&mut arena),
-            primary_keys: ArenaVec::new(&mut arena),
-            secondary_indices: ArenaVec::new(&mut arena),
-        }, arena.deref_mut())
+            columns: ArenaVec::new(&self.arena),
+            primary_keys: ArenaVec::new(&self.arena),
+            secondary_indices: ArenaVec::new(&self.arena),
+        }, self.arena.get_mut())
     }
 
     pub fn new_drop_table(&self, table_name: ArenaStr, if_exists: bool) -> ArenaBox<DropTable> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(DropTable {
             table_name,
             if_exists,
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn new_create_index(&self, name: ArenaStr, unique: bool, table_name: ArenaStr)
                             -> ArenaBox<CreateIndex> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(CreateIndex {
             name,
             table_name,
             unique,
-            key_parts: ArenaVec::new(&mut arena),
-        }, arena.deref_mut())
+            key_parts: ArenaVec::new(&self.arena),
+        }, self.arena.get_mut())
     }
 
     pub fn new_drop_index(&self, name: ArenaStr, primary_key: bool, table_name: ArenaStr)
                           -> ArenaBox<DropIndex> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(DropIndex {
             name,
             primary_key,
             table_name,
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn new_collection(&self, op: SetOp, lhs: ArenaBox<dyn Relation>, rhs: ArenaBox<dyn Relation>)
                           -> ArenaBox<Collection> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(Collection {
             op,
             lhs,
             rhs,
             alias: ArenaStr::default(),
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn new_join_clause(&self, op: JoinOp, lhs: ArenaBox<dyn Relation>, rhs: ArenaBox<dyn Relation>,
                            on_clause: ArenaBox<dyn Expression>) -> ArenaBox<JoinClause> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(JoinClause {
             op,
             lhs,
             rhs,
             on_clause,
             alias: ArenaStr::default(),
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn new_from_clause(&self, name: ArenaStr) -> ArenaBox<FromClause> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(FromClause {
             name,
             alias: ArenaStr::default(),
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn new_select(&self, distinct: bool) -> ArenaBox<Select> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(Select {
             distinct,
-            columns: ArenaVec::new(&mut arena),
+            columns: ArenaVec::new(&self.arena),
             from_clause: None,
             where_clause: None,
-            group_by_clause: ArenaVec::new(&mut arena),
-            order_by_clause: ArenaVec::new(&mut arena),
+            group_by_clause: ArenaVec::new(&self.arena),
+            order_by_clause: ArenaVec::new(&self.arena),
             limit_clause: None,
             offset_clause: None,
             alias: ArenaStr::default(),
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn new_column_decl(&self, name: ArenaStr,
@@ -559,7 +551,6 @@ impl Factory {
                            type_decl: ArenaBox<TypeDeclaration>,
                            default_val: Option<ArenaBox<dyn Expression>>)
                            -> ArenaBox<ColumnDeclaration> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(ColumnDeclaration {
             name,
             auto_increment,
@@ -567,102 +558,85 @@ impl Factory {
             primary_key,
             type_decl,
             default_val,
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn new_type_decl(&self, token: Token, len: usize, len_part: usize)
                          -> ArenaBox<TypeDeclaration> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(TypeDeclaration {
             token,
             len,
             len_part,
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn new_index_decl(&self, name: ArenaStr, unique: bool) -> ArenaBox<IndexDeclaration> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(IndexDeclaration {
             name,
             unique,
-            key_parts: ArenaVec::new(&mut arena),
-        }, arena.deref_mut())
+            key_parts: ArenaVec::new(&self.arena),
+        }, self.arena.get_mut())
     }
 
     pub fn new_insert_into_table(&self, table_name: ArenaStr) -> ArenaBox<InsertIntoTable> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(InsertIntoTable {
             table_name,
-            columns_name: ArenaVec::new(&mut arena),
-            values: ArenaVec::new(&mut arena),
-        }, arena.deref_mut())
+            columns_name: ArenaVec::new(&self.arena),
+            values: ArenaVec::new(&self.arena),
+        }, self.arena.get_mut())
     }
 
     pub fn new_unary_expr(&self, op: Operator, operand: ArenaBox<dyn Expression>) -> ArenaBox<UnaryExpression> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(UnaryExpression {
             op,
             operand,
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn new_binary_expr(&self, op: Operator, lhs: ArenaBox<dyn Expression>,
                            rhs: ArenaBox<dyn Expression>) -> ArenaBox<BinaryExpression> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(BinaryExpression {
             op,
             operands: [lhs, rhs],
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn new_call_function(&self, callee_name: ArenaStr, distinct: bool) -> ArenaBox<CallFunction> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(CallFunction {
             callee_name,
             distinct,
             in_args_star: false,
             args: ArenaVec::new(&self.arena),
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn new_identifier(&self, symbol: ArenaStr) -> ArenaBox<Identifier> {
-        let mut arena = self.arena.clone();
-        ArenaBox::new(Identifier { symbol }, arena.deref_mut())
+        ArenaBox::new(Identifier { symbol }, self.arena.get_mut())
     }
 
     pub fn new_fully_qualified_name(&self, prefix: ArenaStr, suffix: ArenaStr) -> ArenaBox<FullyQualifiedName> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(FullyQualifiedName {
             prefix,
             suffix,
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn new_literal<T>(&self, data: T) -> ArenaBox<Literal<T>> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(Literal {
             data,
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn new_placeholder(&self, order: usize) -> ArenaBox<Placeholder> {
-        let mut arena = self.arena.clone();
         ArenaBox::new(Placeholder {
             order,
-        }, arena.deref_mut())
+        }, self.arena.get_mut())
     }
 
     pub fn str(&self, raw: &str) -> ArenaStr {
-        let mut arena = self.arena.clone();
-        ArenaStr::new(raw, arena.deref_mut())
+        ArenaStr::new(raw, self.arena.get_mut())
     }
 }
-
-// impl From<ArenaBox<dyn Relation + 'static>> for ArenaBox<dyn Statement> {
-//     fn from(value: ArenaBox<dyn Relation>) -> Self {
-//         Self::from_ptr(value.ptr(), value.owns())
-//     }
-// }
 
 impl<T: Statement + 'static> From<ArenaBox<T>> for ArenaBox<dyn Statement> {
     fn from(value: ArenaBox<T>) -> Self {

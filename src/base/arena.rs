@@ -8,7 +8,7 @@ use std::io::Write;
 use std::marker::PhantomData;
 use std::mem::{size_of, size_of_val};
 use std::ops::{Deref, DerefMut, Index, IndexMut};
-use std::ptr::{addr_of_mut, copy_nonoverlapping, NonNull, slice_from_raw_parts_mut, write};
+use std::ptr::{addr_of, addr_of_mut, copy_nonoverlapping, NonNull, slice_from_raw_parts_mut, write};
 use std::rc::Rc;
 
 use crate::base::utils::round_up;
@@ -20,11 +20,27 @@ pub trait Allocator {
     fn allocate(&mut self, layout: Layout) -> Result<NonNull<[u8]>, ()>;
 }
 
-// pub struct ArenaVal<T> {
-//     core: NonNull<T>,
-//     mut_count: Cell<usize>,
-//     chunk: [u8; static ]
-// }
+pub struct ArenaVal<T: Sized> {
+    core: T,
+    mut_count: Cell<usize>,
+}
+
+impl <T: Allocator + Sized> ArenaVal<T> {
+    pub fn new(arena: T) -> Self {
+        Self {
+            core: arena,
+            mut_count: Cell::new(0)
+        }
+    }
+
+    pub fn get_mut(&self) -> ArenaMut<T> {
+        let ptr = addr_of!(self.core) as *mut T;
+        self.mut_count.set(self.mut_count.get() + 1);
+        ArenaMut {
+            shadow: NonNull::new(ptr).unwrap()
+        }
+    }
+}
 
 pub struct ArenaRef<T> {
     core: NonNull<T>,
@@ -75,6 +91,9 @@ impl <T: Allocator> ArenaMut<T> {
         this.mut_count.set(this.mut_count.get() + 1);
         Self { shadow: this.core.clone() }
     }
+
+    pub fn get_ref(&self) -> &T { unsafe { self.shadow.as_ref() } }
+    pub fn get_mut(&self) -> &mut T { unsafe { &mut *self.shadow.as_ptr() } }
 }
 
 impl <T> Deref for ArenaMut<T> {
@@ -378,8 +397,8 @@ impl ArenaStr {
         Self::new(str.as_str(), alloc)
     }
 
-    pub fn from_arena(str: &str, arena: &mut ArenaMut<Arena>) -> Self {
-        Self::new(str, arena.deref_mut())
+    pub fn from_arena(str: &str, arena: &ArenaMut<Arena>) -> Self {
+        Self::new(str, arena.get_mut())
     }
 
     pub fn to_string(&self) -> String {

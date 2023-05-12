@@ -69,7 +69,7 @@ impl RangeScanOps {
         }
     }
 
-    fn next_row<F>(&self, iter: &mut dyn storage::Iterator, mut each_col: F, arena: &mut ArenaMut<Arena>) -> Result<()>
+    fn next_row<F>(&self, iter: &mut dyn storage::Iterator, mut each_col: F, arena: &ArenaMut<Arena>) -> Result<()>
         where F: FnMut(&[u8], &[u8]) {
         debug_assert!(iter.key().len() >= DB::PRIMARY_KEY_ID_BYTES.len() + DB::COL_ID_LEN);
         let row_key_ref = &iter.key()[..iter.key().len() - DB::COL_ID_LEN];
@@ -134,16 +134,16 @@ impl PhysicalPlanOps for RangeScanOps {
             return None;
         }
 
-        let mut arena = zone.get_mut();
-        let mut tuple = Tuple::with(&self.projected_columns, &mut arena);
+        let arena = zone.get_mut();
+        let mut tuple = Tuple::with(&self.projected_columns, &arena);
         let rs = self.next_row(iter.deref_mut(), |key, v| {
             let (_, col_id) = DB::parse_key(key);
             if let Some(index) = self.col_id_to_order.get(&col_id) {
                 let ty = &tuple.columns().columns[*index].ty;
-                let value = DB::decode_column_value(ty, v, arena.deref_mut());
+                let value = DB::decode_column_value(ty, v, arena.get_mut());
                 tuple.set(*index, value);
             }
-        }, &mut zone.get_mut());
+        }, &arena);
         if let Err(e) = rs {
             feedback.catch_error(e);
             None

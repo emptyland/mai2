@@ -22,9 +22,9 @@ pub struct InlineSkipList<'a, Cmp> {
 }
 
 impl<'a, Cmp: for<'b> Comparing<&'b [u8]>> InlineSkipList<'a, Cmp> {
-    pub fn new(mut arena: ArenaMut<Arena>, comparator: Cmp) -> Self {
+    pub fn new(arena: ArenaMut<Arena>, comparator: Cmp) -> Self {
         let head = unsafe {
-            InlineNode::new(MAX_HEIGHT, arena.deref_mut(), 0, 0)
+            InlineNode::new(MAX_HEIGHT, arena.get_mut(), 0, 0)
         };
         Self {
             arena,
@@ -43,9 +43,8 @@ impl<'a, Cmp: for<'b> Comparing<&'b [u8]>> InlineSkipList<'a, Cmp> {
     }
 
     pub fn insert(&self, tag: Tag, sequence_number: u64, key: &[u8], value: &[u8]) {
-        let mut arena = self.arena.clone();
         let node = InlineNode::with_key_value(MAX_HEIGHT,
-                                              arena.deref_mut(),
+                                              self.arena.get_mut(),
                                               tag, sequence_number, key, value);
         self.put(node)
     }
@@ -419,7 +418,7 @@ mod tests {
     #[test]
     fn seek_keys() {
         let pairs = [("1", "a"), ("11", "b"), ("111", "c"), ("1111", "d")];
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_ref();
         let mut map = InlineSkipList::new(arena.get_mut(), new_key_cmp());
 
         add_key_value_pairs(&mut map, 1, &pairs);
@@ -436,7 +435,7 @@ mod tests {
     #[test]
     fn large_insertion() {
         let n = 10000;
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_ref();
         let map = InlineSkipList::new(arena.get_mut(), new_key_cmp());
 
         let mut sn = 1;

@@ -50,7 +50,7 @@ impl MemoryTable {
     }
 
     pub fn iter(this: Arc<MemoryTable>) -> IteratorImpl {
-        let table_ptr = addr_of!(this.table);
+        //let table_ptr = addr_of!(this.table);
         IteratorImpl {
             owns: this.clone(),
             status: Status::Ok,

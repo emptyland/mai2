@@ -898,7 +898,7 @@ impl DB {
     pub fn _test_get_row(&self, table_name: &String,
                          columns_set: &ArenaBox<ColumnSet>,
                          row_key: &[u8],
-                         arena: &mut ArenaMut<Arena>) -> Result<Tuple> {
+                         arena: &ArenaMut<Arena>) -> Result<Tuple> {
         let tables = self.tables_handle.read().unwrap();
         let table = tables.get(table_name).unwrap().clone();
         let mut key = Vec::new();
@@ -912,7 +912,7 @@ impl DB {
 
             let value = self.storage.get_pinnable(&rd_opts, &table.column_family, &key)?;
             tuple.set(col.order, Self::decode_column_value(&col.ty, value.value(),
-                                                           arena.deref_mut()));
+                                                           arena.get_mut()));
             key.truncate(row_key.len() + 4);
         }
         Ok(tuple)
