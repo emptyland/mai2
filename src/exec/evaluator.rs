@@ -6,11 +6,11 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
 use crate::{Corrupting, Result, Status};
-use crate::base::{Arena, ArenaStr};
+use crate::base::{Arena, ArenaMut, ArenaStr};
 use crate::sql::ast::{BinaryExpression, CallFunction, Collection, CreateIndex, CreateTable, DropIndex, DropTable, Expression, FromClause, FullyQualifiedName, Identifier, InLiteralSet, InRelation, InsertIntoTable, JoinClause, Literal, Operator, Placeholder, Select, UnaryExpression, Visitor};
 
 pub struct Evaluator {
-    arena: Rc<RefCell<Arena>>,
+    arena: ArenaMut<Arena>,
     rs: Status,
     env: VecDeque<Arc<dyn Context>>,
     stack: VecDeque<Value>,
@@ -40,7 +40,7 @@ impl Value {
 }
 
 impl Evaluator {
-    pub fn new(arena: &Rc<RefCell<Arena>>) -> Self {
+    pub fn new(arena: &ArenaMut<Arena>) -> Self {
         Self {
             arena: arena.clone(),
             rs: Status::Ok,

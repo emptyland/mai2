@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::sync::atomic::Ordering;
 
-use crate::base::{Allocator, Arena, ArenaBox, ArenaStr, ArenaVec};
+use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaRef, ArenaStr, ArenaVec};
 use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata};
 use crate::exec::from_sql_result;
 use crate::sql::ast::{BinaryExpression, CallFunction, Collection, CreateIndex, CreateTable, DropIndex, DropTable, Expression, Factory, FromClause, FullyQualifiedName, Identifier, InLiteralSet, InRelation, InsertIntoTable, JoinClause, Literal, Placeholder, Select, Statement, TypeDeclaration, UnaryExpression, Visitor};
@@ -24,7 +24,7 @@ use crate::sql::serialize::serialize_yaml_to_string;
 
 pub struct Executor {
     pub db: Weak<DB>,
-    arena: Rc<RefCell<Arena>>,
+    arena: ArenaMut<Arena>,
     prepared_stmts: VecDeque<ArenaBox<PreparedStatement>>,
     affected_rows: u64,
     rs: Result<()>,
@@ -34,19 +34,19 @@ impl Executor {
     pub fn new(db: &Weak<DB>) -> Self {
         Self {
             db: db.clone(),
-            arena: Arena::new_rc(),
+            arena: Arena::new_ref().get_mut(),
             prepared_stmts: VecDeque::default(),
             affected_rows: 0,
             rs: Ok(()),
         }
     }
 
-    pub fn execute(&mut self, reader: &mut dyn Read, arena: &Rc<RefCell<Arena>>) -> Result<u64> {
+    pub fn execute(&mut self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<u64> {
         // clear latest result;
         self.rs = Ok(());
         self.arena = arena.clone();
 
-        let factory = Factory::from(arena);
+        let factory = Factory::new(arena);
         let mut parser = from_sql_result(Parser::new(reader, factory))?;
         let mut stmts = from_sql_result(parser.parse())?;
         for i in 0..stmts.len() {
@@ -58,7 +58,7 @@ impl Executor {
     }
 
     pub fn execute_prepared_statement(&mut self, prepared: &mut ArenaBox<PreparedStatement>,
-                                      arena: &Rc<RefCell<Arena>>) -> Result<u64> {
+                                      arena: &ArenaMut<Arena>) -> Result<u64> {
         if !prepared.all_bound() {
             return Err(Status::corrupted("Not all value bound in PreparedStatement."));
         }
@@ -72,13 +72,13 @@ impl Executor {
         Ok(self.affected_rows)
     }
 
-    pub fn prepare(&mut self, reader: &mut dyn Read, arena: &Rc<RefCell<Arena>>)
+    pub fn prepare(&mut self, reader: &mut dyn Read, arena: &ArenaMut<Arena>)
                    -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
         // clear latest result;
         self.rs = Ok(());
         self.arena = arena.clone();
 
-        let factory = Factory::from(arena);
+        let factory = Factory::new(arena);
         let mut parser = from_sql_result(Parser::new(reader, factory))?;
         let stmts = from_sql_result(
             parser.parse_with_processor(|stmt, n_params| {
@@ -86,7 +86,7 @@ impl Executor {
                     statement: stmt,
                     parameters: ArenaVec::with_init(arena, |_| { Value::Undefined }, n_params),
                 };
-                ArenaBox::new(ps, arena)
+                ArenaBox::new(ps, arena.clone().deref_mut())
             }))?;
         Ok(stmts)
     }
@@ -118,6 +118,7 @@ impl Executor {
         let mut unique_row_keys = HashSet::new();
         let mut unique_keys = Vec::from_iter(repeat(HashSet::<Vec<u8>>::new())
             .take(table.metadata.secondary_indices.len()));
+        let mut arena = self.arena.clone();
         for row in values.iter_mut() {
             let mut row_key = ArenaVec::new(&self.arena);
             if let Some(counter) = auto_increment_counter.as_mut() {
@@ -127,7 +128,7 @@ impl Executor {
                 counter.add_assign(1);
                 DB::encode_anonymous_row_key(counter.clone(), &mut row_key);
             }
-            let mut tuple = Tuple::new(columns, &self.arena);
+            let mut tuple = Tuple::with(columns, &mut arena);
             for col in &table.metadata.columns {
                 if let Some(order) = name_to_order.get(col.name.as_str()) {
                     let expr = &mut row[*order];
@@ -157,7 +158,7 @@ impl Executor {
             }
 
             if !table.metadata.secondary_indices.is_empty() {
-                let mut bundle = SecondaryIndexBundle::new(&tuple, &self.arena);
+                let mut bundle = SecondaryIndexBundle::new(&tuple, &mut arena);
                 //for index in &table.metadata.secondary_indices {
                 for i in 0..table.metadata.secondary_indices.len() {
                     let index = &table.metadata.secondary_indices[i];
@@ -482,8 +483,8 @@ impl Visitor for Executor {
         let mut insertion_cols = Vec::new();
         let mut columns = {
             let tmp = ColumnSet::new(
-                table.metadata.name.as_str(), &self.arena);
-            ArenaBox::new(tmp, &self.arena)
+                table.metadata.name.as_str(), &mut self.arena);
+            ArenaBox::new(tmp, self.arena.deref_mut())
         };
         for col_name in &this.columns_name {
             match table.get_col_by_name(&col_name.to_string()) {
@@ -581,17 +582,18 @@ impl Visitor for Executor {
 }
 
 pub struct ColumnSet {
-    arena: Rc<RefCell<Arena>>,
     pub schema: ArenaStr,
     pub columns: ArenaVec<Column>,
+    arena: ArenaMut<Arena>,
 }
 
 impl ColumnSet {
-    pub fn new(schema: &str, arena: &Rc<RefCell<Arena>>) -> Self {
+    pub fn new(schema: &str, arena_mut: &ArenaMut<Arena>) -> Self {
+        let mut arena = arena_mut.clone();
         Self {
-            arena: arena.clone(),
-            schema: ArenaStr::from_arena(schema, arena),
-            columns: ArenaVec::new(arena),
+            schema: ArenaStr::from_arena(schema, &mut arena),
+            columns: ArenaVec::new(&arena),
+            arena,
         }
     }
 
@@ -602,8 +604,8 @@ impl ColumnSet {
     pub fn append(&mut self, name: &str, desc: &str, id: u32, ty: ColumnType) {
         let order = self.columns.len();
         self.columns.push(Column {
-            name: ArenaStr::from_arena(name, &self.arena),
-            desc: ArenaStr::from_arena(desc, &self.arena),
+            name: ArenaStr::from_arena(name, &mut self.arena),
+            desc: ArenaStr::from_arena(desc, &mut self.arena),
             id,
             ty,
             order,
@@ -623,18 +625,18 @@ pub struct Column {
 pub struct Tuple {
     row_key: NonNull<[u8]>,
     items: NonNull<[Value]>,
-    columns_set: ArenaBox<ColumnSet>,
+    columns_set: NonNull<ColumnSet>,
 }
 
 static EMPTY_ARRAY_DUMMY: [u8; 0] = [0; 0];
 
 impl Tuple {
-    pub fn new(columns: &ArenaBox<ColumnSet>, arena: &Rc<RefCell<Arena>>) -> Self {
+    pub fn new<A: Allocator + ?Sized>(columns: &ArenaBox<ColumnSet>, arena: &mut A) -> Self {
         let len = columns.columns.len();
         let value_layout = Layout::new::<Value>();
         let layout = Layout::from_size_align(value_layout.size() * len, value_layout.align()).unwrap();
         let mut items = {
-            let chunk = arena.borrow_mut().allocate(layout).unwrap();
+            let chunk = arena.allocate(layout).unwrap();
             let addr = chunk.as_ptr() as *mut Value;
             let ptr = slice_from_raw_parts_mut(addr, len);
             NonNull::new(ptr).unwrap()
@@ -649,13 +651,17 @@ impl Tuple {
         Self {
             row_key,
             items,
-            columns_set: columns.clone(),
+            columns_set: columns.ptr(),
         }
     }
 
-    pub fn from(columns: &ArenaBox<ColumnSet>, key: &[u8], arena: &Rc<RefCell<Arena>>) -> Self {
-        let mut this = Self::new(columns, arena);
-        this.row_key = Self::new_row_key(key, arena);
+    pub fn with(columns: &ArenaBox<ColumnSet>, arena: &mut ArenaMut<Arena>) -> Self {
+        Self::new(columns, arena.deref_mut())
+    }
+
+    pub fn with_row_key(columns: &ArenaBox<ColumnSet>, key: &[u8], arena: &mut ArenaMut<Arena>) -> Self {
+        let mut this = Self::new(columns, arena.deref_mut());
+        this.row_key = Self::new_row_key(key, arena.deref_mut());
         this
     }
 
@@ -667,13 +673,13 @@ impl Tuple {
         }
     }
 
-    fn new_row_key(key: &[u8], arena: &Rc<RefCell<Arena>>) -> NonNull<[u8]> {
+    fn new_row_key(key: &[u8], arena: &mut dyn Allocator) -> NonNull<[u8]> {
         let row_key: NonNull<[u8]> = if key.is_empty() {
             let ptr = addr_of!(EMPTY_ARRAY_DUMMY) as *mut u8;
             NonNull::new(slice_from_raw_parts_mut(ptr, 0)).unwrap()
         } else {
             let layout = Layout::from_size_align(key.len(), 4).unwrap();
-            arena.borrow_mut().allocate(layout).unwrap()
+            arena.allocate(layout).unwrap()
         };
         unsafe {
             if !key.is_empty() {
@@ -684,7 +690,7 @@ impl Tuple {
         row_key
     }
 
-    pub fn columns(&self) -> &ArenaBox<ColumnSet> { &self.columns_set }
+    pub fn columns(&self) -> &ColumnSet { unsafe { self.columns_set.as_ref() } }
 
     pub fn get_null(&self, i: usize) -> bool {
         self.get(i).is_null()
@@ -723,10 +729,10 @@ pub struct SecondaryIndexBundle {
 }
 
 impl SecondaryIndexBundle {
-    fn new(tuple: &Tuple, arena: &Rc<RefCell<Arena>>) -> Self {
+    fn new(tuple: &Tuple, arena: &mut ArenaMut<Arena>) -> Self {
         Self {
             row_key: tuple.row_key,
-            index_keys: ArenaVec::new(&arena),
+            index_keys: ArenaVec::new(arena),
         }
     }
 
@@ -737,11 +743,18 @@ impl SecondaryIndexBundle {
 
 struct TupleContext {
     prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+
+    symbols: HashMap<String, usize>,
+    fully_qualified_symbols: HashMap<String, usize>,
 }
 
 impl TupleContext {
     pub fn new(prepared_stmt: Option<ArenaBox<PreparedStatement>>) -> Self {
-        Self { prepared_stmt }
+        Self {
+            prepared_stmt,
+            symbols: HashMap::default(),
+            fully_qualified_symbols: HashMap::default(),
+        }
     }
 }
 

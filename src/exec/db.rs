@@ -1,4 +1,3 @@
-use std::arch::x86_64::_mm_cmpestro;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::default::Default;
@@ -14,7 +13,7 @@ use rusty_pool::ThreadPool;
 
 use crate::exec::connection::Connection;
 use crate::{Corrupting, log_debug, Status, storage};
-use crate::base::{Allocator, Arena, ArenaBox, ArenaStr, Logger};
+use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, Logger};
 use crate::exec::evaluator::Value;
 use crate::exec::executor::{ColumnSet, SecondaryIndexBundle, Tuple};
 use crate::exec::locking::{LockingInstance, LockingManagement};
@@ -57,7 +56,7 @@ impl DB {
 
     const DATA_COL_TABLE_PREFIX: &'static str = "__table__";
 
-    const PRIMARY_KEY_ID: u32 = 0;
+    pub const PRIMARY_KEY_ID: u32 = 0;
     pub const PRIMARY_KEY_ID_BYTES: [u8; 4] = Self::PRIMARY_KEY_ID.to_be_bytes();
 
     const NULL_BYTE: u8 = 0xff;
@@ -71,7 +70,7 @@ impl DB {
 
     const VARCHAR_SEGMENT_LEN: usize = 9;
 
-    const COL_ID_LEN: usize = size_of::<u32>();
+    pub const COL_ID_LEN: usize = size_of::<u32>();
 
     pub const ANONYMOUS_ROW_KEY_KEY: &'static [u8] = &[
         0xff, 0xff, 0xff, 0xff, // index id tag
@@ -402,7 +401,7 @@ impl DB {
             tmp
         };
 
-        let mut arena = Arena::new_rc();
+        let mut arena = Arena::new_ref();
 
         let mut affected_rows = 0;
         let mut col_vals = Vec::from_iter(iter::repeat(Value::Null)
@@ -431,7 +430,7 @@ impl DB {
 
             if let Some((idx, col)) = col_id_to_idx.get(&col_id) {
                 col_vals[*idx] = Self::decode_column_value(&col.ty, iter.value(),
-                                                           arena.borrow_mut().deref_mut());
+                                                           arena.get_mut().deref_mut());
             }
 
             let rk = &iter.key()[..iter.key().len() - Self::COL_ID_LEN];
@@ -454,8 +453,8 @@ impl DB {
                 }
                 debug_assert_eq!(row_key, rk);
 
-                if arena.borrow().rss_in_bytes > 10 * MB {
-                    arena = Arena::new_rc();
+                if arena.rss_in_bytes > 10 * MB {
+                    arena = Arena::new_ref();
                 }
             }
             iter.move_next();
@@ -846,6 +845,13 @@ impl DB {
         }
     }
 
+    pub fn parse_key(key: &[u8]) -> (u64, u32) {
+        debug_assert!(key.len() > Self::PRIMARY_KEY_ID_BYTES.len() + Self::COL_ID_LEN);
+        let key_id = u32::from_be_bytes((&key[..Self::PRIMARY_KEY_ID_BYTES.len()]).try_into().unwrap()) as u64;
+        let col_id = u32::from_be_bytes((&key[key.len() - Self::COL_ID_LEN..]).try_into().unwrap());
+        (key_id, col_id)
+    }
+
     fn get_table_handle(&self, name: &String) -> Option<(Arc<dyn ColumnFamily>, Arc<TableMetadata>)> {
         let tables = self.tables_handle.read().unwrap();
         match tables.get(name) {
@@ -892,21 +898,21 @@ impl DB {
     pub fn _test_get_row(&self, table_name: &String,
                          columns_set: &ArenaBox<ColumnSet>,
                          row_key: &[u8],
-                         arena: &Rc<RefCell<Arena>>) -> Result<Tuple> {
+                         arena: &mut ArenaMut<Arena>) -> Result<Tuple> {
         let tables = self.tables_handle.read().unwrap();
         let table = tables.get(table_name).unwrap().clone();
         let mut key = Vec::new();
         key.write(&Self::PRIMARY_KEY_ID_BYTES).unwrap();
         key.write(row_key).unwrap();
         let rd_opts = ReadOptions::default();
-        let mut tuple = Tuple::from(&columns_set, &key, arena);
+        let mut tuple = Tuple::with_row_key(&columns_set, &key, arena);
         for col in &columns_set.columns {
             let col_meta = table.get_col_by_name(&col.name.to_string()).unwrap();
             key.write(&col_meta.id.to_be_bytes()).unwrap();
 
             let value = self.storage.get_pinnable(&rd_opts, &table.column_family, &key)?;
             tuple.set(col.order, Self::decode_column_value(&col.ty, value.value(),
-                                                           arena.borrow_mut().deref_mut()));
+                                                           arena.deref_mut()));
             key.truncate(row_key.len() + 4);
         }
         Ok(tuple)
@@ -1106,9 +1112,9 @@ mod tests {
         let _junk = JunkFilesCleaner::new("tests/db100");
         let db = DB::open("tests".to_string(), "db100".to_string())?;
 
-        let arena = Arena::new_rc();
+        let arena = Arena::new_ref();
         let conn = db.connect();
-        conn.execute_str("create table a { a tinyint(1) not null } ", &arena)?;
+        conn.execute_str("create table a { a tinyint(1) not null } ", &arena.get_mut())?;
 
         let (cf, tb) = db.get_table_handle(&"a".to_string()).unwrap();
         assert_eq!("__table__1", cf.name());
@@ -1118,15 +1124,15 @@ mod tests {
 
     #[test]
     fn encode_varchar_key() {
-        let arena = Arena::new_rc();
-        let s = ArenaStr::from_arena("", &arena);
+        let arena = Arena::new_ref();
+        let s = ArenaStr::from_arena("", &mut arena.get_mut());
         let mut buf = Vec::new();
         DB::encode_varchar_ty_for_key(&s, &mut buf);
 
         assert_eq!(0, buf.len());
 
         buf.clear();
-        let s = ArenaStr::from_arena("a", &arena);
+        let s = ArenaStr::from_arena("a", &mut arena.get_mut());
         DB::encode_varchar_ty_for_key(&s, &mut buf);
 
         assert_eq!(9, buf.len());
@@ -1144,7 +1150,7 @@ mod tests {
         assert_eq!(&raw, buf.as_slice());
 
         buf.clear();
-        let s = ArenaStr::from_arena("中文", &arena);
+        let s = ArenaStr::from_arena("中文", &mut arena.get_mut());
         DB::encode_varchar_ty_for_key(&s, &mut buf);
 
         assert_eq!(9, buf.len());
@@ -1162,7 +1168,7 @@ mod tests {
         assert_eq!(raw, buf.as_slice());
 
         buf.clear();
-        let s = ArenaStr::from_arena("123456789", &arena);
+        let s = ArenaStr::from_arena("123456789", &mut arena.get_mut());
         DB::encode_varchar_ty_for_key(&s, &mut buf);
 
         assert_eq!(18, buf.len());
@@ -1192,7 +1198,7 @@ mod tests {
     #[test]
     fn recover() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db101");
-        let arena = Arena::new_rc();
+        let arena = Arena::new_ref();
         {
             let db = DB::open("tests".to_string(), "db101".to_string())?;
             let sql = " create table t1 {\n\
@@ -1200,7 +1206,7 @@ mod tests {
                 b char(6)\n\
             }\n";
             let conn = db.connect();
-            conn.execute_str(sql, &arena)?;
+            conn.execute_str(sql, &mut arena.get_mut())?;
         }
 
         let db = DB::open("tests".to_string(), "db101".to_string())?;
@@ -1214,7 +1220,7 @@ mod tests {
     #[test]
     fn create_before_drop_table() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db102");
-        let arena = Arena::new_rc();
+        let arena = Arena::new_ref();
         let db = DB::open("tests".to_string(), "db102".to_string())?;
         let sql = " create table t1 {\n\
                 a tinyint(1) not null,\n\
@@ -1223,7 +1229,7 @@ mod tests {
             drop table if exists t1;\n\
             ";
         let conn = db.connect();
-        conn.execute_str(sql, &arena)?;
+        conn.execute_str(sql, &mut arena.get_mut())?;
         assert!(db.get_table_handle(&"t1".to_string()).is_none());
         Ok(())
     }
@@ -1231,7 +1237,8 @@ mod tests {
     #[test]
     fn insert_into_table() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db103");
-        let arena = Arena::new_rc();
+        let arena_ref = Arena::new_ref();
+        let mut arena = arena_ref.get_mut();
         let db = DB::open("tests".to_string(), "db103".to_string())?;
         let sql = " create table t1 {\n\
                 a int(11) not null,\n\
@@ -1249,20 +1256,20 @@ mod tests {
         stmt.bind_i64(1, 2);
         conn.execute_prepared_statement(&mut stmt)?;
 
-        let mut column_set = ArenaBox::new(ColumnSet::new("t1", &arena), &arena);
+        let mut column_set = ArenaBox::new(ColumnSet::new("t1", &mut arena), arena.deref_mut());
         column_set.append_with_name("a", ColumnType::Int(11));
         column_set.append_with_name("b", ColumnType::Int(11));
 
         let tuple = db._test_get_row(&"t1".to_string(),
                                      &column_set,
-                                     &1i64.to_be_bytes(), &arena)?;
+                                     &1i64.to_be_bytes(), &mut arena)?;
         assert_eq!(Some(1), tuple.get_i64(0));
         assert_eq!(Some(2), tuple.get_i64(1));
         drop(tuple);
 
         let tuple = db._test_get_row(&"t1".to_string(),
                                      &column_set,
-                                     &2i64.to_be_bytes(), &arena)?;
+                                     &2i64.to_be_bytes(), &mut arena)?;
         assert_eq!(Some(3), tuple.get_i64(0));
         assert_eq!(Some(4), tuple.get_i64(1));
         drop(tuple);
@@ -1272,7 +1279,8 @@ mod tests {
     #[test]
     fn insert_with_auto_increment() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db104");
-        let arena = Arena::new_rc();
+        let arena_ref = Arena::new_ref();
+        let mut arena = arena_ref.get_mut();
         let db = DB::open("tests".to_string(), "db104".to_string())?;
         let sql = " create table t1 {\n\
                 a int(11) primary key auto_increment,\n\
@@ -1284,21 +1292,21 @@ mod tests {
         let conn = db.connect();
         conn.execute_str(sql, &arena)?;
 
-        let mut column_set = ArenaBox::new(ColumnSet::new("t1", &arena), &arena);
+        let mut column_set = ArenaBox::new(ColumnSet::new("t1", &mut arena), arena.deref_mut());
         column_set.append_with_name("a", ColumnType::Int(11));
         column_set.append_with_name("b", ColumnType::Int(11));
         column_set.append_with_name("c", ColumnType::Int(11));
 
         let tuple = db._test_get_row(&"t1".to_string(),
                                      &column_set,
-                                     &1i64.to_be_bytes(), &arena)?;
+                                     &1i64.to_be_bytes(), &mut arena)?;
         assert_eq!(Some(1), tuple.get_i64(0));
         assert_eq!(Some(1), tuple.get_i64(1));
         assert_eq!(Some(2), tuple.get_i64(2));
 
         let tuple = db._test_get_row(&"t1".to_string(),
                                      &column_set,
-                                     &2i64.to_be_bytes(), &arena)?;
+                                     &2i64.to_be_bytes(), &mut arena)?;
         assert_eq!(Some(2), tuple.get_i64(0));
         assert_eq!(Some(3), tuple.get_i64(1));
         assert_eq!(Some(4), tuple.get_i64(2));
@@ -1308,7 +1316,8 @@ mod tests {
     #[test]
     fn create_table_with_index() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db105");
-        let arena = Arena::new_rc();
+        let arena_ref = Arena::new_ref();
+        let arena = arena_ref.get_mut();
         let db = DB::open("tests".to_string(), "db105".to_string())?;
         let sql = " create table t1 {\n\
                 a int(11) primary key auto_increment,\n\
@@ -1331,7 +1340,7 @@ mod tests {
     #[test]
     fn insert_with_secondary_index() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db106");
-        let arena = Arena::new_rc();
+        let arena = Arena::new_ref();
         let db = DB::open("tests".to_string(), "db106".to_string())?;
         let sql = " create table t1 {\n\
                 a int primary key auto_increment,\n\
@@ -1344,7 +1353,7 @@ mod tests {
             insert into table t1(a,b,c,d) values (1,2,3,4), (5,6,7,8);\n\
             ";
         let conn = db.connect();
-        conn.execute_str(sql, &arena)?;
+        conn.execute_str(sql, &arena.get_mut())?;
 
 
         Ok(())
@@ -1353,7 +1362,7 @@ mod tests {
     #[test]
     fn insert_with_char_varchar_index() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db107");
-        let arena = Arena::new_rc();
+        let arena = Arena::new_ref();
         let db = DB::open("tests".to_string(), "db107".to_string())?;
         let sql = " create table t1 {\n\
                 a int primary key auto_increment,\n\
@@ -1365,7 +1374,7 @@ mod tests {
             insert into table t1(a,b,c) values (1,\"\",\"\"), (5,NULL,\"111111112222\");\n\
             ";
         let conn = db.connect();
-        conn.execute_str(sql, &arena)?;
+        conn.execute_str(sql, &arena.get_mut())?;
 
         Ok(())
     }
@@ -1373,7 +1382,7 @@ mod tests {
     #[test]
     fn insert_duplicated_row_key() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db108");
-        let arena = Arena::new_rc();
+        let arena = Arena::new_ref();
         let db = DB::open("tests".to_string(), "db108".to_string())?;
         let sql = " create table t1 {\n\
                 a int primary key auto_increment,\n\
@@ -1383,7 +1392,7 @@ mod tests {
             insert into table t1(a,b) values (1, NULL);\n\
             ";
         let conn = db.connect();
-        let rs = conn.execute_str(sql, &arena);
+        let rs = conn.execute_str(sql, &arena.get_mut());
         assert!(rs.is_err());
         assert_eq!(Status::Corruption("Duplicated primary key, must be unique.".to_string()),
                    rs.unwrap_err());
@@ -1393,7 +1402,7 @@ mod tests {
     #[test]
     fn insert_duplicated_row_key_at_same_statement() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db109");
-        let arena = Arena::new_rc();
+        let arena = Arena::new_ref();
         let db = DB::open("tests".to_string(), "db109".to_string())?;
         let sql = " create table t1 {\n\
                 a int primary key auto_increment,\n\
@@ -1402,7 +1411,7 @@ mod tests {
             insert into table t1(a,b) values (1, NULL), (1, NULL);\n\
             ";
         let conn = db.connect();
-        let rs = conn.execute_str(sql, &arena);
+        let rs = conn.execute_str(sql, &arena.get_mut());
         assert!(rs.is_err());
         assert_eq!(Status::Corruption("Duplicated primary key, must be unique.".to_string()),
                    rs.unwrap_err());
@@ -1412,7 +1421,7 @@ mod tests {
     #[test]
     fn large_insert_into_table() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db110");
-        let arena = Arena::new_rc();
+        let arena = Arena::new_ref();
         let db = DB::open("tests".to_string(), "db110".to_string())?;
         let n = 300000;
         let conn = db.connect();
@@ -1421,10 +1430,10 @@ mod tests {
                 b char(9)\n\
             };\n\
             ";
-        conn.execute_str(sql, &arena)?;
+        conn.execute_str(sql, &arena.get_mut())?;
 
         let sql = "insert into table t1(a,b) values (?, ?)";
-        let mut stmt = conn.prepare_str(sql, &arena)?.first().cloned().unwrap();
+        let mut stmt = conn.prepare_str(sql, &arena.get_mut())?.first().cloned().unwrap();
 
         let jiffies = db.env.current_time_mills();
         for i in 0..n {
@@ -1441,7 +1450,8 @@ mod tests {
     #[test]
     fn create_index_before_inserting() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db111");
-        let arena = Arena::new_rc();
+        let arena_ref = Arena::new_ref();
+        let mut arena = arena_ref.get_mut();
         let db = DB::open("tests".to_string(), "db111".to_string())?;
         let n = 1000;
         let conn = db.connect();
@@ -1456,7 +1466,7 @@ mod tests {
         let mut stmt = conn.prepare_str(sql, &arena)?.first().cloned().unwrap();
         for i in 0..n {
             stmt.bind_i64(0, i);
-            stmt.bind_string(1, format!("{:03}", i), arena.borrow_mut().deref_mut());
+            stmt.bind_string(1, format!("{:03}", i), arena.deref_mut());
             conn.execute_prepared_statement(&mut stmt)?;
         }
 
@@ -1497,7 +1507,7 @@ mod tests {
     #[test]
     fn drop_index_before_inserting() -> Result<()> {
         let _junk = JunkFilesCleaner::new("tests/db112");
-        let arena = Arena::new_rc();
+        let arena = Arena::new_ref();
         let db = DB::open("tests".to_string(), "db112".to_string())?;
         //let n = 10000;
         let conn = db.connect();
@@ -1508,10 +1518,10 @@ mod tests {
             };\n\
             insert into table t1(b) values (\"aaa\"),(\"bbb\"),(\"ccc\");\n\
             ";
-        assert_eq!(3, conn.execute_str(sql, &arena)?);
+        assert_eq!(3, conn.execute_str(sql, &arena.get_mut())?);
 
         let sql = "drop index idx_b on t1";
-        assert_eq!(3, conn.execute_str(sql, &arena)?);
+        assert_eq!(3, conn.execute_str(sql, &arena.get_mut())?);
         Ok(())
     }
 }

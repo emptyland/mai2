@@ -14,7 +14,7 @@ pub struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     pub fn new(reader: &'a mut dyn Read, factory: Factory) -> Result<Self> {
-        let mut lexer = Lexer::new(reader, &factory.arena);
+        let mut lexer = Lexer::new(reader, factory.arena.clone());
         let lookahead = lexer.next()?;
         Ok(Self {
             factory,
@@ -28,8 +28,8 @@ impl<'a> Parser<'a> {
         self.parse_with_processor(|x, _| { x })
     }
 
-    pub fn parse_with_processor<T, Fn>(&mut self, proc: Fn) -> Result<ArenaVec<T>>
-        where Fn: FnOnce(ArenaBox<dyn Statement>, usize) -> T + Copy {
+    pub fn parse_with_processor<T, Fn>(&mut self, mut proc: Fn) -> Result<ArenaVec<T>>
+        where Fn: FnMut(ArenaBox<dyn Statement>, usize) -> T {
         let mut stmts: ArenaVec<T> = ArenaVec::new(&self.factory.arena);
         loop {
             self.placeholder_order = 0;
@@ -265,7 +265,7 @@ impl<'a> Parser<'a> {
     fn parse_drop_index(&mut self, _start_pos: SourcePosition) -> Result<ArenaBox<DropIndex>> {
         self.match_expected(Token::Index)?;
         let (primary_key, name) = if self.test(Token::Primary)? {
-            (true, ArenaStr::from_arena("PRIMARY", &self.factory.arena))
+            (true, self.factory.str("PRIMARY"))
         } else {
             (false, self.match_id()?)
         };
@@ -669,7 +669,7 @@ mod tests {
     use std::cell::RefCell;
     use std::ops::DerefMut;
     use std::rc::Rc;
-    use crate::base::Arena;
+    use crate::base::{Arena, ArenaMut};
     use crate::storage::MemorySequentialFile;
     use super::*;
     use crate::sql::ast::Factory;
@@ -677,7 +677,8 @@ mod tests {
 
     #[test]
     fn sanity() -> Result<()> {
-        let factory = Factory::new();
+        let arena = Arena::new_ref();
+        let factory = Factory::new(&arena.get_mut());
         let txt = Vec::from("create table a { a char(122) }");
         let mut file = MemorySequentialFile::new(txt);
         let mut parser = Parser::new(&mut file, factory)?;
@@ -696,8 +697,8 @@ mod tests {
 
     #[test]
     fn insert_into_table() -> Result<()> {
-        let arena = Arena::new_rc();
-        let yaml = parse_all_to_yaml(&arena, "insert into table t1(a,b,c) values(1,2,3)")?;
+        let arena = Arena::new_ref();
+        let yaml = parse_all_to_yaml(arena.get_mut(), "insert into table t1(a,b,c) values(1,2,3)")?;
         println!("{}", yaml);
         assert_eq!("InsertIntoTable
   table_name: t1
@@ -716,8 +717,8 @@ mod tests {
 
     #[test]
     fn simple_select() -> Result<()> {
-        let arena = Arena::new_rc();
-        let yaml = parse_all_to_yaml(&arena, "select 1 as a")?;
+        let arena = Arena::new_ref();
+        let yaml = parse_all_to_yaml(arena.get_mut(), "select 1 as a")?;
         println!("{}", yaml);
         assert_eq!("Select:
   distinct: false
@@ -731,8 +732,8 @@ mod tests {
 
     #[test]
     fn simple_select_with_from_clause() -> Result<()> {
-        let arena = Arena::new_rc();
-        let yaml = parse_all_to_yaml(&arena, "select a as c1,b,c from t")?;
+        let arena = Arena::new_ref();
+        let yaml = parse_all_to_yaml(arena.get_mut(), "select a as c1,b,c from t")?;
         println!("{}", yaml);
         assert_eq!("Select:
   distinct: false
@@ -753,8 +754,8 @@ mod tests {
 
     #[test]
     fn select_with_from_join() -> Result<()> {
-        let arena = Arena::new_rc();
-        let yaml = parse_all_to_yaml(&arena, "select * from t t1 left join tt t2 on t1.id = t2.id")?;
+        let arena = Arena::new_ref();
+        let yaml = parse_all_to_yaml(arena.get_mut(), "select * from t t1 left join tt t2 on t1.id = t2.id")?;
         println!("{}", yaml);
         assert_eq!("Select:
   distinct: false
@@ -784,14 +785,14 @@ mod tests {
 
     #[test]
     fn select_with_from_join_subquery() -> Result<()> {
-        let arena = Arena::new_rc();
+        let arena = Arena::new_ref();
         let sql = "select *
 from a t1
 left join
 (select id from b) t2
 on t1.id = t2.id
         ";
-        let yaml = parse_all_to_yaml(&arena, sql)?;
+        let yaml = parse_all_to_yaml(arena.get_mut(), sql)?;
         println!("{}", yaml);
         assert_eq!("Select:
   distinct: false
@@ -827,8 +828,8 @@ on t1.id = t2.id
 
     #[test]
     fn simple_expr() -> Result<()> {
-        let arena = Arena::new_rc();
-        let yaml = parse_expr_to_yaml(&arena, "col + b")?;
+        let arena = Arena::new_ref();
+        let yaml = parse_expr_to_yaml(arena.get_mut(), "col + b")?;
         println!("{}", yaml);
         assert_eq!("BinaryExpression:
   op: Add(+)
@@ -841,8 +842,8 @@ on t1.id = t2.id
 
     #[test]
     fn call_function_expr() -> Result<()> {
-        let arena = Arena::new_rc();
-        let yaml = parse_expr_to_yaml(&arena, "sum(1)")?;
+        let arena = Arena::new_ref();
+        let yaml = parse_expr_to_yaml(arena.get_mut(), "sum(1)")?;
         println!("{}", yaml);
         assert_eq!("CallFunction:
   name: sum
@@ -854,16 +855,16 @@ on t1.id = t2.id
         Ok(())
     }
 
-    fn parse_all_to_yaml(arena: &Rc<RefCell<Arena>>, sql: &str) -> Result<String> {
+    fn parse_all_to_yaml(arena: ArenaMut<Arena>, sql: &str) -> Result<String> {
         parse_to_yaml(arena, sql, false)
     }
 
-    fn parse_expr_to_yaml(arena: &Rc<RefCell<Arena>>, sql: &str) -> Result<String> {
+    fn parse_expr_to_yaml(arena: ArenaMut<Arena>, sql: &str) -> Result<String> {
         parse_to_yaml(arena, sql, true)
     }
 
-    fn parse_to_yaml(arena: &Rc<RefCell<Arena>>, sql: &str, parse_expr_only: bool) -> Result<String> {
-        let factory = Factory::from(arena);
+    fn parse_to_yaml(arena: ArenaMut<Arena>, sql: &str, parse_expr_only: bool) -> Result<String> {
+        let factory = Factory::new(&arena);
         let txt = Vec::from(sql);
         let mut file = MemorySequentialFile::new(txt);
         let mut parser = Parser::new(&mut file, factory)?;

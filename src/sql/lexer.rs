@@ -4,7 +4,7 @@ use std::io::Read;
 use std::ops::DerefMut;
 use std::rc::Rc;
 use std::str::FromStr;
-use crate::base::{Arena, ArenaStr};
+use crate::base::{Arena, ArenaMut, ArenaStr};
 use crate::sql::{from_io_result, ParseError, Result};
 use crate::sql::{SourceLocation, SourcePosition};
 
@@ -210,15 +210,15 @@ unsafe impl Sync for Keywords {}
 pub struct Lexer<'a> {
     lookahead: char,
     reader: &'a mut dyn Read,
-    arena: Rc<RefCell<Arena>>,
+    arena: ArenaMut<Arena>,
     line: u32,
     column: u32,
 }
 
 impl<'a> Lexer<'a> {
-    pub fn new(reader: &'a mut dyn Read, arena: &Rc<RefCell<Arena>>) -> Self {
+    pub fn new(reader: &'a mut dyn Read, arena: ArenaMut<Arena>) -> Self {
         let mut this = Self {
-            arena: arena.clone(),
+            arena,
             lookahead: '\0',
             reader,
             line: 1,
@@ -346,7 +346,7 @@ impl<'a> Lexer<'a> {
             self.move_next()?;
         }
         self.move_next()?;
-        let str = ArenaStr::new(buf.as_str(), self.arena.borrow_mut().deref_mut());
+        let str = ArenaStr::new(buf.as_str(), self.arena.deref_mut());
         Ok(self.to_concat_token(Token::StringLiteral(str), start_pos))
     }
 
@@ -403,11 +403,13 @@ impl<'a> Lexer<'a> {
     }
 
     fn str(&self, raw: &str) -> ArenaStr {
-        ArenaStr::new(raw, self.arena.borrow_mut().deref_mut())
+        let mut arena = self.arena.clone();
+        ArenaStr::new(raw, arena.deref_mut())
     }
 
     fn string(&self, raw: &String) -> ArenaStr {
-        ArenaStr::from_string(raw, self.arena.borrow_mut().deref_mut())
+        let mut arena = self.arena.clone();
+        ArenaStr::from_string(raw, arena.deref_mut())
     }
 }
 
@@ -419,23 +421,23 @@ mod tests {
 
     #[test]
     fn sanity() -> Result<()> {
-        let arena = Arena::new_rc();
+        let mut arena = Arena::new_ref();
         let txt = Vec::from("id");
         let mut file = MemorySequentialFile::new(txt);
-        let mut lexer = Lexer::new(&mut file, &arena);
+        let mut lexer = Lexer::new(&mut file, arena.get_mut());
 
         let part = lexer.next()?;
-        assert_eq!(Token::Id(ArenaStr::new("id", arena.borrow_mut().deref_mut())), part.token);
+        assert_eq!(Token::Id(ArenaStr::new("id", arena.get_mut().deref_mut())), part.token);
 
         Ok(())
     }
 
     #[test]
     fn numbers() -> Result<()> {
-        let arena = Arena::new_rc();
+        let mut arena = Arena::new_ref();
         let txt = Vec::from("0 1 1000 0.111");
         let mut file = MemorySequentialFile::new(txt);
-        let mut lexer = Lexer::new(&mut file, &arena);
+        let mut lexer = Lexer::new(&mut file, arena.get_mut());
 
         let mut part = lexer.next()?;
         assert_eq!(Token::IntLiteral(0), part.token);
@@ -452,17 +454,17 @@ mod tests {
 
     #[test]
     fn strings() -> Result<()> {
-        let arena = Arena::new_rc();
+        let mut arena = Arena::new_ref();
         let txt = Vec::from("\"\" \'\' \'a\'");
         let mut file = MemorySequentialFile::new(txt);
-        let mut lexer = Lexer::new(&mut file, &arena);
+        let mut lexer = Lexer::new(&mut file, arena.get_mut());
 
         let mut part = lexer.next()?;
-        assert_eq!(Token::StringLiteral(ArenaStr::from_arena("", &arena)), part.token);
+        assert_eq!(Token::StringLiteral(ArenaStr::from_arena("", &mut arena.get_mut())), part.token);
         part = lexer.next()?;
-        assert_eq!(Token::StringLiteral(ArenaStr::from_arena("", &arena)), part.token);
+        assert_eq!(Token::StringLiteral(ArenaStr::from_arena("", &mut arena.get_mut())), part.token);
         part = lexer.next()?;
-        assert_eq!(Token::StringLiteral(ArenaStr::from_arena("a", &arena)), part.token);
+        assert_eq!(Token::StringLiteral(ArenaStr::from_arena("a", &mut arena.get_mut())), part.token);
         Ok(())
     }
 }

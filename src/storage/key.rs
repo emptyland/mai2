@@ -44,14 +44,14 @@ impl Tag {
 }
 
 impl KeyBundle {
-    pub fn new(arena: &mut dyn Allocator, tag: Tag, sequence_number: u64, key: &[u8], value: &[u8]) -> Self {
+    pub fn new<A: Allocator + ?Sized>(arena: &mut A, tag: Tag, sequence_number: u64, key: &[u8], value: &[u8]) -> Self {
         let kb = Self::new_uninitialized(arena, sequence_number, tag, key.len(), value.len());
         kb.user_key_mut().write(key).unwrap();
         kb.value_mut().write(value).unwrap();
         kb
     }
 
-    pub fn from_key_value(arena: &mut dyn Allocator, sequence_number: u64, key: &[u8], value: &[u8]) -> Self {
+    pub fn from_key_value<A: Allocator + ?Sized>(arena: &mut A, sequence_number: u64, key: &[u8], value: &[u8]) -> Self {
         let kb = Self::new_uninitialized(arena, sequence_number, Tag::Key,
                                          key.len(), value.len());
         kb.user_key_mut().write(key).unwrap();
@@ -59,21 +59,21 @@ impl KeyBundle {
         kb
     }
 
-    pub fn from_key(arena: &mut dyn Allocator, sequence_number: u64, key: &[u8]) -> Self {
+    pub fn from_key<A: Allocator + ?Sized>(arena: &mut A, sequence_number: u64, key: &[u8]) -> Self {
         let kb = Self::new_uninitialized(arena, sequence_number, Tag::Key,
                                          key.len(), 0);
         kb.user_key_mut().write(key).unwrap();
         kb
     }
 
-    pub fn from_deletion(arena: &mut dyn Allocator, sequence_number: u64, key: &[u8]) -> Self {
+    pub fn from_deletion<A: Allocator + ?Sized>(arena: &mut A, sequence_number: u64, key: &[u8]) -> Self {
         let kb = Self::new_uninitialized(arena, sequence_number, Tag::Deletion,
                                          key.len(), 0);
         kb.user_key_mut().write(key).unwrap();
         kb
     }
 
-    fn new_uninitialized(arena: &mut dyn Allocator, sequence_number: u64, tag: Tag, user_key_size: usize, value_size: usize) -> Self {
+    fn new_uninitialized<A: Allocator + ?Sized>(arena: &mut A, sequence_number: u64, tag: Tag, user_key_size: usize, value_size: usize) -> Self {
         let mut header;
         unsafe {
             let chunk = arena.allocate(Self::build_layout(user_key_size + TAG_SIZE + value_size));

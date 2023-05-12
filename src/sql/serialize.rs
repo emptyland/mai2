@@ -343,6 +343,7 @@ impl Visitor for YamlWriter<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::base::Arena;
     use super::*;
     use crate::storage::MemoryWritableFile;
 
@@ -351,7 +352,8 @@ mod tests {
         let mut wr = MemoryWritableFile::new();
         let mut yaml = YamlWriter::new(&mut wr, 0);
 
-        let factory = Factory::new();
+        let mut arena = Arena::new_ref();
+        let factory = Factory::new(&arena.get_mut());
         let mut ast = factory.new_create_table(factory.str("aaa"), true);
 
         ast.accept(&mut yaml);

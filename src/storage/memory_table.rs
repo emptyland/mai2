@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
 
 use crate::storage::{inline_skip_list, skip_list};
-use crate::base::{Arena, ScopedMemory};
+use crate::base::{Arena, ArenaRef, ScopedMemory};
 use crate::storage::comparator::Comparator;
 use crate::storage::inline_skip_list::InlineSkipList;
 use crate::storage::Iterator;
@@ -16,7 +16,7 @@ use crate::storage::skip_list::Comparing;
 use crate::{Status, Result};
 
 pub struct MemoryTable {
-    arena: Rc<RefCell<Arena>>,
+    arena: ArenaRef<Arena>,
     table: InlineSkipList<'static, KeyComparator>,
     associated_file_number: Cell<u64>,
     n_entries: AtomicUsize,
@@ -34,11 +34,11 @@ impl Comparing<&[u8]> for KeyComparator {
 
 impl MemoryTable {
     pub fn new(internal_key_cmp: InternalKeyComparator) -> Self {
-        let arena = Arena::new_rc();
+        let arena = Arena::new_ref();
         let key_cmp = KeyComparator { internal_key_cmp };
-        let table = InlineSkipList::new(arena.clone(), key_cmp);
+        let table = InlineSkipList::new(arena.get_mut(), key_cmp);
         Self {
-            arena: arena.clone(),
+            arena,
             table,
             associated_file_number: Cell::new(0),
             n_entries: AtomicUsize::new(0),
@@ -82,7 +82,7 @@ impl MemoryTable {
     }
 
     pub fn approximate_memory_usage(&self) -> usize {
-        self.arena.borrow().use_in_bytes
+        self.arena.use_in_bytes
     }
 
     pub fn associate_file_number_to(&self, file_number: u64) {

@@ -1,8 +1,9 @@
 use std::cell::RefCell;
 use std::io::Read;
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::Weak;
-use crate::base::{Arena, ArenaBox, ArenaVec};
+use crate::base::{Arena, ArenaBox, ArenaMut, ArenaVec};
 use crate::exec::db::DB;
 use crate::exec::executor::{Executor, PreparedStatement};
 use crate::Result;
@@ -21,26 +22,26 @@ impl Connection {
         }
     }
 
-    pub fn execute_str(&self, sql: &str, arena: &Rc<RefCell<Arena>>) -> Result<u64> {
+    pub fn execute_str(&self, sql: &str, arena: &ArenaMut<Arena>) -> Result<u64> {
         let mut rd = MemorySequentialFile::new(sql.to_string().into());
         self.execute(&mut rd, arena)
     }
 
-    pub fn execute(&self, reader: &mut dyn Read, arena: &Rc<RefCell<Arena>>) -> Result<u64> {
+    pub fn execute(&self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<u64> {
         self.executor.borrow_mut().execute(reader, arena)
     }
 
     pub fn execute_prepared_statement(&self, prepared: &mut ArenaBox<PreparedStatement>) -> Result<u64> {
-        let arena = Arena::new_rc();
-        self.executor.borrow_mut().execute_prepared_statement(prepared, &arena)
+        let mut arena = Arena::new_ref();
+        self.executor.borrow_mut().execute_prepared_statement(prepared, &arena.get_mut())
     }
 
-    pub fn prepare_str(&self, sql: &str, arena: &Rc<RefCell<Arena>>) -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
+    pub fn prepare_str(&self, sql: &str, arena: &ArenaMut<Arena>) -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
         let mut rd = MemorySequentialFile::new(sql.to_string().into());
         self.prepare(&mut rd, arena)
     }
 
-    pub fn prepare(&self, reader: &mut dyn Read, arena: &Rc<RefCell<Arena>>) -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
+    pub fn prepare(&self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
         self.executor.borrow_mut().prepare(reader, arena)
     }
 }

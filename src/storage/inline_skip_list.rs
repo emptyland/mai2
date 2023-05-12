@@ -10,21 +10,21 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use rand::random;
 
-use crate::base::{Allocator, Arena};
+use crate::base::{Allocator, Arena, ArenaMut};
 use crate::storage::key::{InternalKey, Tag, TAG_SIZE};
 use crate::storage::skip_list::{BRANCHING, Comparing, MAX_HEIGHT};
 
 pub struct InlineSkipList<'a, Cmp> {
-    arena: Rc<RefCell<Arena>>,
+    arena: ArenaMut<Arena>,
     comparator: Cmp,
     max_height: AtomicU32,
     head: NonNull<InlineNode<'a>>,
 }
 
 impl<'a, Cmp: for<'b> Comparing<&'b [u8]>> InlineSkipList<'a, Cmp> {
-    pub fn new(arena: Rc<RefCell<Arena>>, comparator: Cmp) -> Self {
+    pub fn new(mut arena: ArenaMut<Arena>, comparator: Cmp) -> Self {
         let head = unsafe {
-            InlineNode::new(MAX_HEIGHT, arena.borrow_mut().deref_mut(), 0, 0)
+            InlineNode::new(MAX_HEIGHT, arena.deref_mut(), 0, 0)
         };
         Self {
             arena,
@@ -43,8 +43,9 @@ impl<'a, Cmp: for<'b> Comparing<&'b [u8]>> InlineSkipList<'a, Cmp> {
     }
 
     pub fn insert(&self, tag: Tag, sequence_number: u64, key: &[u8], value: &[u8]) {
+        let mut arena = self.arena.clone();
         let node = InlineNode::with_key_value(MAX_HEIGHT,
-                                              self.arena.borrow_mut().deref_mut(),
+                                              arena.deref_mut(),
                                               tag, sequence_number, key, value);
         self.put(node)
     }
@@ -197,7 +198,7 @@ impl<'a> InlineNode<'a> {
         Self::with_key_value(height, arena, Tag::Deletion, sequence_number, key, Default::default())
     }
 
-    unsafe fn new(height: usize, arena: &mut dyn Allocator, payload_len: usize, key_len: usize) -> NonNull<Self> {
+    unsafe fn new<A: Allocator + ?Sized>(height: usize, arena: &mut A, payload_len: usize, key_len: usize) -> NonNull<Self> {
         let next_len_in_bytes = size_of::<AtomicPtr<Self>>() * height;
         let layout = Self::layout(next_len_in_bytes + payload_len);
         let chunk = arena.allocate(layout).unwrap();
@@ -390,8 +391,8 @@ mod tests {
 
     #[test]
     fn sanity() {
-        let arena = Arena::new_rc();
-        let map = InlineSkipList::new(arena, new_key_cmp());
+        let mut arena = Arena::new_ref();
+        let map = InlineSkipList::new(arena.get_mut(), new_key_cmp());
         map.insert_key_value(1, "111".as_bytes(), "aaaaa".as_bytes());
         map.insert_key_value(2, "111".as_bytes(), "bbbbb".as_bytes());
 
@@ -418,8 +419,8 @@ mod tests {
     #[test]
     fn seek_keys() {
         let pairs = [("1", "a"), ("11", "b"), ("111", "c"), ("1111", "d")];
-        let arena = Arena::new_rc();
-        let mut map = InlineSkipList::new(arena, new_key_cmp());
+        let mut arena = Arena::new_ref();
+        let mut map = InlineSkipList::new(arena.get_mut(), new_key_cmp());
 
         add_key_value_pairs(&mut map, 1, &pairs);
 
@@ -435,8 +436,8 @@ mod tests {
     #[test]
     fn large_insertion() {
         let n = 10000;
-        let arena = Arena::new_rc();
-        let map = InlineSkipList::new(arena, new_key_cmp());
+        let mut arena = Arena::new_ref();
+        let map = InlineSkipList::new(arena.get_mut(), new_key_cmp());
 
         let mut sn = 1;
         for i in 0..n {

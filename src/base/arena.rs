@@ -1,12 +1,12 @@
 use std::alloc::{alloc, dealloc, Layout};
-use std::cell::RefCell;
-use std::{iter, ptr};
+use std::cell::{Cell, RefCell};
+use std::{iter, mem, ptr};
 use std::cmp::min;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::marker::PhantomData;
-use std::mem::size_of;
+use std::mem::{size_of, size_of_val};
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::ptr::{addr_of_mut, copy_nonoverlapping, NonNull, slice_from_raw_parts_mut, write};
 use std::rc::Rc;
@@ -19,6 +19,83 @@ const LARGE_PAGE_THRESHOLD_SIZE: usize = NORMAL_PAGE_SIZE / 2;
 pub trait Allocator {
     fn allocate(&mut self, layout: Layout) -> Result<NonNull<[u8]>, ()>;
 }
+
+// pub struct ArenaVal<T> {
+//     core: NonNull<T>,
+//     mut_count: Cell<usize>,
+//     chunk: [u8; static ]
+// }
+
+pub struct ArenaRef<T> {
+    core: NonNull<T>,
+    mut_count: Cell<usize>,
+}
+
+impl <T: Allocator> ArenaRef<T> {
+    pub fn new(arena: T) -> Self {
+        let layout = Layout::for_value(&arena);
+        let ptr = unsafe {
+            let chunk = alloc(layout) as *mut T;
+            write(chunk, arena);
+            chunk
+        };
+        Self {
+            core: NonNull::new(ptr).unwrap(),
+            mut_count: Cell::new(0)
+        }
+    }
+
+    pub fn get_mut(&self) -> ArenaMut<T> { ArenaMut::new(self) }
+}
+
+impl <T> Deref for ArenaRef<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.core.as_ref() }
+    }
+}
+
+impl <T> Drop for ArenaRef<T> {
+    fn drop(&mut self) {
+        let layout = Layout::new::<T>();
+        unsafe {
+            drop(ptr::read(self.core.as_ptr()));
+            dealloc(self.core.as_ptr() as *mut u8, layout);
+        }
+    }
+}
+
+pub struct ArenaMut<T> {
+    shadow: NonNull<T>
+}
+
+impl <T: Allocator> ArenaMut<T> {
+    fn new(this: &ArenaRef<T>) -> Self {
+        this.mut_count.set(this.mut_count.get() + 1);
+        Self { shadow: this.core.clone() }
+    }
+}
+
+impl <T> Deref for ArenaMut<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.shadow.as_ref() }
+    }
+}
+
+impl <T> DerefMut for ArenaMut<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.shadow.as_mut() }
+    }
+}
+
+impl <T> Clone for ArenaMut<T> {
+    fn clone(&self) -> Self {
+        Self { shadow: self.shadow }
+    }
+}
+
 
 #[derive(Debug)]
 pub struct Arena {
@@ -47,8 +124,8 @@ impl Arena {
         Arena { pages: None, large: None, rss_in_bytes: 0, use_in_bytes: 0 }
     }
 
-    pub fn new_rc() -> Rc<RefCell<Self>> {
-        Rc::new(RefCell::new(Self::new()))
+    pub fn new_ref() -> ArenaRef<Self> {
+        ArenaRef::new(Self::new())
     }
 
     pub fn normal_pages_count(&self) -> i32 {
@@ -228,33 +305,25 @@ impl Allocator for ScopedMemory {
 }
 
 pub struct ArenaBox<T: ?Sized> {
-    naked: NonNull<T>,
-    owns: Rc<RefCell<Arena>>,
+    naked: NonNull<T>
 }
 
 impl<T> ArenaBox<T> {
-    pub fn new(data: T, owns: &Rc<RefCell<Arena>>) -> Self {
+    pub fn new<A: Allocator + ?Sized>(data: T, arena: &mut A) -> Self {
         let layout = Layout::new::<T>();
-        let chunk = owns.borrow_mut().allocate(layout).unwrap();
+        let chunk = arena.allocate(layout).unwrap();
         let naked = NonNull::new(chunk.as_ptr() as *mut T).unwrap();
         unsafe { write(naked.as_ptr(), data) }
-        Self {
-            naked,
-            owns: owns.clone(),
-        }
+        Self { naked }
     }
 }
 
 impl<T: ?Sized> ArenaBox<T> {
-    pub fn from_ptr(naked: NonNull<T>, owns: Rc<RefCell<Arena>>) -> Self {
-        Self {
-            naked,
-            owns,
-        }
+    pub fn from_ptr(naked: NonNull<T>) -> Self {
+        Self { naked }
     }
 
     pub fn ptr(&self) -> NonNull<T> { self.naked }
-    pub fn owns(&self) -> Rc<RefCell<Arena>> { self.owns.clone() }
 }
 
 impl<T: ?Sized> Deref for ArenaBox<T> {
@@ -273,10 +342,7 @@ impl<T: ?Sized> DerefMut for ArenaBox<T> {
 
 impl<T: ?Sized> Clone for ArenaBox<T> {
     fn clone(&self) -> Self {
-        Self {
-            naked: self.naked.clone(),
-            owns: self.owns.clone(),
-        }
+        Self { naked: self.naked.clone() }
     }
 }
 
@@ -293,7 +359,7 @@ pub struct ArenaStr {
 }
 
 impl ArenaStr {
-    pub fn new(str: &str, alloc: &mut dyn Allocator) -> Self {
+    pub fn new<A: Allocator + ?Sized>(str: &str, alloc: &mut A) -> Self {
         if str.is_empty() {
             return Self::default();
         }
@@ -308,12 +374,12 @@ impl ArenaStr {
         Self { naked }
     }
 
-    pub fn from_arena(str: &str, arena: &Rc<RefCell<Arena>>) -> Self {
-        Self::new(str, arena.borrow_mut().deref_mut())
+    pub fn from_string<A: Allocator + ?Sized>(str: &String, alloc: &mut A) -> Self {
+        Self::new(str.as_str(), alloc)
     }
 
-    pub fn from_string(str: &String, alloc: &mut dyn Allocator) -> Self {
-        Self::new(str.as_str(), alloc)
+    pub fn from_arena(str: &str, arena: &mut ArenaMut<Arena>) -> Self {
+        Self::new(str, arena.deref_mut())
     }
 
     pub fn to_string(&self) -> String {
@@ -377,30 +443,32 @@ impl Display for ArenaStr {
 pub struct ArenaVec<T> {
     naked: NonNull<[T]>,
     len: usize,
-    pub owns: Rc<RefCell<Arena>>,
+    pub owns: ArenaMut<Arena>,
 }
 
 impl<T> ArenaVec<T> {
-    pub fn new(owns: &Rc<RefCell<Arena>>) -> Self {
+    pub fn new(arena: &ArenaMut<Arena>) -> Self {
+        let mut owns = arena.clone();
         let naked = unsafe {
-            Self::new_uninitialized(owns.borrow_mut().deref_mut(), 1)
+            Self::new_uninitialized(owns.deref_mut(), 1)
         };
         Self {
             naked,
             len: 0,
-            owns: owns.clone(),
+            owns,
         }
     }
 
-    pub fn with_init<Fn>(owns: &Rc<RefCell<Arena>>, init: Fn, count: usize) -> Self
+    pub fn with_init<Fn>(arena: &ArenaMut<Arena>, init: Fn, count: usize) -> Self
         where Fn: FnOnce(usize) -> T + Copy {
+        let mut owns = arena.clone();
         let naked = unsafe {
-            Self::new_uninitialized(owns.borrow_mut().deref_mut(), count)
+            Self::new_uninitialized(owns.deref_mut(), count)
         };
         let mut this = Self {
             naked,
             len: 0,
-            owns: owns.clone(),
+            owns,
         };
         for i in 0..count {
             this.push(init(i));
@@ -445,7 +513,7 @@ impl<T> ArenaVec<T> {
         if self.len() + incremental > self.capacity() {
             let new_cap = self.capacity() * 2 + 4;
             let naked = unsafe {
-                Self::new_uninitialized(self.owns.borrow_mut().deref_mut(), new_cap)
+                Self::new_uninitialized(self.owns.deref_mut(), new_cap)
             };
             let old_raw_vec = self.naked;
             self.naked = naked;
@@ -615,8 +683,8 @@ mod tests {
 
     #[test]
     fn arena_vec() {
-        let arena = Arena::new_rc();
-        let mut vec = ArenaVec::new(&arena);
+        let arena = Arena::new_ref();
+        let mut vec = ArenaVec::new(&arena.get_mut());
         vec.push(1);
         vec.push(2);
         vec.push(3);
@@ -629,8 +697,8 @@ mod tests {
 
     #[test]
     fn arena_vec_large_push() {
-        let arena = Arena::new_rc();
-        let mut vec = ArenaVec::new(&arena);
+        let arena = Arena::new_ref();
+        let mut vec = ArenaVec::new(&arena.get_mut());
         let n = 10000;
 
         for i in 0..n {

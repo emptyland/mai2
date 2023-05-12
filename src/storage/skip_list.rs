@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use rand::prelude::*;
 
-use crate::base::{Allocator, Arena};
+use crate::base::{Allocator, Arena, ArenaMut};
 
 //type Comparator = Box<dyn for<'a> Comparing<&'a [u8]>>;
 
@@ -18,7 +18,7 @@ pub const MAX_HEIGHT: usize = 12usize;
 pub const BRANCHING: usize = 4usize;
 
 pub struct SkipList<Key, Cmp> {
-    arena: Rc<RefCell<Arena>>,
+    arena: ArenaMut<Arena>,
     comparator: Cmp,
     max_height: AtomicU32,
     head: NonNull<Node<Key>>,
@@ -46,8 +46,8 @@ pub trait Comparing<T> {
 }
 
 impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<Key, Cmp> {
-    pub fn new(arena: Rc<RefCell<Arena>>, comparator: Cmp) -> SkipList<Key, Cmp> {
-        let head = Node::new(arena.borrow_mut().deref_mut(), Key::default(), MAX_HEIGHT).unwrap();
+    pub fn new(mut arena: ArenaMut<Arena>, comparator: Cmp) -> SkipList<Key, Cmp> {
+        let head = Node::new(arena.deref_mut(), Key::default(), MAX_HEIGHT).unwrap();
         SkipList {
             arena,
             comparator,
@@ -71,7 +71,7 @@ impl<'a, Key: Default + Clone + Copy + 'a, Cmp: Comparing<&'a Key>> SkipList<Key
             self.max_height.store(height as u32, Ordering::Relaxed);
         }
 
-        x = Node::new(self.arena.borrow_mut().deref_mut(), *key, height);
+        x = Node::new(self.arena.clone().deref_mut(), *key, height);
         for i in 0..height {
             Node::no_barrier_set_next(x.unwrap().as_ptr(), i,
                                       Node::no_barrier_next(prev[i].unwrap().as_ptr(), i));
@@ -181,7 +181,7 @@ struct Node<Key> {
 
 
 impl<Key> Node<Key> {
-    fn new(arena: &mut dyn Allocator, key: Key, height: usize) -> Option<NonNull<Node<Key>>> {
+    fn new<A: Allocator + ?Sized>(arena: &mut A, key: Key, height: usize) -> Option<NonNull<Node<Key>>> {
         let size_in_bytes = size_of::<Self>() + size_of::<AtomicPtr<Self>>() * height + size_of::<usize>();
         //dbg!(size_in_bytes);
         let layout = Layout::from_size_align(size_in_bytes, align_of::<Self>()).unwrap();
@@ -342,24 +342,24 @@ mod tests {
 
     #[test]
     fn sanity() {
-        let arena = Arena::new_rc();
-        let key = KeyBundle::from_key_value(arena.borrow_mut().deref_mut(), 1,
+        let mut arena = Arena::new_ref();
+        let key = KeyBundle::from_key_value(arena.get_mut().deref_mut(), 1,
                                             "111".as_bytes(), "a".as_bytes());
         let cmp = KeyComparator {};
-        let map = SkipList::new(arena, cmp);
+        let map = SkipList::new(arena.get_mut(), cmp);
         map.insert(&key);
     }
 
     #[test]
     fn insert_keys() {
-        let arena = Arena::new_rc();
+        let mut arena = Arena::new_ref();
         let cmp = KeyComparator {};
-        let mut map = SkipList::new(arena.clone(), cmp);
+        let mut map = SkipList::new(arena.get_mut(), cmp);
 
         for i in 0..100 {
             //let mut borrowed = arena.borrow_mut();
             let s = format!("{:03}", i);
-            let key = KeyBundle::from_key_value(arena.borrow_mut().deref_mut(), 1, s.as_bytes(), "a".as_bytes());
+            let key = KeyBundle::from_key_value(arena.get_mut().deref_mut(), 1, s.as_bytes(), "a".as_bytes());
             map.insert(&key);
         }
 
@@ -386,9 +386,9 @@ mod tests {
 
     #[test]
     fn iterate() {
-        let arena = Arena::new_rc();
+        let mut arena = Arena::new_ref();
         let cmp = IntComparator {};
-        let map = SkipList::new(arena, cmp);
+        let map = SkipList::new(arena.get_mut(), cmp);
         map.insert(&1);
 
         let mut iter = IteratorImpl::new(&map);
@@ -404,9 +404,9 @@ mod tests {
 
     #[test]
     fn iterate_more() {
-        let arena = Arena::new_rc();
+        let mut arena = Arena::new_ref();
         let cmp = IntComparator {};
-        let map = SkipList::new(arena, cmp);
+        let map = SkipList::new(arena.get_mut(), cmp);
         for i in 0..100 {
             map.insert(&i);
         }
@@ -424,9 +424,9 @@ mod tests {
 
     #[test]
     fn rust_iter() {
-        let arena = Arena::new_rc();
+        let mut arena = Arena::new_ref();
         let cmp = IntComparator {};
-        let mut map = SkipList::new(arena, cmp);
+        let mut map = SkipList::new(arena.get_mut(), cmp);
         for i in 0..100 {
             map.insert(&i);
         }
