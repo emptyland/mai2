@@ -42,6 +42,12 @@ impl <T: Allocator + Sized> ArenaVal<T> {
     }
 }
 
+impl <T> Deref for ArenaVal<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target { &self.core }
+}
+
 pub struct ArenaRef<T> {
     core: NonNull<T>,
     mut_count: Cell<usize>,
@@ -145,6 +151,10 @@ impl Arena {
 
     pub fn new_ref() -> ArenaRef<Self> {
         ArenaRef::new(Self::new())
+    }
+
+    pub fn new_val() -> ArenaVal<Self> {
+        ArenaVal::new(Self::new())
     }
 
     pub fn normal_pages_count(&self) -> i32 {

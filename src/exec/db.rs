@@ -401,7 +401,7 @@ impl DB {
             tmp
         };
 
-        let mut arena = Arena::new_ref();
+        let mut arena = Arena::new_val();
 
         let mut affected_rows = 0;
         let mut col_vals = Vec::from_iter(iter::repeat(Value::Null)
@@ -454,7 +454,7 @@ impl DB {
                 debug_assert_eq!(row_key, rk);
 
                 if arena.rss_in_bytes > 10 * MB {
-                    arena = Arena::new_ref();
+                    arena = Arena::new_val();
                 }
             }
             iter.move_next();

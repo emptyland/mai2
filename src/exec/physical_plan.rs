@@ -1,8 +1,6 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
 use std::ops::DerefMut;
-use std::rc::Rc;
 use std::sync::Arc;
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaVec};
 use crate::exec::executor::{ColumnSet, Tuple};
