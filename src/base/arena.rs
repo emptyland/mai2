@@ -536,11 +536,21 @@ impl<T> ArenaVec<T> {
         }
     }
 
+    pub fn clear(&mut self) { self.len = 0; }
+
+    pub fn truncate(&mut self, want: usize) {
+        if want <= self.len() {
+            self.len = want;
+        } else {
+            unreachable!()
+        }
+    }
+
     pub unsafe fn raw_ptr(&self) -> NonNull<[T]> { self.naked }
 
     fn extend_if_needed(&mut self, incremental: usize) -> &mut [T] {
         if self.len() + incremental > self.capacity() {
-            let new_cap = self.capacity() * 2 + 4;
+            let new_cap = self.capacity() * 2 + 4 + incremental;
             let naked = unsafe {
                 Self::new_uninitialized(self.owns.deref_mut(), new_cap)
             };
@@ -717,7 +727,7 @@ mod tests {
         vec.push(1);
         vec.push(2);
         vec.push(3);
-        assert_eq!(6, vec.capacity());
+        assert_eq!(7, vec.capacity());
         assert_eq!(3, vec.len());
         assert_eq!(1, vec[0]);
         assert_eq!(2, vec[1]);

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::storage::{config, files, mai2};
+use crate::storage::{config, files, storage};
 use crate::storage::cache::TableCache;
 use crate::storage::compaction::Compact;
 use crate::storage::comparator::Comparator;

@@ -1,18 +1,15 @@
 use std::any::Any;
-use std::cell::RefCell;
 use std::fmt::{Display, Formatter};
-use std::ops::DerefMut;
 use std::ptr::{addr_of, addr_of_mut, NonNull};
-use std::rc::Rc;
 use std::slice;
 use num_enum::TryFromPrimitive;
-use crate::base::{Arena, ArenaStr, ArenaVec, ArenaBox, ArenaMut, ArenaRef};
+use crate::base::{Arena, ArenaStr, ArenaVec, ArenaBox, ArenaMut};
 use crate::sql::lexer::Token;
 
 macro_rules! ast_nodes_impl {
     [$(($name:ty, $call:ident)),+ $(,)?] => {
         pub trait Visitor {
-            $(fn $call(&mut self, this: &mut $name);)+
+            $(fn $call(&mut self, this: &mut $name) { todo!() })+
         }
         $(statement_impl!($name, $call);)+
     }

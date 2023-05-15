@@ -14,14 +14,14 @@ mod inline_skip_list;
 mod compaction;
 
 pub mod env;
-pub mod mai2;
+pub mod storage;
 pub mod comparator;
 pub mod iterator;
 pub mod config;
 
 use std::sync::Arc;
 pub use env::*;
-pub use self::mai2::*;
+pub use self::storage::*;
 pub use crate::status::*;
 pub use comparator::*;
 pub use iterator::*;

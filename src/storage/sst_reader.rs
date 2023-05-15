@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crc::{Crc, CRC_32_ISCSI};
 
-use crate::storage::{iterator, mai2};
+use crate::storage::iterator;
 use crate::base::utils;
 use crate::storage::cache::{Block, BlockCache};
 use crate::storage::Comparator;

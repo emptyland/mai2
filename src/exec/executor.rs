@@ -1,24 +1,20 @@
-use std::alloc::{alloc, Layout};
-use std::arch::x86_64::_tzcnt_u32;
+use std::alloc::Layout;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::intrinsics::copy_nonoverlapping;
 use std::io::{Read, Write};
 use std::iter::repeat;
-use std::ops::{AddAssign, Deref, DerefMut, Index};
-use std::ptr::{addr_of, addr_of_mut, NonNull, slice_from_raw_parts_mut};
-use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::sync::atomic::Ordering;
+use std::ops::{AddAssign, DerefMut, Index};
+use std::ptr::{addr_of, NonNull, slice_from_raw_parts_mut};
+use std::sync::{Arc, MutexGuard, Weak};
 
-use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaRef, ArenaStr, ArenaVec};
+use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata};
 use crate::exec::from_sql_result;
-use crate::sql::ast::{BinaryExpression, CallFunction, Collection, CreateIndex, CreateTable, DropIndex, DropTable, Expression, Factory, FromClause, FullyQualifiedName, Identifier, InLiteralSet, InRelation, InsertIntoTable, JoinClause, Literal, Placeholder, Select, Statement, TypeDeclaration, UnaryExpression, Visitor};
+use crate::sql::ast::*;
 use crate::sql::parser::Parser;
 use crate::{Corrupting, Result, Status};
 use crate::exec::evaluator::{Context, Evaluator, Value};
-use crate::exec::evaluator::Value::Str;
 use crate::sql::lexer::Token;
 use crate::sql::serialize::serialize_yaml_to_string;
 
@@ -112,7 +108,7 @@ impl Executor {
                               name_to_order: &HashMap<&str, usize>)
                               -> Result<(ArenaVec<Tuple>, ArenaVec<SecondaryIndexBundle>)> {
         let mut evaluator = Evaluator::new(&self.arena);
-        let context = Arc::new(TupleContext::new(self.prepared_stmts.back().cloned()));
+        let context = Arc::new(UniversalContext::new(self.prepared_stmts.back().cloned()));
         let mut tuples = ArenaVec::new(&self.arena); // Vec::new();
         let mut secondary_indices = ArenaVec::new(&self.arena);
         let mut unique_row_keys = HashSet::new();
@@ -345,6 +341,22 @@ impl Visitor for Executor {
         }
     }
 
+    fn visit_drop_table(&mut self, this: &mut DropTable) {
+        let db = self.db.upgrade().unwrap();
+        let mut locking_tables = db.lock_tables_mut();
+        if !locking_tables.contains_key(&this.table_name.to_string()) {
+            if !this.if_exists {
+                self.rs = Err(Status::corrupted(format!("Table `{}` not found",
+                                                        this.table_name.as_str())));
+            }
+            return;
+        }
+        match db.drop_table(&this.table_name.to_string(), &mut locking_tables) {
+            Err(e) => self.rs = Err(e),
+            Ok(_) => self.affected_rows = 0,
+        }
+    }
+
     fn visit_create_index(&mut self, this: &mut CreateIndex) {
         let db = self.db.upgrade().unwrap();
         let mut locking_tables = db.lock_tables_mut();
@@ -454,22 +466,6 @@ impl Visitor for Executor {
         }
     }
 
-    fn visit_drop_table(&mut self, this: &mut DropTable) {
-        let db = self.db.upgrade().unwrap();
-        let mut locking_tables = db.lock_tables_mut();
-        if !locking_tables.contains_key(&this.table_name.to_string()) {
-            if !this.if_exists {
-                self.rs = Err(Status::corrupted(format!("Table `{}` not found",
-                                                        this.table_name.as_str())));
-            }
-            return;
-        }
-        match db.drop_table(&this.table_name.to_string(), &mut locking_tables) {
-            Err(e) => self.rs = Err(e),
-            Ok(_) => self.affected_rows = 0,
-        }
-    }
-
     fn visit_insert_into_table(&mut self, this: &mut InsertIntoTable) {
         let db = self.db.upgrade().unwrap();
         let tables = db.lock_tables();
@@ -542,41 +538,6 @@ impl Visitor for Executor {
             Ok(affected_rows) => self.affected_rows = affected_rows,
             Err(e) => self.rs = Err(e)
         }
-    }
-
-    fn visit_identifier(&mut self, _: &mut Identifier) { unreachable!() }
-    fn visit_full_qualified_name(&mut self, _: &mut FullyQualifiedName) { unreachable!() }
-    fn visit_unary_expression(&mut self, _: &mut UnaryExpression) { unreachable!() }
-    fn visit_binary_expression(&mut self, _: &mut BinaryExpression) { unreachable!() }
-    fn visit_call_function(&mut self, _: &mut CallFunction) { unreachable!() }
-    fn visit_int_literal(&mut self, _: &mut Literal<i64>) { unreachable!() }
-    fn visit_float_literal(&mut self, _: &mut Literal<f64>) { unreachable!() }
-    fn visit_str_literal(&mut self, _: &mut Literal<ArenaStr>) { unreachable!() }
-    fn visit_null_literal(&mut self, _: &mut Literal<()>) { unreachable!() }
-    fn visit_placeholder(&mut self, _: &mut Placeholder) { unreachable!() }
-
-    fn visit_collection(&mut self, this: &mut Collection) {
-        todo!()
-    }
-
-    fn visit_select(&mut self, this: &mut Select) {
-        todo!()
-    }
-
-    fn visit_from_clause(&mut self, this: &mut FromClause) {
-        todo!()
-    }
-
-    fn visit_join_clause(&mut self, this: &mut JoinClause) {
-        todo!()
-    }
-
-    fn visit_in_literal_set(&mut self, this: &mut InLiteralSet) {
-        todo!()
-    }
-
-    fn visit_in_relation(&mut self, this: &mut InRelation) {
-        todo!()
     }
 }
 
@@ -701,6 +662,28 @@ impl Tuple {
             _ => None
         }
     }
+
+    pub fn get_arena_str(&self, i: usize) -> Option<ArenaStr> {
+        match self.get(i) {
+            Value::Str(s) => Some(s.clone()),
+            _ => None
+        }
+    }
+
+    pub fn get_str(&self, i: usize) -> Option<&str> {
+        match self.get(i) {
+            Value::Str(s) => Some(s.as_str()),
+            _ => None
+        }
+    }
+
+    pub fn get_string(&self, i: usize) -> Option<String> {
+        match self.get(i) {
+            Value::Str(s) => Some(s.to_string()),
+            _ => None
+        }
+    }
+
     pub fn get(&self, i: usize) -> &Value { &self.as_slice()[i] }
 
     pub fn set(&mut self, i: usize, value: Value) { self.as_mut_slice()[i] = value; }
@@ -740,46 +723,72 @@ impl SecondaryIndexBundle {
     }
 }
 
-struct TupleContext {
+pub struct UpstreamContext<'a> {
     prepared_stmt: Option<ArenaBox<PreparedStatement>>,
-
-    symbols: HashMap<String, usize>,
-    fully_qualified_symbols: HashMap<String, usize>,
+    arena: ArenaMut<Arena>,
+    symbols: HashMap<&'a str, usize>,
+    fully_qualified_symbols: HashMap<(&'a str, &'a str), usize>,
 }
 
-impl TupleContext {
-    pub fn new(prepared_stmt: Option<ArenaBox<PreparedStatement>>) -> Self {
+impl <'a> UpstreamContext<'a> {
+    pub fn new(prepared_stmt: Option<ArenaBox<PreparedStatement>>, arena: &ArenaMut<Arena>) -> Self {
         Self {
             prepared_stmt,
+            arena: arena.clone(),
             symbols: HashMap::default(),
             fully_qualified_symbols: HashMap::default(),
         }
     }
+
+    pub fn add(&mut self, column_set: &ColumnSet) {
+        let schema = self.dup_str(column_set.schema.as_str());
+
+        for i in 0..column_set.columns.len() {
+            let col = &column_set.columns[i];
+            let name = self.dup_str(col.name.as_str());
+            self.symbols.insert(name, i);
+            if !column_set.schema.is_empty() {
+                self.fully_qualified_symbols.insert((schema, name), i);
+            }
+        }
+    }
+
+    fn dup_str(&self, input: &str) -> &'a str {
+        if input.is_empty() {
+            return "";
+        }
+        let layout = Layout::from_size_align(input.len(), 4).unwrap();
+        let mut chunk = self.arena.get_mut().allocate(layout).unwrap();
+        unsafe {
+            chunk.as_mut().write(input.as_bytes()).unwrap();
+            std::str::from_utf8_unchecked(chunk.as_ref())
+        }
+    }
 }
 
-impl Context for TupleContext {
-    fn resolve(&self, _name: &str) -> Value {
-        Value::Undefined
-    }
+struct UniversalContext {
+    prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+}
 
-    fn resolve_fully_qualified(&self, _prefix: &str, _suffix: &str) -> Value {
-        Value::Undefined
+impl UniversalContext {
+    pub fn new(prepared_stmt: Option<ArenaBox<PreparedStatement>>) -> Self {
+        Self {
+            prepared_stmt
+        }
     }
+}
 
-    fn invoke(&self, _callee: &str, _args: &[Value]) -> Value {
-        Value::Undefined
-    }
-
-    fn bound_param(&self, order: usize) -> Value {
+impl Context for UniversalContext {
+    fn bound_param(&self, order: usize) -> &Value {
         match self.prepared_stmt.as_ref() {
             Some(ps) => {
                 if order >= ps.parameters_len() {
-                    Value::Undefined
+                    &Value::Undefined
                 } else {
-                    ps.parameters[order].clone()
+                    &ps.parameters[order]
                 }
             }
-            None => Value::Undefined
+            None => &Value::Undefined
         }
     }
 }

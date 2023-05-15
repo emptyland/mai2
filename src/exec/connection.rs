@@ -114,8 +114,8 @@ impl Drop for ResultSet {
     }
 }
 
-struct FeedbackImpl {
-    status: Status
+pub struct FeedbackImpl {
+    pub status: Status
 }
 
 impl Feedback for FeedbackImpl {

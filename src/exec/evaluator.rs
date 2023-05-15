@@ -1,13 +1,11 @@
-use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ops::{Add, DerefMut, Sub, Mul};
-use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
 use crate::{Corrupting, Result, Status};
 use crate::base::{Arena, ArenaMut, ArenaStr};
-use crate::sql::ast::{BinaryExpression, CallFunction, Collection, CreateIndex, CreateTable, DropIndex, DropTable, Expression, FromClause, FullyQualifiedName, Identifier, InLiteralSet, InRelation, InsertIntoTable, JoinClause, Literal, Operator, Placeholder, Select, UnaryExpression, Visitor};
+use crate::exec::executor::Tuple;
+use crate::sql::ast::*;
 
 pub struct Evaluator {
     arena: ArenaMut<Arena>,
@@ -17,10 +15,14 @@ pub struct Evaluator {
 }
 
 pub trait Context {
-    fn resolve(&self, name: &str) -> Value;
-    fn resolve_fully_qualified(&self, prefix: &str, suffix: &str) -> Value;
-    fn invoke(&self, callee: &str, args: &[Value]) -> Value;
-    fn bound_param(&self, order: usize) -> Value;
+    fn fast_access(&self, _i: usize) -> &Value { &Value::Undefined }
+    fn resolve(&self, _name: &str) -> Value {
+        Value::Undefined
+    }
+    fn resolve_fully_qualified(&self, _prefix: &str, _suffix: &str) -> Value {
+        Value::Undefined
+    }
+    fn bound_param(&self, order: usize) -> &Value;
     // aggregate
 }
 
@@ -140,28 +142,6 @@ macro_rules! process_airth_op {
 }
 
 impl Visitor for Evaluator {
-    fn visit_create_table(&mut self, this: &mut CreateTable) { unreachable!() }
-    fn visit_drop_table(&mut self, this: &mut DropTable) { unreachable!() }
-    fn visit_create_index(&mut self, this: &mut CreateIndex) { unreachable!() }
-    fn visit_drop_index(&mut self, this: &mut DropIndex) { unreachable!() }
-    fn visit_insert_into_table(&mut self, this: &mut InsertIntoTable) { unreachable!() }
-
-    fn visit_collection(&mut self, this: &mut Collection) {
-        todo!()
-    }
-
-    fn visit_select(&mut self, this: &mut Select) {
-        todo!()
-    }
-
-    fn visit_from_clause(&mut self, this: &mut FromClause) {
-        todo!()
-    }
-
-    fn visit_join_clause(&mut self, this: &mut JoinClause) {
-        todo!()
-    }
-
     fn visit_identifier(&mut self, this: &mut Identifier) {
         let value = self.env().resolve(this.symbol.as_str());
         if value.is_undefined() {
@@ -278,6 +258,6 @@ impl Visitor for Evaluator {
     }
 
     fn visit_placeholder(&mut self, this: &mut Placeholder) {
-        self.ret(self.env().bound_param(this.order))
+        self.ret(self.env().bound_param(this.order).clone())
     }
 }

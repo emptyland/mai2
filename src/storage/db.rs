@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 
-use crate::storage::{config, mai2, wal, files};
+use crate::storage::{config, storage, wal, files};
 use crate::{log_debug, log_error, log_info};
 use crate::storage::cache::TableCache;
 use crate::storage::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
@@ -25,7 +25,7 @@ use crate::storage::files::{Kind, paths};
 use crate::storage::{DBIterator, Iterator as MaiIterator, IteratorArc, IteratorRc, MergingIterator};
 use crate::storage::key::Tag;
 use crate::base::Logger;
-use crate::storage::mai2::*;
+use crate::storage::storage::*;
 use crate::storage::memory_table::MemoryTable;
 use crate::storage::snapshot::{SnapshotImpl, SnapshotSet};
 use crate::storage::sst_builder::SSTBuilder;

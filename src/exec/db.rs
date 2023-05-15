@@ -673,6 +673,10 @@ impl DB {
         wr.write(&counter.to_be_bytes()).unwrap();
     }
 
+    pub fn encode_col_id<W: Write>(id: u32, wr: &mut W) {
+        wr.write(&id.to_be_bytes()).unwrap();
+    }
+
     pub fn encode_idx_id<W: Write>(id: u64, wr: &mut W) {
         wr.write(&(id as u32).to_be_bytes()).unwrap();
     }
