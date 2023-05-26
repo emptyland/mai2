@@ -1089,6 +1089,36 @@ pub enum ColumnType {
     Varchar(u32),
 }
 
+impl ColumnType {
+    pub fn is_integral(&self) -> bool {
+        match self {
+            Self::TinyInt(_)
+            | Self::SmallInt(_)
+            | Self::Int(_)
+            | Self::BigInt(_) => true,
+            _ => false
+        }
+    }
+
+    pub fn is_floating(&self) -> bool {
+        match self {
+            Self::Float(_, _) | Self::Double(_, _) => true,
+            _ => false
+        }
+    }
+
+    pub fn is_number(&self) -> bool {
+        self.is_integral() || self.is_floating()
+    }
+
+    pub fn is_string(&self) -> bool {
+        match self {
+            Self::Varchar(_) | Self::Char(_) => true,
+            _ => false
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OrderBy {
     Desc,
@@ -1526,6 +1556,24 @@ mod tests {
 
         let sql = "drop index idx_b on t1";
         assert_eq!(3, conn.execute_str(sql, &arena.get_mut())?);
+        Ok(())
+    }
+
+    #[test]
+    fn just_select_returning_one() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db113");
+        let arena = Arena::new_val();
+        let db = DB::open("tests".to_string(), "db113".to_string())?;
+        let conn = db.connect();
+        let mut rs = conn.execute_query_str("select 1 + 1;", &arena.get_mut())?;
+        assert_eq!(1, rs.columns().columns.len());
+        assert_eq!("_0", rs.column_name(0));
+        assert!(matches!(rs.column_ty(0), ColumnType::BigInt(_)));
+        assert!(rs.next());
+        let row = rs.current()?;
+        assert_eq!(Some(2), row.get_i64(0));
+        assert!(!rs.next());
+
         Ok(())
     }
 }

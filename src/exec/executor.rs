@@ -1,11 +1,13 @@
 use std::alloc::Layout;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::intrinsics::copy_nonoverlapping;
 use std::io::{Read, Write};
 use std::iter::repeat;
 use std::ops::{AddAssign, DerefMut, Index};
-use std::ptr::{addr_of, NonNull, slice_from_raw_parts_mut};
+use std::{mem, ptr};
+use std::ptr::{addr_of, NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
+use std::rc::Rc;
 use std::sync::{Arc, MutexGuard, Weak};
 
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
@@ -14,27 +16,40 @@ use crate::exec::from_sql_result;
 use crate::sql::ast::*;
 use crate::sql::parser::Parser;
 use crate::{Corrupting, Result, Status};
-use crate::exec::evaluator::{Context, Evaluator, Value};
+use crate::exec::connection::ResultSet;
+use crate::exec::evaluator::{Context, Evaluator, expr_typing_reduce, Value};
+use crate::exec::physical_plan::{ProjectingOps, ReturningOneDummyOps};
 use crate::sql::lexer::Token;
 use crate::sql::serialize::serialize_yaml_to_string;
 
 pub struct Executor {
     pub db: Weak<DB>,
     arena: ArenaMut<Arena>,
-    prepared_stmts: VecDeque<ArenaBox<PreparedStatement>>,
+    prepared_stmts: ArenaVec<ArenaBox<PreparedStatement>>,
     affected_rows: u64,
+    result_set: Option<ResultSet>,
     rs: Result<()>,
 }
 
 impl Executor {
     pub fn new(db: &Weak<DB>) -> Self {
+        let zone = Arena::new_val();
         Self {
             db: db.clone(),
-            arena: Arena::new_ref().get_mut(),
-            prepared_stmts: VecDeque::default(),
+            arena: zone.get_mut(),
+            prepared_stmts: ArenaVec::new(&zone.get_mut()),
             affected_rows: 0,
+            result_set: None,
             rs: Ok(()),
         }
+    }
+
+    pub fn execute_query(&mut self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<ResultSet> {
+        self.execute(reader, arena)?;
+        if self.result_set.is_none() {
+            return Err(Status::corrupted("No result set for query!"));
+        }
+        Ok(mem::replace(&mut self.result_set, None).unwrap())
     }
 
     pub fn execute(&mut self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<u64> {
@@ -61,9 +76,10 @@ impl Executor {
         // clear latest result;
         self.rs = Ok(());
         self.arena = arena.clone();
-        self.prepared_stmts.push_back(prepared.clone());
+        self.prepared_stmts = ArenaVec::new(arena);
+        self.prepared_stmts.push(prepared.clone());
         prepared.statement.accept(self);
-        self.prepared_stmts.pop_back();
+        self.prepared_stmts.pop();
         self.rs.clone()?;
         Ok(self.affected_rows)
     }
@@ -177,6 +193,38 @@ impl Executor {
         }
 
         Ok((tuples, secondary_indices))
+    }
+
+    fn build_standalone_projecting(&mut self, this: &mut Select) -> Result<ResultSet> {
+        let mut columns_expr = ArenaVec::new(&self.arena);
+        let mut columns = ColumnSet::new("", &self.arena);
+        let mut i = 0;
+        let context = Arc::new(UniversalContext::new(self.prepared_stmts.back().cloned()));
+        for col in this.columns.iter_mut() {
+            match col.expr {
+                SelectColumn::Expr(ref mut expr) => {
+                    let ty = expr_typing_reduce(expr.deref_mut(), context.clone(), &self.arena);
+                    if col.alias.is_empty() {
+                        columns.append_with_name(format!("_{i}").as_str(), ty.unwrap());
+                    } else {
+                        columns.append_with_name(col.alias.as_str(), ty.unwrap());
+                    }
+                    columns_expr.push(expr.clone());
+                }
+                _ => {
+                    return Err(Status::corrupted("No columns for star(*)"));
+                }
+            }
+            i += 1;
+        }
+
+        let stub = ArenaBox::new(ReturningOneDummyOps::new(&self.arena),
+                                 self.arena.deref_mut());
+        let projected_columns = ArenaBox::new(columns, self.arena.deref_mut());
+        let plan = ProjectingOps::new(columns_expr, stub.into(),
+                                      self.arena.clone(), projected_columns,
+                                      self.prepared_stmts.back().cloned());
+        ResultSet::from_dcl_stmt(ArenaBox::new(plan, self.arena.deref_mut()).into())
     }
 }
 
@@ -407,7 +455,7 @@ impl Visitor for Executor {
             Err(e) => {
                 let mut locking_tables = db.lock_tables_mut();
                 db.remove_secondary_index(table.metadata.id, &table.column_family,
-                                          idx_id,  this.unique, false).unwrap();
+                                          idx_id, this.unique, false).unwrap();
 
                 locking_tables.insert(table.metadata.name.clone(), table); // fall back
                 self.rs = Err(e)
@@ -462,7 +510,7 @@ impl Visitor for Executor {
                 // Eat error
                 self.affected_rows = 0;
                 // TODO: record warning message
-            },
+            }
         }
     }
 
@@ -539,6 +587,20 @@ impl Visitor for Executor {
             Err(e) => self.rs = Err(e)
         }
     }
+
+    fn visit_select(&mut self, this: &mut Select) {
+        match &this.from_clause {
+            None => { // fast path
+                match self.build_standalone_projecting(this) {
+                    Err(e) => self.rs = Err(e),
+                    Ok(rs) => self.result_set = Some(rs),
+                }
+            }
+            Some(_) => {
+                todo!()
+            }
+        }
+    }
 }
 
 pub struct ColumnSet {
@@ -584,7 +646,7 @@ pub struct Column {
 
 pub struct Tuple {
     row_key: NonNull<[u8]>,
-    items: NonNull<[Value]>,
+    pub items: NonNull<[Value]>,
     columns_set: NonNull<ColumnSet>,
 }
 
@@ -651,6 +713,8 @@ impl Tuple {
     }
 
     pub fn columns(&self) -> &ColumnSet { unsafe { self.columns_set.as_ref() } }
+
+    pub fn rename(&mut self, cols: &ArenaBox<ColumnSet>) { self.columns_set = cols.ptr(); }
 
     pub fn get_null(&self, i: usize) -> bool {
         self.get(i).is_null()
@@ -723,26 +787,28 @@ impl SecondaryIndexBundle {
     }
 }
 
-pub struct UpstreamContext<'a> {
+pub struct UpstreamContext {
     prepared_stmt: Option<ArenaBox<PreparedStatement>>,
     arena: ArenaMut<Arena>,
-    symbols: HashMap<&'a str, usize>,
-    fully_qualified_symbols: HashMap<(&'a str, &'a str), usize>,
+    symbols: HashMap<&'static str, usize>,
+    fully_qualified_symbols: HashMap<(&'static str, &'static str), usize>,
+    tuple: Cell<*const [Value]>,
 }
 
-impl <'a> UpstreamContext<'a> {
+impl UpstreamContext {
     pub fn new(prepared_stmt: Option<ArenaBox<PreparedStatement>>, arena: &ArenaMut<Arena>) -> Self {
+        static DUMMY: [Value; 0] = [];
         Self {
             prepared_stmt,
             arena: arena.clone(),
             symbols: HashMap::default(),
             fully_qualified_symbols: HashMap::default(),
+            tuple: Cell::new(addr_of!(DUMMY[..])),
         }
     }
 
     pub fn add(&mut self, column_set: &ColumnSet) {
         let schema = self.dup_str(column_set.schema.as_str());
-
         for i in 0..column_set.columns.len() {
             let col = &column_set.columns[i];
             let name = self.dup_str(col.name.as_str());
@@ -753,15 +819,49 @@ impl <'a> UpstreamContext<'a> {
         }
     }
 
-    fn dup_str(&self, input: &str) -> &'a str {
-        if input.is_empty() {
-            return "";
-        }
+    pub fn dup_str<'a>(&'a self, input: &str) -> &'static str {
         let layout = Layout::from_size_align(input.len(), 4).unwrap();
-        let mut chunk = self.arena.get_mut().allocate(layout).unwrap();
+        let chunk = self.arena.get_mut().allocate(layout).unwrap();
         unsafe {
-            chunk.as_mut().write(input.as_bytes()).unwrap();
+            copy_nonoverlapping(input.as_ptr(), chunk.as_ptr() as *mut u8, input.len());
             std::str::from_utf8_unchecked(chunk.as_ref())
+        }
+    }
+
+    pub fn attach(&self, tuple: &Tuple) {
+        self.tuple.set(tuple.items.as_ptr());
+    }
+}
+
+impl Context for UpstreamContext {
+    fn fast_access(&self, i: usize) -> &Value {
+        unsafe { &(*self.tuple.get())[i] }
+    }
+
+    fn resolve(&self, name: &str) -> Value {
+        match self.symbols.get(name) {
+            Some(index) => self.fast_access(*index).clone(),
+            None => Value::Undefined
+        }
+    }
+
+    fn resolve_fully_qualified(&self, prefix: &str, suffix: &str) -> Value {
+        match self.fully_qualified_symbols.get(&(prefix, suffix)) {
+            Some(index) => self.fast_access(*index).clone(),
+            None => Value::Undefined
+        }
+    }
+
+    fn bound_param(&self, order: usize) -> &Value {
+        match self.prepared_stmt.as_ref() {
+            Some(ps) => {
+                if order >= ps.parameters_len() {
+                    &Value::Undefined
+                } else {
+                    &ps.parameters[order]
+                }
+            }
+            None => &Value::Undefined
         }
     }
 }

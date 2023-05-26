@@ -9,7 +9,7 @@ use crate::sql::lexer::Token;
 macro_rules! ast_nodes_impl {
     [$(($name:ty, $call:ident)),+ $(,)?] => {
         pub trait Visitor {
-            $(fn $call(&mut self, this: &mut $name) { todo!() })+
+            $(fn $call(&mut self, _this: &mut $name) { todo!() })+
         }
         $(statement_impl!($name, $call);)+
     }
@@ -76,7 +76,7 @@ macro_rules! ast_ops_impl {
             $($name,)+
         }
 
-        static OPS_META: [OpMeta; 17] = [
+        static OPS_META: [OpMeta; 18] = [
             $(OpMeta {name: stringify!($name), literal: $op, priority: $prio},)+
         ];
     }
@@ -103,6 +103,8 @@ ast_ops_impl![
     (Le, "<=", 60),
     (Gt, ">", 60),
     (Ge, ">=", 60),
+
+    (Like, "like", 60),
 
     (And, "and", 20),
     (Or, "or", 10),

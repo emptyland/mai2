@@ -1,9 +1,10 @@
 use std::cell::RefCell;
 use std::io::Read;
+use std::ops::Deref;
 use std::sync::Weak;
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaVec};
-use crate::exec::db::DB;
-use crate::exec::executor::{Executor, PreparedStatement, Tuple};
+use crate::exec::db::{ColumnType, DB};
+use crate::exec::executor::{ColumnSet, Executor, PreparedStatement, Tuple};
 use crate::exec::physical_plan::{Feedback, PhysicalPlanOps};
 use crate::{Result, Status};
 use crate::storage::{config, MemorySequentialFile};
@@ -44,13 +45,13 @@ impl Connection {
         self.executor.borrow_mut().prepare(reader, arena)
     }
 
-    pub fn execute_query_str(&self, sql: &str, arena: &ArenaMut<Arena>) -> ResultSet {
+    pub fn execute_query_str(&self, sql: &str, arena: &ArenaMut<Arena>) -> Result<ResultSet> {
         let mut rd = MemorySequentialFile::new(sql.to_string().into());
         self.execute_query(&mut rd, arena)
     }
 
-    pub fn execute_query(&self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> ResultSet {
-        todo!()
+    pub fn execute_query(&self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<ResultSet> {
+        self.executor.borrow_mut().execute_query(reader, arena)
     }
 }
 
@@ -65,6 +66,7 @@ impl Drop for Connection {
 
 pub struct ResultSet {
     arena: ArenaRef<Arena>, // for result tuple
+    columns: ArenaBox<ColumnSet>,
     current: Option<Tuple>,
     pub status: Status,
     fetched_rows: u64,
@@ -74,10 +76,11 @@ pub struct ResultSet {
 }
 
 impl ResultSet {
-    fn from_dcl_stmt(mut plan_root: ArenaBox<dyn PhysicalPlanOps>) -> Result<Self> {
-        plan_root.prepare()?;
+    pub fn from_dcl_stmt(mut plan_root: ArenaBox<dyn PhysicalPlanOps>) -> Result<Self> {
+        let columns = plan_root.prepare()?;
         Ok(Self {
             arena: Arena::new_ref(),
+            columns,
             current: None,
             status: Status::Ok,
             fetched_rows: 0,
@@ -86,6 +89,12 @@ impl ResultSet {
             plan_root,
         })
     }
+
+    pub fn columns(&self) -> &ColumnSet { self.columns.deref() }
+
+    pub fn column_ty(&self, i: usize) -> &ColumnType { &self.columns().columns[i].ty }
+
+    pub fn column_name(&self, i: usize) -> &str { self.columns().columns[i].name.as_str() }
 
     pub fn next(&mut self) -> bool {
         self.current = None;
@@ -106,7 +115,35 @@ impl ResultSet {
             None => false
         }
     }
+
+    pub fn current(&self) -> Result<ResultRow> {
+        if self.status != Status::Ok {
+            return Err(self.status.clone());
+        }
+        match &self.current {
+            Some(tuple) => Ok(ResultRow {
+                tuple,
+                owns: self
+            }),
+            None => Err(Status::NotFound)
+        }
+    }
 }
+
+pub struct ResultRow<'a> {
+    tuple: &'a Tuple,
+    owns: &'a ResultSet
+}
+
+impl <'a> ResultRow<'a> {
+    pub fn columns(&self) -> &ColumnSet { self.tuple.columns() }
+
+    pub fn column_ty(&self, i: usize) -> &ColumnType { &self.columns().columns[i].ty }
+
+    pub fn get_null(&self, i: usize) -> bool { self.tuple.get_null(i) }
+    pub fn get_i64(&self, i: usize) -> Option<i64> { self.tuple.get_i64(i) }
+}
+
 
 impl Drop for ResultSet {
     fn drop(&mut self) {

@@ -1,18 +1,20 @@
-use std::collections::VecDeque;
 use std::ops::{Add, DerefMut, Sub, Mul};
 use std::str::FromStr;
 use std::sync::Arc;
 use crate::{Corrupting, Result, Status};
-use crate::base::{Arena, ArenaMut, ArenaStr};
-use crate::exec::executor::Tuple;
+use crate::base::{Arena, ArenaMut, ArenaStr, ArenaVec};
+use crate::exec::db::ColumnType;
 use crate::sql::ast::*;
 
-pub struct Evaluator {
+pub struct Reducer<T> {
     arena: ArenaMut<Arena>,
     rs: Status,
-    env: VecDeque<Arc<dyn Context>>,
-    stack: VecDeque<Value>,
+    env: ArenaVec<Arc<dyn Context>>,
+    stack: ArenaVec<T>,
 }
+
+pub type Evaluator = Reducer<Value>;
+pub type TypingReducer = Reducer<ColumnType>;
 
 pub trait Context {
     fn fast_access(&self, _i: usize) -> &Value { &Value::Undefined }
@@ -41,16 +43,38 @@ impl Value {
     pub fn is_undefined(&self) -> bool { self.eq(&Value::Undefined) }
 }
 
-impl Evaluator {
+unsafe impl Sync for Value {}
+
+impl <T: Clone> Reducer<T> {
     pub fn new(arena: &ArenaMut<Arena>) -> Self {
         Self {
             arena: arena.clone(),
             rs: Status::Ok,
-            env: VecDeque::default(),
-            stack: VecDeque::default(),
+            env: ArenaVec::new(arena),
+            stack: ArenaVec::new(arena),
         }
     }
 
+    pub fn env_enter(&mut self, env: Arc<dyn Context>) {
+        self.env.push(env);
+    }
+
+    pub fn env_exit(&mut self) {
+        self.env.truncate(self.env.len() - 1);
+    }
+
+    pub fn env(&self) -> &Arc<dyn Context> {
+        self.env.back().unwrap()
+    }
+
+    fn ret(&mut self, elem: T) {
+        self.stack.push(elem);
+    }
+
+    fn take_top(&mut self) -> T { self.stack.pop().unwrap() }
+}
+
+impl Evaluator {
     pub fn evaluate(&mut self, expr: &mut dyn Expression, env: Arc<dyn Context>) -> Result<Value> {
         self.rs = Status::Ok;
         self.stack.clear();
@@ -58,34 +82,23 @@ impl Evaluator {
         expr.accept(self);
         self.env_exit();
         match self.rs {
-            Status::Ok => Ok(self.take_value()),
+            Status::Ok => Ok(self.take_top()),
             _ => Err(self.rs.clone())
         }
     }
 
     fn evaluate_returning(&mut self, expr: &mut dyn Expression) -> Value {
         expr.accept(self);
-        self.take_value()
+        self.take_top()
     }
 
-    pub fn env_enter(&mut self, env: Arc<dyn Context>) {
-        self.env.push_back(env);
-    }
-
-    pub fn env_exit(&mut self) {
-        self.env.pop_back();
-    }
-
-    pub fn env(&self) -> &Arc<dyn Context> {
-        self.env.back().unwrap()
-    }
-
-    fn ret(&mut self, value: Value) {
-        self.stack.push_back(value);
-    }
-
-    fn take_value(&mut self) -> Value {
-        self.stack.pop_back().unwrap()
+    pub fn normalize_to_bool(value: &Value) -> bool {
+        match value {
+            Value::Int(n) => *n != 0,
+            Value::Float(n) => *n != 0f64,
+            Value::Str(s) => !s.is_empty(),
+            _ => false
+        }
     }
 
     fn require_int(origin: &Value) -> Value {
@@ -118,6 +131,7 @@ impl Evaluator {
         }
     }
 }
+
 
 macro_rules! process_airth_op {
     ($self:ident, $this:ident, $call:ident) => {
@@ -259,5 +273,143 @@ impl Visitor for Evaluator {
 
     fn visit_placeholder(&mut self, this: &mut Placeholder) {
         self.ret(self.env().bound_param(this.order).clone())
+    }
+}
+
+
+pub fn expr_typing_reduce(expr: &mut dyn Expression, env: Arc<dyn Context>, arena: &ArenaMut<Arena>) -> Result<ColumnType> {
+    let mut reducer = TypingReducer::new(arena);
+    reducer.reduce(expr, env)
+}
+
+impl TypingReducer {
+    pub fn reduce(&mut self, expr: &mut dyn Expression, env: Arc<dyn Context>) -> Result<ColumnType> {
+        self.rs = Status::Ok;
+        self.stack.clear();
+        self.env_enter(env);
+        expr.accept(self);
+        self.env_exit();
+        match self.rs {
+            Status::Ok => Ok(self.take_top()),
+            _ => Err(self.rs.clone())
+        }
+    }
+
+    fn reduce_returning(&mut self, expr: &mut dyn Expression) -> ColumnType {
+        expr.accept(self);
+        self.take_top()
+    }
+
+    fn reduce_value_type(value: &Value) -> ColumnType {
+        match value {
+            Value::Int(_) => ColumnType::BigInt(11),
+            Value::Float(_) => ColumnType::Double(0, 0),
+            Value::Str(_) => ColumnType::Varchar(255),
+            Value::Null => ColumnType::Varchar(255),
+            _ => unreachable!()
+        }
+    }
+}
+
+
+impl Visitor for TypingReducer {
+    fn visit_identifier(&mut self, this: &mut Identifier) {
+        let value = self.env().resolve(this.symbol.as_str());
+        if value.is_undefined() {
+            self.rs = Status::corrupted(format!("Unresolved symbol: {}", this.symbol.as_str()));
+        }
+        self.ret(Self::reduce_value_type(&value));
+    }
+
+    fn visit_full_qualified_name(&mut self, this: &mut FullyQualifiedName) {
+        let value = self.env().resolve_fully_qualified(this.prefix.as_str(),
+                                                       this.suffix.as_str());
+        if value.is_undefined() {
+            self.rs = Status::corrupted(format!("Unresolved symbol: {}.{}",
+                                                this.prefix.as_str(), this.suffix.as_str()));
+        }
+        self.ret(Self::reduce_value_type(&value));
+    }
+
+    fn visit_unary_expression(&mut self, this: &mut UnaryExpression) {
+        match this.op() {
+            Operator::Not => self.ret(ColumnType::Int(11)),
+            Operator::Minus => {
+                let ty = match self.reduce_returning(this.operands_mut()[0].deref_mut()) {
+                    ColumnType::Float(m, n) => ColumnType::Float(m, n),
+                    ColumnType::Double(m, n) => ColumnType::Double(m, n),
+                    ColumnType::TinyInt(n) => ColumnType::Int(n),
+                    ColumnType::SmallInt(n) => ColumnType::Int(n),
+                    ColumnType::Int(n) => ColumnType::Int(n),
+                    ColumnType::BigInt(n) => ColumnType::BigInt(n),
+                    ColumnType::Char(_) => ColumnType::Int(11),
+                    ColumnType::Varchar(_) => ColumnType::Int(11),
+                    //_ => unreachable!()
+                };
+                self.ret(ty);
+            }
+            _ => unreachable!()
+        }
+    }
+
+    fn visit_binary_expression(&mut self, this: &mut BinaryExpression) {
+        let lhs = self.reduce_returning(this.lhs_mut().deref_mut());
+        let rhs = self.reduce_returning(this.rhs_mut().deref_mut());
+        match this.op() {
+            Operator::Add
+            | Operator::Sub
+            | Operator::Mul
+            | Operator::Div => {
+                if lhs.is_integral() && rhs.is_integral() {
+                    if this.op() == &Operator::Div {
+                        self.ret(ColumnType::Float(0, 0))
+                    } else {
+                        self.ret(ColumnType::BigInt(11))
+                    }
+                } else if lhs.is_number() && rhs.is_number() {
+                    self.ret(ColumnType::Float(0, 0))
+                } else {
+                    debug_assert!(lhs.is_string() || rhs.is_string());
+                    self.ret(ColumnType::Float(0, 0))
+                }
+            }
+            Operator::And
+            | Operator::Or
+            | Operator::Like => self.ret(ColumnType::Int(11)),
+            _ => unreachable!()
+        }
+    }
+
+    fn visit_in_literal_set(&mut self, _this: &mut InLiteralSet) {
+        self.ret(ColumnType::Int(11));
+    }
+
+    fn visit_in_relation(&mut self, _this: &mut InRelation) {
+        self.ret(ColumnType::Int(11));
+    }
+
+    fn visit_call_function(&mut self, this: &mut CallFunction) {
+        todo!()
+    }
+
+    fn visit_int_literal(&mut self, this: &mut Literal<i64>) {
+        self.ret(ColumnType::BigInt(11));
+    }
+
+    fn visit_float_literal(&mut self, this: &mut Literal<f64>) {
+        self.ret(ColumnType::Double(0, 0));
+    }
+
+    fn visit_str_literal(&mut self, this: &mut Literal<ArenaStr>) {
+        self.ret(ColumnType::Varchar(255));
+    }
+
+    fn visit_null_literal(&mut self, this: &mut Literal<()>) {
+        self.ret(ColumnType::Varchar(255));
+    }
+
+    fn visit_placeholder(&mut self, this: &mut Placeholder) {
+        let ty = TypingReducer::reduce_value_type(self.env().bound_param(this.order));
+        self.ret(ty);
     }
 }

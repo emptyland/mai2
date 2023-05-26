@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaVec};
-use crate::exec::executor::{ColumnSet, Tuple, UpstreamContext};
+use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaStr, ArenaVec};
+use crate::exec::executor::{ColumnSet, PreparedStatement, Tuple, UpstreamContext};
 use crate::{Result, Status, storage};
-use crate::exec::db::DB;
-use crate::exec::evaluator::{Context, Evaluator};
+use crate::exec::db::{ColumnType, DB};
+use crate::exec::evaluator::Evaluator;
 use crate::sql::ast::Expression;
 
 pub trait PhysicalPlanOps {
@@ -18,7 +18,7 @@ pub trait PhysicalPlanOps {
         }
     }
 
-    fn next(&mut self, feedback: &mut dyn Feedback, arena: &ArenaRef<Arena>) -> Option<Tuple>;
+    fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple>;
     fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>>;
 }
 
@@ -155,19 +155,22 @@ impl PhysicalPlanOps for RangeScanOps {
     }
 }
 
-pub struct FilteringOps<'a> {
+pub struct FilteringOps {
     expr: ArenaBox<dyn Expression>,
     child: ArenaBox<dyn PhysicalPlanOps>,
     arena: ArenaMut<Arena>,
     projected_columns: ArenaBox<ColumnSet>,
 
-    context: Option<UpstreamContext<'a>>,
+    context: Option<Arc<UpstreamContext>>,
 }
 
-impl <'a> PhysicalPlanOps for FilteringOps<'a> {
+impl PhysicalPlanOps for FilteringOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
-        self.context.as_mut().unwrap().add(self.projected_columns.deref());
-        self.child.prepare()
+        let mut context = UpstreamContext::new(None, &self.arena);
+        context.add(self.projected_columns.deref());
+        self.context = Some(Arc::new(context));
+        self.child.prepare()?;
+        Ok(self.projected_columns.clone())
     }
 
     fn finalize(&mut self) {
@@ -177,24 +180,196 @@ impl <'a> PhysicalPlanOps for FilteringOps<'a> {
 
     fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
         let mut arena = zone.get_mut();
-        let prev = self.child.next(feedback, zone);
-        if prev.is_none() {
-            return None;
+
+        loop {
+            let prev = self.child.next(feedback, zone);
+            if prev.is_none() {
+                break None;
+            }
+            let tuple = prev.unwrap();
+            let mut evaluator = Evaluator::new(&mut arena);
+
+            let context = self.context.as_ref().unwrap().clone();
+            context.attach(&tuple);
+
+            let rs = evaluator.evaluate(self.expr.deref_mut(), context);
+            match rs {
+                Err(e) => {
+                    feedback.catch_error(e);
+                    break None;
+                }
+                Ok(value) => if Evaluator::normalize_to_bool(&value) {
+                    break Some(tuple);
+                }
+            }
         }
-        let tuple = prev.unwrap();
-        //let mut evaluator = Evaluator::new(&mut arena);
-
-        // let rs = evaluator.evaluate(self.expr.deref_mut(),
-        //                             self.context.as_ref().cloned().unwrap());
-
-
-        todo!()
     }
 
     fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
-        let mut children = ArenaVec::new(&self.arena);
-        children.push(self.child.clone());
-        children
+        ArenaVec::of(self.child.clone(), &self.arena)
+    }
+}
+
+pub struct ProjectingOps {
+    columns: ArenaVec<ArenaBox<dyn Expression>>,
+    child: ArenaBox<dyn PhysicalPlanOps>,
+    arena: ArenaMut<Arena>,
+    projected_columns: ArenaBox<ColumnSet>,
+    prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+
+    context: Option<Arc<UpstreamContext>>,
+}
+
+impl ProjectingOps {
+    pub fn new(columns: ArenaVec<ArenaBox<dyn Expression>>,
+               child: ArenaBox<dyn PhysicalPlanOps>,
+               arena: ArenaMut<Arena>,
+               projected_columns: ArenaBox<ColumnSet>,
+               prepared_stmt: Option<ArenaBox<PreparedStatement>>) -> Self {
+        Self {
+            columns,
+            child,
+            arena,
+            projected_columns,
+            prepared_stmt,
+            context: None,
+        }
+    }
+}
+
+impl PhysicalPlanOps for ProjectingOps {
+    fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
+        let mut context = UpstreamContext::new(self.prepared_stmt.clone(),
+                                               &self.arena);
+        context.add(self.projected_columns.deref());
+        self.context = Some(Arc::new(context));
+        self.child.prepare()?;
+        Ok(self.projected_columns.clone())
+    }
+
+    fn finalize(&mut self) {
+        self.context = None;
+        self.child.finalize();
+    }
+
+    fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        let mut arena = zone.get_mut();
+
+        match self.child.next(feedback, zone) {
+            Some(tuple) => {
+                let mut evaluator = Evaluator::new(&mut arena);
+
+                let context = self.context.as_ref().unwrap();
+                context.attach(&tuple);
+
+                let mut rv = Tuple::with(&self.projected_columns, &arena);
+                for i in 0..self.projected_columns.columns.len() {
+                    let expr = &mut self.columns[i];
+                    let rs = evaluator.evaluate(expr.deref_mut(),
+                                                context.clone());
+                    match rs {
+                        Ok(value) => rv.set(i, value),
+                        Err(e) => {
+                            feedback.catch_error(e);
+                            return None;
+                        }
+                    }
+                }
+                Some(rv)
+            }
+            None => None
+        }
+    }
+
+    fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
+        ArenaVec::of(self.child.clone(), &self.arena)
+    }
+}
+
+pub struct ReturningOneDummyOps {
+    projected_columns: ArenaBox<ColumnSet>,
+    returning_count: usize,
+    arena: ArenaMut<Arena>,
+}
+
+impl ReturningOneDummyOps {
+    pub fn new(arena: &ArenaMut<Arena>) -> Self {
+        let mut columns = ColumnSet::new("", arena);
+        columns.append_with_name("$$", ColumnType::TinyInt(1));
+
+        Self {
+            projected_columns: ArenaBox::new(columns, arena.get_mut()),
+            returning_count: 0,
+            arena: arena.clone(),
+        }
+    }
+}
+
+impl PhysicalPlanOps for ReturningOneDummyOps {
+    fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
+        Ok(self.projected_columns.clone())
+    }
+
+    fn next(&mut self, _feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        if self.returning_count > 0 {
+            None
+        } else {
+            let arena = zone.get_mut();
+            self.returning_count += 1;
+            Some(Tuple::with(&self.projected_columns, &arena))
+        }
+    }
+
+    fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
+        ArenaVec::new(&self.arena)
+    }
+}
+
+
+pub struct RenamingOps {
+    schema_as: ArenaStr,
+    columns_as: ArenaVec<ArenaStr>,
+    child: ArenaBox<dyn PhysicalPlanOps>,
+    arena: ArenaMut<Arena>,
+    projected_columns: Option<ArenaBox<ColumnSet>>,
+}
+
+impl PhysicalPlanOps for RenamingOps {
+    fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
+        let origin = self.child.prepare()?;
+        let mut cols = ColumnSet::new(self.schema_as.as_str(), &self.arena);
+        debug_assert_eq!(origin.columns.len(), self.columns_as.len());
+        for i in 0..origin.columns.len() {
+            let col = &origin.columns[i];
+            let name = if self.columns_as[i].is_empty() {
+                col.name.as_str()
+            } else {
+                self.columns_as[i].as_str()
+            };
+            cols.append(name, col.desc.as_str(), col.id, col.ty.clone());
+        }
+        self.projected_columns = Some(ArenaBox::new(cols, self.arena.get_mut()));
+        Ok(self.projected_columns.clone().unwrap())
+    }
+
+    fn next(&mut self, feedback: &mut dyn Feedback, arena: &ArenaRef<Arena>) -> Option<Tuple> {
+        match self.child.next(feedback, arena) {
+            Some(mut tuple) => {
+                tuple.rename(self.projected_columns.as_ref().unwrap());
+                Some(tuple)
+            }
+            _ => None
+        }
+    }
+
+    fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
+        ArenaVec::of(self.child.clone(), &self.arena)
+    }
+}
+
+impl<T: PhysicalPlanOps + 'static> From<ArenaBox<T>> for ArenaBox<dyn PhysicalPlanOps> {
+    fn from(value: ArenaBox<T>) -> Self {
+        Self::from_ptr(value.ptr())
     }
 }
 

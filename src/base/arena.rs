@@ -1,12 +1,12 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::{Cell, RefCell};
-use std::{iter, mem, ptr};
+use std::{iter, mem, ptr, slice};
 use std::cmp::min;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::marker::PhantomData;
-use std::mem::{size_of, size_of_val};
+use std::mem::{align_of, size_of, size_of_val};
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::ptr::{addr_of, addr_of_mut, copy_nonoverlapping, NonNull, slice_from_raw_parts_mut, write};
 use std::rc::Rc;
@@ -155,6 +155,22 @@ impl Arena {
 
     pub fn new_val() -> ArenaVal<Self> {
         ArenaVal::new(Self::new())
+    }
+
+    pub fn dup_str(&mut self, origin: &str) -> Result<&str, ()> {
+        let dest = unsafe {
+            let buf = self.dup_uninitialized_array(origin.as_bytes())?;
+            copy_nonoverlapping(origin.as_ptr(), buf, origin.len());
+            slice::from_raw_parts(buf, origin.len())
+        };
+        Ok(std::str::from_utf8(dest).unwrap())
+    }
+
+    unsafe fn dup_uninitialized_array<T>(&mut self, origin: &[T]) -> Result<*mut T, ()> {
+        let layout = Layout::from_size_align(size_of::<T>() * origin.len(),
+                                             align_of::<T>()).unwrap();
+        let chunk = self.allocate(layout)?;
+        Ok(chunk.as_ptr() as *mut T)
     }
 
     pub fn normal_pages_count(&self) -> i32 {
@@ -488,6 +504,12 @@ impl<T> ArenaVec<T> {
         }
     }
 
+    pub fn of(elem: T, arena: &ArenaMut<Arena>) -> Self {
+        let mut this = Self::new(arena);
+        this.push(elem);
+        this
+    }
+
     pub fn with_init<Fn>(arena: &ArenaMut<Arena>, init: Fn, count: usize) -> Self
         where Fn: FnOnce(usize) -> T + Copy {
         let mut owns = arena.clone();
@@ -508,6 +530,34 @@ impl<T> ArenaVec<T> {
     pub fn push(&mut self, elem: T) {
         self.extend_if_needed(1);
         unsafe { write(&mut self.naked.as_mut()[self.len - 1], elem) }
+    }
+
+    pub fn pop(&mut self) -> Option<T> {
+        if self.is_empty() {
+            None
+        } else {
+            unsafe {
+                let addr = addr_of!(self.naked.as_ref()[self.len() - 1]);
+                self.len -= 1;
+                Some(ptr::read(addr))
+            }
+        }
+    }
+
+    pub fn front(&self) -> Option<&T> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(&self[0])
+        }
+    }
+
+    pub fn back(&self) -> Option<&T> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(&self[self.len() - 1])
+        }
     }
 
     pub fn len(&self) -> usize { self.len }
