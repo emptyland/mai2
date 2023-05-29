@@ -1576,4 +1576,32 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn just_select_calling_version() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db114");
+        let arena = Arena::new_val();
+        let db = DB::open("tests".to_string(), "db114".to_string())?;
+        let conn = db.connect();
+        let mut rs = conn.execute_query_str("select version();", &arena.get_mut())?;
+
+        assert_eq!(1, rs.columns().columns.len());
+        assert_eq!("_0", rs.column_name(0));
+        assert!(matches!(rs.column_ty(0), ColumnType::Varchar(_)));
+        assert!(rs.next());
+        let row = rs.current()?;
+        assert_eq!(Some("mai2-sql:v0.0.1"), row.get_str(0));
+        assert!(!rs.next());
+
+        let mut rs = conn.execute_query_str("select length();", &arena.get_mut())?;
+
+        assert_eq!(1, rs.columns().columns.len());
+        assert_eq!("_0", rs.column_name(0));
+        assert!(matches!(rs.column_ty(0), ColumnType::Int(_)));
+        assert!(rs.next());
+        let row = rs.current()?;
+        assert!(row.get_null(0));
+        assert!(!rs.next());
+        Ok(())
+    }
 }

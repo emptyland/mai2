@@ -142,6 +142,7 @@ impl <'a> ResultRow<'a> {
 
     pub fn get_null(&self, i: usize) -> bool { self.tuple.get_null(i) }
     pub fn get_i64(&self, i: usize) -> Option<i64> { self.tuple.get_i64(i) }
+    pub fn get_str(&self, i: usize) -> Option<&str> { self.tuple.get_str(i) }
 }
 
 

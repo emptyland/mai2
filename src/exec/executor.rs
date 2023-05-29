@@ -12,12 +12,13 @@ use std::sync::{Arc, MutexGuard, Weak};
 
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata};
-use crate::exec::from_sql_result;
+use crate::exec::{from_sql_result, function};
 use crate::sql::ast::*;
 use crate::sql::parser::Parser;
 use crate::{Corrupting, Result, Status};
 use crate::exec::connection::ResultSet;
 use crate::exec::evaluator::{Context, Evaluator, expr_typing_reduce, Value};
+use crate::exec::function::{ExecutionContext, UDF};
 use crate::exec::physical_plan::{ProjectingOps, ReturningOneDummyOps};
 use crate::sql::lexer::Token;
 use crate::sql::serialize::serialize_yaml_to_string;
@@ -792,6 +793,7 @@ pub struct UpstreamContext {
     arena: ArenaMut<Arena>,
     symbols: HashMap<&'static str, usize>,
     fully_qualified_symbols: HashMap<(&'static str, &'static str), usize>,
+    udfs_cache: RefCell<HashMap<&'static str, ArenaBox<dyn UDF>>>,
     tuple: Cell<*const [Value]>,
 }
 
@@ -803,6 +805,7 @@ impl UpstreamContext {
             arena: arena.clone(),
             symbols: HashMap::default(),
             fully_qualified_symbols: HashMap::default(),
+            udfs_cache: RefCell::new(HashMap::default()),
             tuple: Cell::new(addr_of!(DUMMY[..])),
         }
     }
@@ -862,6 +865,23 @@ impl Context for UpstreamContext {
                 }
             }
             None => &Value::Undefined
+        }
+    }
+
+    fn get_udf(&self, name: &str) -> Option<ArenaBox<dyn UDF>> {
+        let mut udfs = self.udfs_cache.borrow_mut();
+        match udfs.get(name) {
+            Some(udf) => Some(udf.clone()),
+            None => {
+                let ctx = ExecutionContext::new(false, &self.arena);
+                match function::new_udf(name, &ctx) {
+                    Some(udf) => {
+                        udfs.insert(self.dup_str(name), udf.clone());
+                        Some(udf)
+                    }
+                    None => None
+                }
+            }
         }
     }
 }

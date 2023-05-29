@@ -7,6 +7,7 @@ mod evaluator;
 mod locking;
 mod relational_plan;
 mod physical_plan;
+mod function;
 
 #[inline]
 pub fn from_sql_result<T>(input: sql::Result<T>) -> crate::Result<T> {

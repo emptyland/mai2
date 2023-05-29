@@ -2,8 +2,9 @@ use std::ops::{Add, DerefMut, Sub, Mul};
 use std::str::FromStr;
 use std::sync::Arc;
 use crate::{Corrupting, Result, Status};
-use crate::base::{Arena, ArenaMut, ArenaStr, ArenaVec};
+use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::ColumnType;
+use crate::exec::function::{AnyFn, ExecutionContext, new_any_fn, Signature, UDF};
 use crate::sql::ast::*;
 
 pub struct Reducer<T> {
@@ -25,6 +26,7 @@ pub trait Context {
         Value::Undefined
     }
     fn bound_param(&self, order: usize) -> &Value;
+    fn get_udf(&self, _name: &str) -> Option<ArenaBox<dyn UDF>> { None }
     // aggregate
 }
 
@@ -252,7 +254,29 @@ impl Visitor for Evaluator {
     }
 
     fn visit_call_function(&mut self, this: &mut CallFunction) {
-        todo!()
+        match self.env().get_udf(this.callee_name.as_str()) {
+            Some(udf) => {
+                let mut args = ArenaVec::new(&self.arena);
+                for expr in this.args.iter_mut() {
+                    args.push(self.evaluate_returning(expr.deref_mut()));
+                    if self.rs.is_not_ok() {
+                        self.ret(Value::Undefined);
+                        break;
+                    }
+                }
+                match udf.evaluate(&args, &self.arena) {
+                    Ok(value) => self.ret(value),
+                    Err(e) => {
+                        self.ret(Value::Undefined);
+                        self.rs = e;
+                    }
+                }
+            }
+            None => {
+                self.rs = Status::corrupted(format!("Unresolved function: {}", this.callee_name));
+                self.ret(Value::Undefined);
+            }
+        }
     }
 
     fn visit_int_literal(&mut self, this: &mut Literal<i64>) {
@@ -389,7 +413,21 @@ impl Visitor for TypingReducer {
     }
 
     fn visit_call_function(&mut self, this: &mut CallFunction) {
-        todo!()
+        let ctx = ExecutionContext::new(this.distinct, &self.arena);
+        let rs = new_any_fn(this.callee_name.as_str(), &ctx);
+        if rs.is_none() {
+            self.rs = Status::corrupted(format!("Unresolved function: {}", this.callee_name));
+            self.ret(ColumnType::Int(11));
+            return;
+        }
+
+        match rs.unwrap() {
+            AnyFn::Udf(udf) => {
+                let sig = Signature::parse(udf.signatures()[0], &self.arena).unwrap();
+                self.ret(sig.ret_val);
+            }
+            AnyFn::Udaf(udaf) => self.ret(udaf.signature())
+        }
     }
 
     fn visit_int_literal(&mut self, this: &mut Literal<i64>) {
