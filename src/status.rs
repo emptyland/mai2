@@ -9,6 +9,7 @@ pub enum Status {
 impl Status {
     pub fn is_ok(&self) -> bool { matches!(self, Self::Ok) }
     pub fn is_corruption(&self) -> bool { matches!(self, Self::Corruption(_)) }
+    pub fn is_not_found(&self) -> bool { matches!(self, Self::NotFound) }
     pub fn is_not_ok(&self) -> bool { !self.is_ok() }
 }
 

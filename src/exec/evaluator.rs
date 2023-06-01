@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::ops::{Add, DerefMut, Sub, Mul};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -6,6 +7,7 @@ use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::ColumnType;
 use crate::exec::function::{AnyFn, ExecutionContext, new_any_fn, Signature, UDF};
 use crate::sql::ast::*;
+use crate::sql::lexer::Token::Or;
 
 pub struct Reducer<T> {
     arena: ArenaMut<Arena>,
@@ -30,9 +32,12 @@ pub trait Context {
     // aggregate
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub enum Value {
+    #[default]
     Undefined,
+    NegativeInf, // -inf
+    PositiveInf, // +inf
     Null,
     Int(i64),
     Float(f64),
@@ -43,6 +48,39 @@ impl Value {
     pub fn is_null(&self) -> bool { self.eq(&Value::Null) }
     pub fn is_not_null(&self) -> bool { !self.is_null() && !self.is_undefined() }
     pub fn is_undefined(&self) -> bool { self.eq(&Value::Undefined) }
+}
+
+
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        debug_assert!(!self.is_undefined() && !other.is_undefined());
+        if self.is_null() || other.is_null() {
+            return None;
+        }
+        match self {
+            Self::NegativeInf => Some(Ordering::Less),
+            Self::PositiveInf => Some(Ordering::Greater),
+            Self::Int(a) => match other {
+                Self::Int(b) => a.partial_cmp(b),
+                Self::NegativeInf => Some(Ordering::Greater),
+                Self::PositiveInf => Some(Ordering::Less),
+                _ => None
+            }
+            Self::Float(a) => match other {
+                Self::Float(b) => a.partial_cmp(b),
+                Self::NegativeInf => Some(Ordering::Greater),
+                Self::PositiveInf => Some(Ordering::Less),
+                _ => None
+            }
+            Self::Str(a) => match other {
+                Self::Str(b) => a.as_str().partial_cmp(b.as_str()),
+                Self::NegativeInf => Some(Ordering::Greater),
+                Self::PositiveInf => Some(Ordering::Less),
+                _ => None
+            }
+            _ => unreachable!()
+        }
+    }
 }
 
 unsafe impl Sync for Value {}

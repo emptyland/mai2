@@ -2,6 +2,8 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::cell::{Cell, RefCell};
 use std::{iter, mem, ptr, slice};
 use std::cmp::min;
+use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
@@ -493,9 +495,13 @@ pub struct ArenaVec<T> {
 
 impl<T> ArenaVec<T> {
     pub fn new(arena: &ArenaMut<Arena>) -> Self {
+        Self::with_capacity(1, arena)
+    }
+
+    pub fn with_capacity(capacity: usize, arena: &ArenaMut<Arena>) -> Self {
         let mut owns = arena.clone();
         let naked = unsafe {
-            Self::new_uninitialized(owns.deref_mut(), 1)
+            Self::new_uninitialized(owns.deref_mut(), capacity)
         };
         Self {
             naked,
@@ -627,6 +633,16 @@ impl<T> ArenaVec<T> {
     }
 }
 
+impl <T: Clone> Clone for ArenaVec<T> {
+    fn clone(&self) -> Self {
+        let mut other = Self::with_capacity(self.capacity(), &self.owns);
+        for elem in self {
+            other.push(elem.clone());
+        }
+        other
+    }
+}
+
 impl <T: Clone> ArenaVec<T> {
     pub fn to_vec(&self) -> Vec<T> {
         Vec::from(self.as_slice())
@@ -739,6 +755,43 @@ impl<T: Debug> Debug for ArenaVec<T> {
         r.finish()
     }
 }
+
+mod map {
+    use super::*;
+
+    pub struct ArenaHashMap<K, V, S = RandomState> {
+        arena: ArenaMut<Arena>,
+        hash_builder: S,
+        buckets: NonNull<[Bucket<K, V>]>,
+    }
+
+    struct Bucket<K, V> {
+        head: *mut Node<K, V>,
+    }
+
+    struct Node<K, V> {
+        kv_pair: (K, V),
+        next: *mut Self,
+    }
+
+    // impl <K, V> ArenaHashMap<K, V, RandomState> {
+    //     const EMPTY_BUCKETS_DUMMY: [Bucket<K, V>; 0] = [];
+    //
+    //     pub fn new(arena: &ArenaMut<Arena>) -> Self {
+    //         let ptr = addr_of_mut!(Self::EMPTY_BUCKETS_DUMMY);
+    //
+    //         Self {
+    //             arena: arena.clone(),
+    //             hash_builder: RandomState::new(),
+    //             buckets: NonNull::new(addr_of_mut!(Self::EMPTY_BUCKETS_DUMMY[..])).unwrap()
+    //         }
+    //     }
+    // }
+}
+
+
+
+
 
 #[cfg(test)]
 mod tests {

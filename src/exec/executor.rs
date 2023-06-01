@@ -1,13 +1,12 @@
 use std::alloc::Layout;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::intrinsics::copy_nonoverlapping;
 use std::io::{Read, Write};
 use std::iter::repeat;
 use std::ops::{AddAssign, DerefMut, Index};
-use std::{mem, ptr};
-use std::ptr::{addr_of, NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
-use std::rc::Rc;
+use std::mem;
+use std::ptr::{addr_of, NonNull, slice_from_raw_parts_mut};
 use std::sync::{Arc, MutexGuard, Weak};
 
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};

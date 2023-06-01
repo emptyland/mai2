@@ -61,6 +61,37 @@ ast_nodes_impl![
     (Placeholder, visit_placeholder),
 ];
 
+#[macro_export]
+macro_rules! visit_fatal {
+    ($self:ident, $($arg:tt)*) => {
+        $self.rs = Status::corrupted(format!($($arg)*));
+        return;
+    }
+}
+
+#[macro_export]
+macro_rules! try_visit {
+    ($self:ident, $node:expr) => {
+        {
+            $node.accept($self);
+            if $self.rs.is_not_ok() {
+                return;
+            }
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! break_visit {
+    ($self:ident, $node:expr) => {
+        {
+            $node.accept($self);
+            if $self.rs.is_not_ok() {
+                break;
+            }
+        }
+    }
+}
 
 pub trait Statement {
     fn as_any(&self) -> &dyn Any;

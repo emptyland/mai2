@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::default::Default;
 use std::io::Write;
@@ -6,7 +5,6 @@ use std::iter;
 use std::mem::size_of;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use rusty_pool::ThreadPool;
@@ -29,7 +27,7 @@ pub struct DB {
     storage: Arc<dyn storage::DB>,
     rd_opts: ReadOptions,
     wr_opts: WriteOptions,
-    default_column_family: Arc<dyn storage::ColumnFamily>,
+    default_column_family: Arc<dyn ColumnFamily>,
     //tables: Mutex<HashMap<String, Box>>
     tables_handle: RwLock<HashMap<String, TableRef>>,
 
@@ -42,9 +40,9 @@ pub struct DB {
     // TODO:
 }
 
-type TableRef = Arc<TableHandle>;
-type LockingTables<'a> = RwLockReadGuard<'a, HashMap<String, TableRef>>;
-type LockingTablesMut<'a> = RwLockWriteGuard<'a, HashMap<String, TableRef>>;
+pub type TableRef = Arc<TableHandle>;
+pub type LockingTables<'a> = RwLockReadGuard<'a, HashMap<String, TableRef>>;
+pub type LockingTablesMut<'a> = RwLockWriteGuard<'a, HashMap<String, TableRef>>;
 
 
 impl DB {
