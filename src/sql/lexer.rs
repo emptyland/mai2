@@ -262,6 +262,27 @@ impl<'a> Lexer<'a> {
                     }
                     return Ok(self.to_concat_token(Token::Id(self.str("_")), start_pos));
                 }
+                '>' => {
+                    let start_pos = self.current_position();
+                    self.move_next()?;
+                    if self.peek() == '=' {
+                        self.move_next()?;
+                        return Ok(self.to_concat_token(Token::Ge, start_pos));
+                    }
+                    return Ok(self.to_single_token(Token::Gt, start_pos));
+                }
+                '<' => {
+                    let start_pos = self.current_position();
+                    self.move_next()?;
+                    if self.peek() == '=' {
+                        self.move_next()?;
+                        return Ok(self.to_concat_token(Token::Le, start_pos));
+                    } else if self.peek() == '>' {
+                        self.move_next()?;
+                        return Ok(self.to_concat_token(Token::Ne, start_pos));
+                    }
+                    return Ok(self.to_single_token(Token::Lt, start_pos));
+                }
                 _ => {
                     if ch.is_ascii_whitespace() {
                         self.move_next()?;
@@ -363,6 +384,16 @@ impl<'a> Lexer<'a> {
                 end: self.current_position(),
             },
         })
+    }
+
+    fn to_single_token(&self, token: Token, pos: SourcePosition) -> TokenPart {
+        TokenPart {
+            token,
+            location: SourceLocation {
+                start: pos.clone(),
+                end: pos,
+            }
+        }
     }
 
     fn to_concat_token(&self, token: Token, start_pos: SourcePosition) -> TokenPart {

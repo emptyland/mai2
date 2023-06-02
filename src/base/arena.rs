@@ -655,6 +655,12 @@ impl <T> Deref for ArenaVec<T> {
     fn deref(&self) -> &Self::Target { self.as_slice() }
 }
 
+impl <T> DerefMut for ArenaVec<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_slice_mut()
+    }
+}
+
 impl Hash for ArenaVec<u8> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write(self.as_slice())

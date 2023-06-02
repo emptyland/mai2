@@ -897,6 +897,11 @@ impl DB {
         }
     }
 
+    pub fn _test_get_table_ref(&self, name: &str) -> Option<TableRef> {
+        let tables = self.lock_tables();
+        tables.get(&name.to_string()).cloned()
+    }
+
     pub fn _test_get_row(&self, table_name: &String,
                          columns_set: &ArenaBox<ColumnSet>,
                          row_key: &[u8],

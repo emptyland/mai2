@@ -1,3 +1,4 @@
+use std::env::args;
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -6,7 +7,7 @@ use crate::{break_visit, Corrupting, Result, Status, try_visit, visit_fatal};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::{DB, TableHandle};
 use crate::exec::evaluator::Value;
-use crate::exec::executor::{Column, ColumnSet};
+use crate::exec::executor::{Column, ColumnSet, PreparedStatement};
 use crate::exec::function;
 use crate::exec::function::{Aggregator, ExecutionContext};
 use crate::exec::physical_plan::{PhysicalPlanOps, RangeScanOps};
@@ -104,6 +105,7 @@ impl Visitor for PlanMaker {
 // (0, +) | (-, 100) | [200, 200]
 // = (-, 0) (100, +) [200, 200]
 struct PhysicalSelectionAnalyzer {
+    prepared_stmt: Option<ArenaBox<PreparedStatement>>,
     table: Arc<TableHandle>,
     analyzing_vals: ArenaVec<AnalyzedVal>,
     arena: ArenaMut<Arena>,
@@ -113,6 +115,7 @@ struct PhysicalSelectionAnalyzer {
 // pk > 0 and pk < 100 => scan(pk)
 // pk > 0 and k1 > 0 => filter(k1) <- scan(pk)
 // pk > 0 or k1 > 0 => scan(pk) merge scan(k1)
+#[derive(Debug, Clone)]
 struct SelectionSet {
     key_id: u64,
     part_of: usize,
@@ -120,6 +123,64 @@ struct SelectionSet {
     segments: ArenaVec<SelectionRange>,
 }
 
+impl SelectionSet {
+
+    fn intersect(&mut self, other: &ArenaVec<SelectionRange>) {
+        let mut rv = ArenaVec::new(&self.segments.owns);
+        for a in &self.segments {
+            for b in other {
+                let r = a.intersect(b);
+                if !r.is_empty() {
+                    rv.push(r);
+                }
+            }
+        }
+        self.segments = Self::merge_overlapped_range(&mut rv)
+    }
+
+    fn union(&mut self, other: &ArenaVec<SelectionRange>) {
+        for b in other {
+            self.segments.push(b.clone());
+        }
+        self.segments = Self::merge_overlapped_range(&mut self.segments);
+    }
+
+    fn merge_overlapped_range(ranges: &mut ArenaVec<SelectionRange>) -> ArenaVec<SelectionRange> {
+        ranges.sort_by(|a,b|{ a.min.partial_cmp(&b.min).unwrap() });
+
+        match ranges.len() {
+            0 | 1 => ranges.clone(), // fast path
+            _ => {
+                let mut rv = ArenaVec::new(&ranges.owns);
+                match ranges[0].union(&ranges[1]) {
+                    Some(r) => rv.push(r),
+                    None => {
+                        rv.push(ranges[0].clone());
+                        rv.push(ranges[1].clone());
+                    }
+                }
+                for i in 2..ranges.len() {
+                    let mut merged = false;
+                    let b = &ranges[i];
+                    for j in 0..rv.len() {
+                        let a = &rv[j];
+                        if let Some(r) = a.union(b) {
+                            rv[j] = r.clone();
+                            merged = true;
+                            break;
+                        }
+                    }
+                    if !merged {
+                        rv.push(b.clone());
+                    }
+                }
+                rv
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct SelectionRange {
     min: Value,
     max: Value,
@@ -128,6 +189,15 @@ struct SelectionRange {
 }
 
 impl SelectionRange {
+    fn from_min_to_max(min: Value, max: Value, left_close: bool, right_close: bool) -> Self {
+        Self {
+            min,
+            max,
+            left_close,
+            right_close,
+        }
+    }
+
     fn from_min_to_positive_infinity(min: Value, close: bool) -> Self {
         Self {
             min,
@@ -154,6 +224,107 @@ impl SelectionRange {
             right_close: true,
         }
     }
+
+    fn inf() -> Self {
+        Self {
+            min: Value::NegativeInf,
+            max: Value::PositiveInf,
+            left_close: false,
+            right_close: false,
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            min: Value::PositiveInf,
+            max: Value::NegativeInf,
+            left_close: true,
+            right_close: true,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self.min, Value::PositiveInf) && matches!(self.max, Value::NegativeInf)
+    }
+
+    fn is_inf(&self) -> bool {
+        matches!(self.min, Value::NegativeInf) && matches!(self.max, Value::PositiveInf)
+    }
+
+    // (-∞, 1) ∩ [1, +∞) => Ø
+    // (-∞, 1] ∩ [1, +∞) => [1, 1]
+    // (-∞, 100] ∩ [12, +∞) => [12, 100]
+    // (0, 100) ∩ (1,99) => (1, 99)
+    fn intersect(&self, other: &Self) -> Self {
+        let mut rv = Self::empty();
+        if self.is_contain_of(other) {
+            rv = other.clone();
+            rv.left_close = self.left_should_close(other);
+            rv.right_close = self.right_should_close(other);
+        } else if other.is_contain_of(self) {
+            rv = self.clone();
+            rv.left_close = other.left_should_close(self);
+            rv.right_close = other.right_should_close(self);
+        } else if self.min <= other.min && self.is_overlapped_of(other) {
+            rv.min = other.min.clone();
+            rv.left_close = other.left_close;
+            rv.max = self.max.clone();
+            rv.right_close = self.right_close;
+        } else if self.min >= other.min && other.is_overlapped_of(self) {
+            rv.min = self.min.clone();
+            rv.left_close = self.left_close;
+            rv.max = other.max.clone();
+            rv.right_close = other.right_close;
+        }
+        rv
+    }
+
+    // (-∞, 1) ∪ (1, +∞) => (-∞, 1),(1, +∞)
+    // (-∞, 1] ∪ [1, +∞) => (-∞, +∞)
+    // (0, 100) ∪ (1,99) => (0, 100)
+    fn union(&self, other: &Self) -> Option<Self> {
+        if self.is_contain_of(other) {
+            Some(self.clone())
+        } else if other.is_contain_of(self) {
+            Some(other.clone())
+        } else if self.min <= other.min && self.is_continuous_of(other) {
+            Some(Self::from_min_to_max(self.min.clone(), other.max.clone(),
+                                        self.left_close, other.right_close))
+        } else if self.min >= other.min && other.is_continuous_of(self) {
+            Some(Self::from_min_to_max(other.min.clone(), self.max.clone(),
+                                       other.left_close, self.right_close))
+        } else {
+            None
+        }
+    }
+
+    fn left_should_close(&self, other: &Self) -> bool {
+        if self.min == other.min {
+            self.left_close && other.left_close
+        } else {
+            other.left_close
+        }
+    }
+
+    fn right_should_close(&self, other: &Self) -> bool {
+        if self.max == other.max {
+            self.right_close && other.right_close
+        } else {
+            other.right_close
+        }
+    }
+
+    fn is_continuous_of(&self, other: &Self) -> bool {
+        other.min < self.max || (other.min == self.max && (other.left_close || self.right_close))
+    }
+
+    fn is_overlapped_of(&self, other: &Self) -> bool {
+        other.min < self.max || (other.min == self.max && other.left_close && self.right_close)
+    }
+
+    fn is_contain_of(&self, other: &Self) -> bool {
+        other.min >= self.min && other.max <= self.max
+    }
 }
 
 //#[derive(Debug, PartialEq)]
@@ -170,7 +341,60 @@ enum AnalyzedVal {
     Null,
 }
 
+impl AnalyzedVal {
+    fn is_key(&self) -> bool {
+        self.full_cover_key_id().is_some() || self.partial_cover_key_id().is_some()
+    }
+
+    fn full_cover_key_id(&self) -> Option<u64> {
+        match self {
+            Self::PrimaryKey => Some(0),
+            Self::Index(key_id) => Some(*key_id),
+            _ => None
+        }
+    }
+
+    fn partial_cover_key_id(&self) -> Option<(u64, usize)> {
+        match self {
+            Self::PartOfPrimaryKey(order) => Some((0, *order)),
+            Self::PartOfIndex(key_id, order) => Some((*key_id, *order)),
+            _ => None
+        }
+    }
+
+    fn is_constant(&self) -> bool {
+        match self {
+            Self::Integral(_) | Self::Floating(_) | Self::String(_) => true,
+            _ => false
+        }
+    }
+
+    fn should_ignore(&self) -> bool {
+        match self {
+            Self::NeedEval | Self::Null => true,
+            _ => false
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        match self {
+            Self::Set(_) => true,
+            _ => false
+        }
+    }
+}
+
 impl PhysicalSelectionAnalyzer {
+    fn new(table: &Arc<TableHandle>, arena: &ArenaMut<Arena>,
+           prepared_stmt: Option<ArenaBox<PreparedStatement>>) -> Self {
+        Self {
+            prepared_stmt,
+            table: table.clone(),
+            analyzing_vals: ArenaVec::new(arena),
+            arena: arena.clone(),
+            rs: Status::Ok,
+        }
+    }
 
     fn analyze(&mut self, expr: &mut dyn Expression) -> Result<ArenaVec<SelectionSet>> {
         self.rs = Status::Ok;
@@ -195,6 +419,35 @@ impl PhysicalSelectionAnalyzer {
         } else {
             Ok(self.analyzing_vals.pop().unwrap())
         }
+    }
+
+    fn merge_selection_sets(&mut self, a: &mut ArenaVec<SelectionSet>, b: &ArenaVec<SelectionSet>,
+                            op: &Operator) -> bool {
+        let mut processed_pairs = ArenaVec::new(&self.arena);
+        for dst in a.iter_mut() {
+            for src in b {
+                if dst.key_id == src.key_id && dst.part_of == src.part_of {
+                    match op {
+                        Operator::And => dst.intersect(&src.segments),
+                        Operator::Or => dst.union(&src.segments),
+                        _ => unreachable!()
+                    }
+                    processed_pairs.push((dst.key_id, dst.part_of));
+                }
+            }
+        }
+        for x in b.iter().filter(|x| {
+            processed_pairs.iter()
+                .find(|(key_id, part_of)| {
+                    x.key_id == *key_id && x.part_of == *part_of
+                }).is_none()
+        }) {
+            if op == &Operator::And {
+                return false;
+            }
+            a.push(x.clone());
+        }
+        true
     }
 
     fn build_selection_set(&mut self,
@@ -248,7 +501,7 @@ impl PhysicalSelectionAnalyzer {
 
         let segments = match op {
             Operator::Lt | Operator::Le => {
-                let close = matches!(op, Operator::Le);
+                let close = op == &Operator::Le;
                 ArenaVec::of(if reserve {
                     SelectionRange::from_min_to_positive_infinity(boundary, close)
                 } else {
@@ -256,7 +509,7 @@ impl PhysicalSelectionAnalyzer {
                 }, &self.arena)
             }
             Operator::Gt | Operator::Ge => {
-                let close = matches!(op, Operator::Ge);
+                let close = op == &Operator::Ge;
                 ArenaVec::of(if reserve {
                     SelectionRange::from_negative_infinity_to_max(boundary, close)
                 } else {
@@ -326,42 +579,6 @@ impl PhysicalSelectionAnalyzer {
     }
 }
 
-impl AnalyzedVal {
-    fn is_key(&self) -> bool {
-        self.full_cover_key_id().is_some() || self.partial_cover_key_id().is_some()
-    }
-
-    fn full_cover_key_id(&self) -> Option<u64> {
-        match self {
-            Self::PrimaryKey => Some(0),
-            Self::Index(key_id) => Some(*key_id),
-            _ => None
-        }
-    }
-
-    fn partial_cover_key_id(&self) -> Option<(u64, usize)> {
-        match self {
-            Self::PartOfPrimaryKey(order) => Some((0, *order)),
-            Self::PartOfIndex(key_id, order) => Some((*key_id, *order)),
-            _ => None
-        }
-    }
-
-    fn is_constant(&self) -> bool {
-        match self {
-            Self::Integral(_) | Self::Floating(_) | Self::String(_) => true,
-            _ => false
-        }
-    }
-
-    fn should_ignore(&self) -> bool {
-        match self {
-            Self::NeedEval | Self::Null => true,
-            _ => false
-        }
-    }
-}
-
 impl Visitor for PhysicalSelectionAnalyzer {
     fn visit_identifier(&mut self, this: &mut Identifier) {
         let maybe_col = self.table.get_col_by_name(&this.symbol.to_string());
@@ -406,18 +623,19 @@ impl Visitor for PhysicalSelectionAnalyzer {
     }
 
     fn visit_binary_expression(&mut self, this: &mut BinaryExpression) {
+        let lhs;
+        let rhs;
+        match self.analyzer_expr(this.lhs_mut().deref_mut()) {
+            Ok(kind) => lhs = kind,
+            Err(_) => return
+        }
+        match self.analyzer_expr(this.rhs_mut().deref_mut()) {
+            Ok(kind) => rhs = kind,
+            Err(_) => return
+        }
+
         match this.op() {
             Operator::Lt | Operator::Le | Operator::Gt | Operator::Ge | Operator::Eq | Operator::Ne => {
-                let lhs;
-                let rhs;
-                match self.analyzer_expr(this.lhs_mut().deref_mut()) {
-                    Ok(kind) => lhs = kind,
-                    Err(_) => return
-                }
-                match self.analyzer_expr(this.rhs_mut().deref_mut()) {
-                    Ok(kind) => rhs = kind,
-                    Err(_) => return
-                }
                 let analyzed = if lhs.is_key() && rhs.is_constant() {
                     self.build_selection_set(lhs, rhs, this.op(), false)
                         .map_or(AnalyzedVal::NeedEval, |x| {
@@ -433,8 +651,25 @@ impl Visitor for PhysicalSelectionAnalyzer {
                 };
                 self.ret(analyzed);
             }
-            Operator::And => todo!(),
-            Operator::Or => todo!(),
+            Operator::And | Operator::Or => {
+                if lhs.is_set() && rhs.is_set() {
+                    let mut a = match lhs {
+                        AnalyzedVal::Set(a) => a,
+                        _ => unreachable!()
+                    };
+                    let b = match rhs {
+                        AnalyzedVal::Set(b) => b,
+                        _ => unreachable!()
+                    };
+                    if !self.merge_selection_sets(&mut a, &b, this.op()) {
+                        self.rs = Status::NotFound;
+                        return;
+                    }
+                    self.ret(AnalyzedVal::Set(a));
+                } else {
+                    todo!()
+                }
+            }
             _ => self.ret(AnalyzedVal::NeedEval)
         }
     }
@@ -455,7 +690,22 @@ impl Visitor for PhysicalSelectionAnalyzer {
         self.ret(AnalyzedVal::Null);
     }
 
-    fn visit_placeholder(&mut self, _this: &mut Placeholder) {}
+    fn visit_placeholder(&mut self, this: &mut Placeholder) {
+        if self.prepared_stmt.is_none() {
+            visit_fatal!(self, "Not prepared statement for '?' placeholder");
+        }
+        let prepared_stmt = self.prepared_stmt.as_ref().unwrap().clone();
+        if !prepared_stmt.all_bound() {
+            visit_fatal!(self, "Not all '?' placeholder has been bound in prepared statement");
+        }
+        match &prepared_stmt.parameters[this.order] {
+            Value::Int(n) => self.ret(AnalyzedVal::Integral(*n)),
+            Value::Float(n) => self.ret(AnalyzedVal::Floating(*n)),
+            Value::Str(s) => self.ret(AnalyzedVal::String(s.clone())),
+            Value::Null => self.ret(AnalyzedVal::Null),
+            _ => unreachable!()
+        }
+    }
 }
 
 struct ProjectionColumnVisitor {
@@ -595,23 +845,195 @@ impl Visitor for ProjectionColumnVisitor {
     fn visit_placeholder(&mut self, _this: &mut Placeholder) {}
 }
 
-struct AggregatorCallingScope<'a> {
-    owns: &'a mut ProjectionColumnVisitor,
-}
+#[cfg(test)]
+mod tests {
+    use crate::exec::from_sql_result;
+    use crate::sql::ast::*;
+    use crate::sql::parser::Parser;
+    use crate::storage::{JunkFilesCleaner, MemorySequentialFile};
+    use super::*;
 
-impl<'a> AggregatorCallingScope<'a> {
-    fn new(owns: &'a mut ProjectionColumnVisitor, name: &ArenaStr, agg: &ArenaBox<dyn Aggregator>) -> Self {
-        owns.enter_aggregator_calling(name, agg);
-        Self { owns }
+    #[test]
+    fn selection_range_sanity() {
+        assert!(SelectionRange::empty().is_empty());
+        assert!(SelectionRange::inf().is_inf());
     }
 
-    fn nested_calling(&self) -> bool {
-        self.owns.in_agg_calling > 1
+    #[test]
+    fn selection_range_intersect_to_point() {
+        let a = SelectionRange::from_min_to_max(Value::NegativeInf, Value::Int(1), false, true);
+        let b = SelectionRange::from_min_to_max(Value::Int(1), Value::PositiveInf, true, false);
+        let r = a.intersect(&b);
+        assert_eq!(Value::Int(1), r.min);
+        assert_eq!(Value::Int(1), r.max);
+        assert!(r.left_close && r.right_close);
     }
-}
 
-impl<'a> Drop for AggregatorCallingScope<'a> {
-    fn drop(&mut self) {
-        self.owns.exit_aggregator_calling();
+    #[test]
+    fn selection_range_intersect_to_empty() {
+        let a = SelectionRange::from_min_to_max(Value::NegativeInf, Value::Int(1), false, false);
+        let b = SelectionRange::from_min_to_max(Value::Int(1), Value::PositiveInf, true, false);
+        let r = a.intersect(&b);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn selection_range_intersect_to_range() {
+        // (-∞, 100) ∩ [12, +∞) => [12, 100)
+        let a = SelectionRange::from_negative_infinity_to_max(Value::Int(100), false);
+        let b = SelectionRange::from_min_to_positive_infinity(Value::Int(12), true);
+        let r = a.intersect(&b);
+        assert_eq!(Value::Int(12), r.min);
+        assert!(r.left_close);
+        assert_eq!(Value::Int(100), r.max);
+        assert!(!r.right_close);
+    }
+
+    #[test]
+    fn selection_range_intersect_issue_0() {
+        // (0, 100) ∩ (99,100] => (99, 100)
+        let a = SelectionRange::from_min_to_max(Value::Int(0), Value::Int(100), false, false);
+        let b = SelectionRange::from_min_to_max(Value::Int(99), Value::Int(100), false, true);
+        let r = a.intersect(&b);
+        assert_eq!(Value::Int(99), r.min);
+        assert!(!r.left_close);
+        assert_eq!(Value::Int(100), r.max);
+        assert!(!r.right_close);
+
+        let o = b.intersect(&a);
+        assert_eq!(r, o);
+    }
+
+    #[test]
+    fn selection_range_intersect_issue_1() {
+        // (0, 100) ∩ [0,1) => (0, 1)
+        let a = SelectionRange::from_min_to_max(Value::Int(0), Value::Int(100), false, false);
+        let b = SelectionRange::from_min_to_max(Value::Int(0), Value::Int(1), true, false);
+        let r = a.intersect(&b);
+        assert_eq!(Value::Int(0), r.min);
+        assert!(!r.left_close);
+        assert_eq!(Value::Int(1), r.max);
+        assert!(!r.right_close);
+
+        let o = b.intersect(&a);
+        assert_eq!(r, o);
+    }
+
+    #[test]
+    fn selection_range_union_to_inf() {
+        // (-∞, 1] ∪ [1, +∞) => (-∞, +∞)
+        let a = SelectionRange::from_negative_infinity_to_max(Value::Int(1), true);
+        let b = SelectionRange::from_min_to_positive_infinity(Value::Int(1), true);
+        let r = a.union(&b).unwrap();
+        assert!(r.is_inf());
+        let r = b.union(&a).unwrap();
+        assert!(r.is_inf());
+    }
+
+    #[test]
+    fn selection_range_union_to_inf2() {
+        // (-∞, 1] ∪ (1, +∞) => (-∞, +∞)
+        let a = SelectionRange::from_negative_infinity_to_max(Value::Int(1), true);
+        let b = SelectionRange::from_min_to_positive_infinity(Value::Int(1), false);
+        let r = a.union(&b).unwrap();
+        assert!(r.is_inf());
+        let r = b.union(&a).unwrap();
+        assert!(r.is_inf());
+    }
+
+    #[test]
+    fn selection_range_union_to_2parts() {
+        // (-∞, 1) ∪ (1, +∞) => (-∞, 1), (1, +∞)
+        let a = SelectionRange::from_negative_infinity_to_max(Value::Int(1), false);
+        let b = SelectionRange::from_min_to_positive_infinity(Value::Int(1), false);
+        assert!(a.union(&b).is_none());
+        assert!(b.union(&a).is_none());
+    }
+
+    #[test]
+    fn selection_range_union_to_concat() {
+        // (0, 100) ∪ [99, 200) => (0, 200)
+        let a = SelectionRange::from_min_to_max(Value::Int(0), Value::Int(100), false, false);
+        let b = SelectionRange::from_min_to_max(Value::Int(99), Value::Int(200), true, false);
+        let r = a.union(&b).unwrap();
+        assert_eq!(Value::Int(0), r.min);
+        assert!(!r.left_close);
+        assert_eq!(Value::Int(200), r.max);
+        assert!(!r.right_close);
+        let o = b.union(&a).unwrap();
+        assert_eq!(r, o);
+    }
+
+    #[test]
+    fn selection_range_union_to_contain() {
+        // (-∞, +∞) ∪ [-1, 1] => (-∞, +∞)
+        let a = SelectionRange::inf();
+        let b = SelectionRange::from_min_to_max(Value::Int(-1), Value::Int(1), true, true);
+        assert!(a.union(&b).unwrap().is_inf());
+        assert!(b.union(&a).unwrap().is_inf());
+    }
+
+    #[test]
+    fn physical_selection_analyzing_simple() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db300");
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let db = DB::open("tests".to_string(), "db300".to_string())?;
+        //let n = 10000;
+        let conn = db.connect();
+        let sql = " create table t1 {\n\
+                a int primary key auto_increment,\n\
+                b char(9)\n\
+                index idx_b(b)\n\
+            };\n\
+            insert into table t1(b) values (\"aaa\"),(\"bbb\"),(\"ccc\");\n\
+            ";
+        assert_eq!(3, conn.execute_str(sql, &arena)?);
+        let table = db._test_get_table_ref("t1").unwrap();
+        let stmt = parse_sql_as_select("select * from t1 where a > 100", &arena)?;
+        let mut analyzer = PhysicalSelectionAnalyzer::new(&table, &arena, None);
+        let mut expr = stmt.where_clause.as_ref().cloned().unwrap();
+        let rs = analyzer.analyze(expr.deref_mut())?;
+        assert_eq!(1, rs.len());
+        assert_eq!(0, rs[0].key_id);
+        assert_eq!(Value::PositiveInf, rs[0].segments[0].max);
+        assert_eq!(Value::Int(100), rs[0].segments[0].min);
+        assert!(!rs[0].segments[0].left_close);
+        assert!(!rs[0].segments[0].right_close);
+
+        let stmt = parse_sql_as_select("select * from t1 where a <> 100", &arena)?;
+        let mut expr = stmt.where_clause.as_ref().cloned().unwrap();
+        let rs = analyzer.analyze(expr.deref_mut())?;
+        dbg!(&rs[0]);
+        assert_eq!(1, rs.len());
+        assert_eq!(0, rs[0].key_id);
+        assert_eq!(2, rs[0].segments.len());
+
+        assert_eq!(Value::NegativeInf, rs[0].segments[0].min);
+        assert_eq!(Value::Int(100), rs[0].segments[0].max);
+        assert!(!rs[0].segments[0].left_close);
+        assert!(!rs[0].segments[0].right_close);
+
+        assert_eq!(Value::Int(100), rs[0].segments[1].min);
+        assert_eq!(Value::PositiveInf, rs[0].segments[1].max);
+        assert!(!rs[0].segments[1].left_close);
+        assert!(!rs[0].segments[1].right_close);
+        Ok(())
+    }
+
+    fn parse_sql_as_select(sql: &str, arena: &ArenaMut<Arena>) -> Result<ArenaBox<Select>> {
+        let stmt = parse_sql(sql, arena)?;
+        if !stmt.as_any().is::<Select>() {
+            return Err(Status::corrupted("Not select statement"));
+        }
+        Ok(stmt.into())
+    }
+
+    fn parse_sql(sql: &str, arena: &ArenaMut<Arena>) -> Result<ArenaBox<dyn Statement>> {
+        let mut rd = MemorySequentialFile::new(sql.to_string().into());
+        let factory = Factory::new(arena);
+        let mut parser = from_sql_result(Parser::new(&mut rd, factory))?;
+        let stmts = from_sql_result(parser.parse())?;
+        Ok(stmts[0].clone())
     }
 }

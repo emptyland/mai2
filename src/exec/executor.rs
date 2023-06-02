@@ -230,7 +230,7 @@ impl Executor {
 
 pub struct PreparedStatement {
     statement: ArenaBox<dyn Statement>,
-    parameters: ArenaVec<Value>,
+    pub parameters: ArenaVec<Value>,
 }
 
 impl PreparedStatement {
