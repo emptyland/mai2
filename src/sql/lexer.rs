@@ -234,7 +234,6 @@ impl<'a> Lexer<'a> {
             match ch {
                 '\0' => return self.move_to_single_token(Token::Eof),
                 '+' => return self.move_to_single_token(Token::Plus),
-                '-' => return self.move_to_single_token(Token::Minus),
                 '*' => return self.move_to_single_token(Token::Star),
                 '/' => return self.move_to_single_token(Token::Div),
                 '=' => return self.move_to_single_token(Token::Eq),
@@ -261,6 +260,14 @@ impl<'a> Lexer<'a> {
                         return self.parse_id_or_keyword(ch, start_pos);
                     }
                     return Ok(self.to_concat_token(Token::Id(self.str("_")), start_pos));
+                }
+                '-' => {
+                    let start_pos = self.current_position();
+                    self.move_next()?;
+                    if self.peek().is_numeric() {
+                        return self.parse_number(true)
+                    }
+                    return Ok(self.to_single_token(Token::Minus, start_pos));
                 }
                 '>' => {
                     let start_pos = self.current_position();
@@ -289,7 +296,7 @@ impl<'a> Lexer<'a> {
                     } else if ch.is_alphabetic() {
                         return self.parse_id_or_keyword('\0', self.current_position());
                     } else if ch.is_numeric() {
-                        return self.parse_number();
+                        return self.parse_number(false);
                     } else {
                         let message = format!("Invalid token: `{}'", ch);
                         return Err(ParseError::TokenError(message,
@@ -322,7 +329,7 @@ impl<'a> Lexer<'a> {
         Ok(self.to_concat_token(token, start_pos))
     }
 
-    fn parse_number(&mut self) -> Result<TokenPart> {
+    fn parse_number(&mut self, minus: bool) -> Result<TokenPart> {
         let mut buf = String::new();
         let mut has_dot = false;
         let start_pos = self.current_position();
@@ -345,9 +352,11 @@ impl<'a> Lexer<'a> {
             }
         }
         let token = if has_dot {
-            Token::FloatLiteral(f64::from_str(buf.as_str()).unwrap())
+            let n = f64::from_str(buf.as_str()).unwrap();
+            Token::FloatLiteral(if minus {-n} else {n})
         } else {
-            Token::IntLiteral(i64::from_str(buf.as_str()).unwrap())
+            let n = i64::from_str(buf.as_str()).unwrap();
+            Token::IntLiteral(if minus {-n} else {n})
         };
         Ok(self.to_concat_token(token, start_pos))
     }

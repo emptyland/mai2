@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::fmt::{Display, Formatter};
 use std::ops::{Add, DerefMut, Sub, Mul};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -36,8 +37,8 @@ pub trait Context {
 pub enum Value {
     #[default]
     Undefined,
-    NegativeInf, // -inf
-    PositiveInf, // +inf
+    NegativeInf, // -∞
+    PositiveInf, // +∞
     Null,
     Int(i64),
     Float(f64),
@@ -50,6 +51,19 @@ impl Value {
     pub fn is_undefined(&self) -> bool { self.eq(&Value::Undefined) }
 }
 
+impl Display for Value {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Undefined => f.write_str("<undefined>"),
+            Self::NegativeInf => f.write_str("-∞"),
+            Self::PositiveInf => f.write_str("+∞"),
+            Self::Null => f.write_str("NULL"),
+            Self::Int(n) => write!(f, "{n}"),
+            Self::Float(n) => write!(f, "{n}"),
+            Self::Str(s) => write!(f, "\"{s}\"")
+        }
+    }
+}
 
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {

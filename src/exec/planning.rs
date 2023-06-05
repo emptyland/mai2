@@ -1,4 +1,5 @@
 use std::env::args;
+use std::fmt::{Display, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -124,7 +125,6 @@ struct SelectionSet {
 }
 
 impl SelectionSet {
-
     fn intersect(&mut self, other: &ArenaVec<SelectionRange>) {
         let mut rv = ArenaVec::new(&self.segments.owns);
         for a in &self.segments {
@@ -146,7 +146,7 @@ impl SelectionSet {
     }
 
     fn merge_overlapped_range(ranges: &mut ArenaVec<SelectionRange>) -> ArenaVec<SelectionRange> {
-        ranges.sort_by(|a,b|{ a.min.partial_cmp(&b.min).unwrap() });
+        ranges.sort_by(|a, b| { a.min.partial_cmp(&b.min).unwrap() });
 
         match ranges.len() {
             0 | 1 => ranges.clone(), // fast path
@@ -289,7 +289,7 @@ impl SelectionRange {
             Some(other.clone())
         } else if self.min <= other.min && self.is_continuous_of(other) {
             Some(Self::from_min_to_max(self.min.clone(), other.max.clone(),
-                                        self.left_close, other.right_close))
+                                       self.left_close, other.right_close))
         } else if self.min >= other.min && other.is_continuous_of(self) {
             Some(Self::from_min_to_max(other.min.clone(), self.max.clone(),
                                        other.left_close, self.right_close))
@@ -325,6 +325,18 @@ impl SelectionRange {
     fn is_contain_of(&self, other: &Self) -> bool {
         other.min >= self.min && other.max <= self.max
     }
+
+    fn to_string(&self) -> String { format!("{self}") }
+}
+
+impl Display for SelectionRange {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{},{}{}",
+               if self.left_close {'['} else {'('},
+               self.min,
+               self.max,
+               if self.right_close {']'} else {')'})
+    }
 }
 
 //#[derive(Debug, PartialEq)]
@@ -334,14 +346,36 @@ enum AnalyzedVal {
     PartOfPrimaryKey(usize),
     Index(u64),
     PartOfIndex(u64, usize),
-    NeedEval,
+    NeedEval(ArenaBox<dyn Expression>),
     Integral(i64),
     Floating(f64),
     String(ArenaStr),
+    And(ArenaVec<SelectionSet>, ArenaBox<dyn Expression>),
+    Or(ArenaVec<SelectionSet>, ArenaBox<dyn Expression>),
     Null,
 }
 
 impl AnalyzedVal {
+    fn unwrap_set(self) -> ArenaVec<SelectionSet> {
+        if let Self::Set(set) = self {
+            set
+        } else {
+            panic!("called `AnalyzedVal::unwrap_set()` on a non-`Set` value")
+        }
+    }
+
+    fn unwrap_and(self) -> (ArenaVec<SelectionSet>, ArenaBox<dyn Expression>) {
+        if let Self::And(set, expr) = self {
+            (set, expr)
+        } else {
+            panic!("called `AnalyzedVal::unwrap_and()` on a non-`And` value")
+        }
+    }
+
+    fn need_eval<T: Expression + 'static>(expr: &mut T) -> Self {
+        Self::NeedEval(ArenaBox::from(expr).into())
+    }
+
     fn is_key(&self) -> bool {
         self.full_cover_key_id().is_some() || self.partial_cover_key_id().is_some()
     }
@@ -369,16 +403,16 @@ impl AnalyzedVal {
         }
     }
 
-    fn should_ignore(&self) -> bool {
+    fn is_set(&self) -> bool {
         match self {
-            Self::NeedEval | Self::Null => true,
+            Self::Set(_) => true,
             _ => false
         }
     }
 
-    fn is_set(&self) -> bool {
+    fn is_logic(&self) -> bool {
         match self {
-            Self::Set(_) => true,
+            Self::And(_, _) | Self::Or(_, _) => true,
             _ => false
         }
     }
@@ -396,18 +430,14 @@ impl PhysicalSelectionAnalyzer {
         }
     }
 
-    fn analyze(&mut self, expr: &mut dyn Expression) -> Result<ArenaVec<SelectionSet>> {
+    fn analyze(&mut self, expr: &mut dyn Expression) -> Result<AnalyzedVal> {
         self.rs = Status::Ok;
         self.analyzing_vals.clear();
         expr.accept(self);
         if self.rs.is_not_ok() {
             return Err(self.rs.clone());
         }
-        let analyzed_val = self.analyzing_vals.pop().unwrap();
-        match analyzed_val {
-            AnalyzedVal::Set(set) => Ok(set),
-            _ => Err(Status::NotFound)
-        }
+        Ok(self.analyzing_vals.pop().unwrap())
     }
 
     fn ret(&mut self, kind: AnalyzedVal) { self.analyzing_vals.push(kind); }
@@ -529,7 +559,7 @@ impl PhysicalSelectionAnalyzer {
         };
         Some(SelectionSet {
             key_id,
-            part_of: order.map_or(0, |x|{x}),
+            part_of: order.map_or(0, |x| { x }),
             total: 0, // TODO:
             segments,
         })
@@ -613,13 +643,28 @@ impl Visitor for PhysicalSelectionAnalyzer {
                         }
                     }
                 }
-                None => self.ret(AnalyzedVal::NeedEval),
+                None => self.ret(AnalyzedVal::need_eval(this)),
             }
         }
     }
 
-    fn visit_full_qualified_name(&mut self, _this: &mut FullyQualifiedName) {
-        self.ret(AnalyzedVal::NeedEval);
+    fn visit_full_qualified_name(&mut self, this: &mut FullyQualifiedName) {
+        self.ret(AnalyzedVal::need_eval(this));
+    }
+
+    fn visit_unary_expression(&mut self, this: &mut UnaryExpression) {
+        match this.op() {
+            Operator::IsNull => {
+                todo!()
+            }
+            Operator::IsNotNull => {
+                todo!()
+            }
+            Operator::Not => {
+                todo!()
+            }
+            _ => self.ret(AnalyzedVal::need_eval(this))
+        }
     }
 
     fn visit_binary_expression(&mut self, this: &mut BinaryExpression) {
@@ -634,20 +679,23 @@ impl Visitor for PhysicalSelectionAnalyzer {
             Err(_) => return
         }
 
+
         match this.op() {
             Operator::Lt | Operator::Le | Operator::Gt | Operator::Ge | Operator::Eq | Operator::Ne => {
+                let op = this.op().clone();
+                let default_val = AnalyzedVal::need_eval(this);
                 let analyzed = if lhs.is_key() && rhs.is_constant() {
-                    self.build_selection_set(lhs, rhs, this.op(), false)
-                        .map_or(AnalyzedVal::NeedEval, |x| {
+                    self.build_selection_set(lhs, rhs, &op, false)
+                        .map_or(default_val, |x| {
                             AnalyzedVal::Set(ArenaVec::of(x, &self.arena))
                         })
                 } else if lhs.is_constant() && rhs.is_key() {
-                    self.build_selection_set(rhs, lhs, this.op(), true)
-                        .map_or(AnalyzedVal::NeedEval, |x| {
+                    self.build_selection_set(rhs, lhs, &op, true)
+                        .map_or(default_val, |x| {
                             AnalyzedVal::Set(ArenaVec::of(x, &self.arena))
                         })
                 } else {
-                    AnalyzedVal::NeedEval
+                    default_val
                 };
                 self.ret(analyzed);
             }
@@ -666,11 +714,31 @@ impl Visitor for PhysicalSelectionAnalyzer {
                         return;
                     }
                     self.ret(AnalyzedVal::Set(a));
+                } else if lhs.is_set() && !rhs.is_set() {
+                    let a = match lhs {
+                        AnalyzedVal::Set(a) => a,
+                        _ => unreachable!()
+                    };
+                    if this.op() == &Operator::And {
+                        self.ret(AnalyzedVal::And(a, this.rhs_mut().clone()));
+                    } else {
+                        self.ret(AnalyzedVal::need_eval(this))
+                    }
+                } else if !lhs.is_set() && rhs.is_set() {
+                    let b = match rhs {
+                        AnalyzedVal::Set(b) => b,
+                        _ => unreachable!()
+                    };
+                    if this.op() == &Operator::And {
+                        self.ret(AnalyzedVal::And(b, this.lhs_mut().clone()));
+                    } else {
+                        self.ret(AnalyzedVal::need_eval(this))
+                    }
                 } else {
-                    todo!()
+                    self.ret(AnalyzedVal::need_eval(this));
                 }
             }
-            _ => self.ret(AnalyzedVal::NeedEval)
+            _ => self.ret(AnalyzedVal::need_eval(this))
         }
     }
 
@@ -850,6 +918,7 @@ mod tests {
     use crate::exec::from_sql_result;
     use crate::sql::ast::*;
     use crate::sql::parser::Parser;
+    use crate::sql::serialize::serialize_expr_to_string;
     use crate::storage::{JunkFilesCleaner, MemorySequentialFile};
     use super::*;
 
@@ -993,7 +1062,7 @@ mod tests {
         let stmt = parse_sql_as_select("select * from t1 where a > 100", &arena)?;
         let mut analyzer = PhysicalSelectionAnalyzer::new(&table, &arena, None);
         let mut expr = stmt.where_clause.as_ref().cloned().unwrap();
-        let rs = analyzer.analyze(expr.deref_mut())?;
+        let rs = analyzer.analyze(expr.deref_mut())?.unwrap_set();
         assert_eq!(1, rs.len());
         assert_eq!(0, rs[0].key_id);
         assert_eq!(Value::PositiveInf, rs[0].segments[0].max);
@@ -1003,8 +1072,8 @@ mod tests {
 
         let stmt = parse_sql_as_select("select * from t1 where a <> 100", &arena)?;
         let mut expr = stmt.where_clause.as_ref().cloned().unwrap();
-        let rs = analyzer.analyze(expr.deref_mut())?;
-        dbg!(&rs[0]);
+        let rs = analyzer.analyze(expr.deref_mut())?.unwrap_set();
+        //dbg!(&rs[0]);
         assert_eq!(1, rs.len());
         assert_eq!(0, rs[0].key_id);
         assert_eq!(2, rs[0].segments.len());
@@ -1018,6 +1087,59 @@ mod tests {
         assert_eq!(Value::PositiveInf, rs[0].segments[1].max);
         assert!(!rs[0].segments[1].left_close);
         assert!(!rs[0].segments[1].right_close);
+        Ok(())
+    }
+
+    #[test]
+    fn physical_selection_analyzing_issue_0() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db301");
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let db = DB::open("tests".to_string(), "db301".to_string())?;
+        let conn = db.connect();
+        let sql = " create table t1 {\n\
+                a int primary key auto_increment,\n\
+                b char(9)\n\
+            };\n\
+            ";
+        assert_eq!(0, conn.execute_str(sql, &arena)?);
+        let table = db._test_get_table_ref("t1").unwrap();
+        let stmt = parse_sql_as_select("select * from t1 where a > 100 and b < \"aaa\"", &arena)?;
+        let mut analyzer = PhysicalSelectionAnalyzer::new(&table, &arena, None);
+        let mut expr = stmt.where_clause.as_ref().cloned().unwrap();
+        let (rs, mut expr) = analyzer.analyze(expr.deref_mut())?.unwrap_and();
+
+        assert_eq!(1, rs.len());
+        assert_eq!(0, rs[0].key_id);
+        assert_eq!("(100,+∞)", rs[0].segments[0].to_string());
+
+        let yaml = serialize_expr_to_string(expr.deref_mut());
+        //println!("{yaml}");
+        assert_eq!("BinaryExpression:
+  op: Lt(<)
+  lhs:
+    Identifier: b
+  rhs:
+    StrLiteral: aaa
+", yaml);
+
+
+        let stmt = parse_sql_as_select("select * from t1 where a > 100 and a <= \"200\"", &arena)?;
+        let mut expr = stmt.where_clause.as_ref().cloned().unwrap();
+        let rs = analyzer.analyze(expr.deref_mut())?.unwrap_set();
+        assert_eq!(1, rs.len());
+        assert_eq!(0, rs[0].key_id);
+        assert_eq!("(100,200]", rs[0].segments[0].to_string());
+
+
+        let stmt = parse_sql_as_select("select * from t1 where a <= -100 or a > \"200\"", &arena)?;
+        let mut expr = stmt.where_clause.as_ref().cloned().unwrap();
+        let rs = analyzer.analyze(expr.deref_mut())?.unwrap_set();
+        assert_eq!(1, rs.len());
+        assert_eq!(0, rs[0].key_id);
+        assert_eq!(2, rs[0].segments.len());
+        assert_eq!("(-∞,-100]", rs[0].segments[0].to_string());
+        assert_eq!("(200,+∞)", rs[0].segments[1].to_string());
         Ok(())
     }
 

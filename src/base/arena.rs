@@ -365,6 +365,22 @@ impl<T> ArenaBox<T> {
     }
 }
 
+impl <T> From<&T> for ArenaBox<T> {
+    fn from(value: &T) -> Self {
+        Self {
+            naked: NonNull::new(value as *const T as *mut T).unwrap()
+        }
+    }
+}
+
+impl <T> From<&mut T> for ArenaBox<T> {
+    fn from(value: &mut T) -> Self {
+        Self {
+            naked: NonNull::new(value as *mut T).unwrap()
+        }
+    }
+}
+
 impl<T: ?Sized> ArenaBox<T> {
     pub fn from_ptr(naked: NonNull<T>) -> Self {
         Self { naked }

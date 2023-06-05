@@ -107,7 +107,7 @@ macro_rules! ast_ops_impl {
             $($name,)+
         }
 
-        static OPS_META: [OpMeta; 18] = [
+        static OPS_META: [OpMeta; 20] = [
             $(OpMeta {name: stringify!($name), literal: $op, priority: $prio},)+
         ];
     }
@@ -121,6 +121,8 @@ ast_ops_impl![
 
     (Minus, "-", 110),
     (Not, "not", 110),
+    (IsNull, "is_null", 110),
+    (IsNotNull, "is_not_null", 110),
 
     (Add, "+", 90),
     (Sub, "-", 90),
@@ -153,7 +155,7 @@ impl Operator {
 
     pub fn is_unary(&self) -> bool {
         match self {
-            Self::Minus | Self::Not | Self::Lit => true,
+            Self::Minus | Self::Not | Self::Lit | Self::IsNull | Self::IsNotNull => true,
             _ => false
         }
     }

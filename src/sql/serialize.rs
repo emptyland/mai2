@@ -54,6 +54,13 @@ pub fn serialize_yaml_to_string<T: Statement + ?Sized>(ast: &mut T) -> String {
     String::from_utf8_lossy(&wr).to_string()
 }
 
+pub fn serialize_expr_to_string<T: Expression + ?Sized>(ast: &mut T) -> String {
+    let mut wr = Vec::<u8>::new();
+    let mut encoder = YamlWriter::new(&mut wr, 0);
+    ast.accept(&mut encoder);
+    String::from_utf8_lossy(&wr).to_string()
+}
+
 macro_rules! emit {
     ($self:ident, $($arg:tt)*) => {
         $self.emit_indent();
@@ -352,7 +359,7 @@ mod tests {
         let mut wr = MemoryWritableFile::new();
         let mut yaml = YamlWriter::new(&mut wr, 0);
 
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_val();
         let factory = Factory::new(&arena.get_mut());
         let mut ast = factory.new_create_table(factory.str("aaa"), true);
 
