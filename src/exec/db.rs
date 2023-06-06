@@ -24,8 +24,8 @@ pub struct DB {
     env: Arc<dyn Env>,
     abs_db_path: PathBuf,
     logger: Arc<dyn Logger>,
-    storage: Arc<dyn storage::DB>,
-    rd_opts: ReadOptions,
+    pub storage: Arc<dyn storage::DB>,
+    pub rd_opts: ReadOptions,
     wr_opts: WriteOptions,
     default_column_family: Arc<dyn ColumnFamily>,
     //tables: Mutex<HashMap<String, Box>>
@@ -69,6 +69,7 @@ impl DB {
     const VARCHAR_SEGMENT_LEN: usize = 9;
 
     pub const COL_ID_LEN: usize = size_of::<u32>();
+    pub const KEY_ID_LEN: usize = size_of::<u32>();
 
     pub const ANONYMOUS_ROW_KEY_KEY: &'static [u8] = &[
         0xff, 0xff, 0xff, 0xff, // index id tag
@@ -691,15 +692,15 @@ impl DB {
             | ColumnType::BigInt(_) => {
                 match value {
                     Value::Int(n) => { wr.write(&n.to_be_bytes()).unwrap(); }
+                    Value::NegativeInf => (), // ignore
+                    Value::PositiveInf => (), // ignore
                     _ => unreachable!()
                 }
             }
-            ColumnType::Float(_, _) => match value {
+            ColumnType::Float(_, _) | ColumnType::Double(_, _) => match value {
                 Value::Float(n) => { wr.write(&n.to_be_bytes()).unwrap(); }
-                _ => unreachable!()
-            },
-            ColumnType::Double(_, _) => match value {
-                Value::Float(n) => { wr.write(&n.to_be_bytes()).unwrap(); }
+                Value::NegativeInf => (), // ignore
+                Value::PositiveInf => (), // ignore
                 _ => unreachable!()
             },
             ColumnType::Char(n) => match value {
@@ -709,6 +710,8 @@ impl DB {
                     }
                     Self::encode_char_ty_for_key(s, *n as usize, wr);
                 }
+                Value::NegativeInf => (), // ignore
+                Value::PositiveInf => (), // ignore
                 _ => unreachable!()
             },
             ColumnType::Varchar(n) => match value {
@@ -718,6 +721,7 @@ impl DB {
                     }
                     Self::encode_varchar_ty_for_key(s, wr);
                 }
+                Value::NegativeInf | Value::PositiveInf => (), // ignore
                 _ => unreachable!()
             },
         }
@@ -739,30 +743,35 @@ impl DB {
             | ColumnType::BigInt(_) => {
                 match value {
                     Value::Int(n) => wr.write(&n.to_be_bytes()).unwrap(),
+                    Value::NegativeInf | Value::PositiveInf => 0, // ignore
                     _ => unreachable!()
                 };
             }
             ColumnType::Float(_, _) => {
                 match value {
                     Value::Float(n) => wr.write(&(*n as f32).to_be_bytes()).unwrap(),
+                    Value::NegativeInf | Value::PositiveInf => 0, // ignore
                     _ => unreachable!()
                 };
             }
             ColumnType::Double(_, _) => {
                 match value {
                     Value::Float(n) => wr.write(&n.to_be_bytes()).unwrap(),
+                    Value::NegativeInf | Value::PositiveInf => 0, // ignore
                     _ => unreachable!()
                 };
             }
             ColumnType::Char(n) => {
                 match value {
                     Value::Str(s) => Self::encode_char_ty_for_key(s, *n as usize, wr),
+                    Value::NegativeInf | Value::PositiveInf => (), // ignore
                     _ => unreachable!()
                 }
             }
             ColumnType::Varchar(n) => {
                 match value {
                     Value::Str(s) => Self::encode_varchar_ty_for_key(s, wr),
+                    Value::NegativeInf | Value::PositiveInf => (), // ignore
                     _ => unreachable!()
                 }
             }

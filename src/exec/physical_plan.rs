@@ -33,7 +33,9 @@ pub struct RangeScanOps {
     limit: Option<u64>,
     offset: Option<u64>,
     range_begin: ArenaVec<u8>,
+    left_close: bool,
     range_end: ArenaVec<u8>,
+    right_close: bool,
 
     arena: ArenaMut<Arena>,
     iter: Option<storage::IteratorArc>,
@@ -43,7 +45,9 @@ pub struct RangeScanOps {
 impl RangeScanOps {
     pub fn new(projected_columns: ArenaBox<ColumnSet>,
                range_begin: ArenaVec<u8>,
+               left_close: bool,
                range_end: ArenaVec<u8>,
+               right_close: bool,
                limit: Option<u64>,
                offset: Option<u64>,
                arena: ArenaMut<Arena>,
@@ -59,7 +63,9 @@ impl RangeScanOps {
             limit,
             offset,
             range_begin,
+            left_close,
             range_end,
+            right_close,
             arena,
             iter: Some(iter.clone()),
             col_id_to_order,
@@ -155,18 +161,99 @@ impl PhysicalPlanOps for RangeScanOps {
     }
 }
 
+pub struct MergingOps {
+    current: usize,
+    children: ArenaVec<ArenaBox<dyn PhysicalPlanOps>>,
+    pulled_rows: u64,
+    delta_rows: u64,
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
+impl MergingOps {
+    pub fn new(children: ArenaVec<ArenaBox<dyn PhysicalPlanOps>>, limit: Option<u64>, offset: Option<u64>) -> Self {
+        Self {
+            current: 0,
+            children,
+            pulled_rows: 0,
+            delta_rows: offset.map_or(0, |x|{x}),
+            limit,
+            offset,
+        }
+    }
+}
+
+impl PhysicalPlanOps for MergingOps {
+    fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
+        let mut columns = None;
+        for child in self.children.iter_mut() {
+            columns = Some(child.prepare()?)
+        }
+        Ok(columns.unwrap())
+    }
+
+    fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        while self.current < self.children.len() {
+
+            match self.children[self.current].next(feedback, zone) {
+                Some(row) => {
+                    self.pulled_rows += 1;
+                    if let Some(offset) = &self.offset {
+                        if self.pulled_rows < *offset {
+                            continue
+                        }
+                    }
+                    return Some(row);
+                },
+                None => {
+                    self.current += 1;
+                }
+            }
+
+            if let Some(limit) = &self.limit {
+                if self.pulled_rows - self.delta_rows >= *limit {
+                    break;
+                }
+            }
+        }
+        None
+    }
+
+    fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
+        self.children.clone()
+    }
+}
+
 pub struct FilteringOps {
     expr: ArenaBox<dyn Expression>,
     child: ArenaBox<dyn PhysicalPlanOps>,
     arena: ArenaMut<Arena>,
     projected_columns: ArenaBox<ColumnSet>,
+    prepared_stmt: Option<ArenaBox<PreparedStatement>>,
 
     context: Option<Arc<UpstreamContext>>,
 }
 
+impl FilteringOps {
+    pub fn new(expr: &ArenaBox<dyn Expression>,
+               child: &ArenaBox<dyn PhysicalPlanOps>,
+               projected_columns: &ArenaBox<ColumnSet>,
+               prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+               arena: &ArenaMut<Arena>) -> Self {
+        Self {
+            expr: expr.clone(),
+            child: child.clone(),
+            arena: arena.clone(),
+            projected_columns: projected_columns.clone(),
+            prepared_stmt,
+            context: None,
+        }
+    }
+}
+
 impl PhysicalPlanOps for FilteringOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
-        let mut context = UpstreamContext::new(None, &self.arena);
+        let mut context = UpstreamContext::new(self.prepared_stmt.clone(), &self.arena);
         context.add(self.projected_columns.deref());
         self.context = Some(Arc::new(context));
         self.child.prepare()?;
@@ -408,9 +495,8 @@ mod tests {
         columns.append("name", "", 2, ColumnType::Varchar(64));
 
         let iter = db.new_iterator(&ReadOptions::default(), &db.default_column_family())?;
-        let mut plan = RangeScanOps::new(columns, begin_key,
-                                         end_key, None, None, arena.clone(),
-                                         &iter);
+        let mut plan = RangeScanOps::new(columns, begin_key, true,
+                                         end_key, true, None, None, arena.clone(), &iter);
         plan.prepare()?;
         let mut feedback = FeedbackImpl { status: Status::Ok };
         let mut i = 0i64;

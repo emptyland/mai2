@@ -6,27 +6,29 @@ use std::sync::Arc;
 use crate::sql::ast::*;
 use crate::{break_visit, Corrupting, Result, Status, try_visit, visit_fatal};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
-use crate::exec::db::{DB, TableHandle};
-use crate::exec::evaluator::Value;
-use crate::exec::executor::{Column, ColumnSet, PreparedStatement};
+use crate::exec::db::{DB, TableHandle, TableRef};
+use crate::exec::evaluator::{Evaluator, Value};
+use crate::exec::executor::{Column, ColumnSet, PreparedStatement, UniversalContext};
 use crate::exec::function;
 use crate::exec::function::{Aggregator, ExecutionContext};
-use crate::exec::physical_plan::{PhysicalPlanOps, RangeScanOps};
+use crate::exec::physical_plan::{FilteringOps, MergingOps, PhysicalPlanOps, RangeScanOps};
 
 
 struct PlanMaker {
     db: Arc<DB>,
     arena: ArenaMut<Arena>,
+    prepared_stmt: Option<ArenaBox<PreparedStatement>>,
     rs: Status,
     schemas: ArenaVec<ArenaBox<ColumnSet>>,
     current: ArenaVec<ArenaBox<dyn PhysicalPlanOps>>,
 }
 
 impl PlanMaker {
-    pub fn new(db: &Arc<DB>, arena: &ArenaMut<Arena>) -> Self {
+    pub fn new(db: &Arc<DB>, prepared_stmt: Option<ArenaBox<PreparedStatement>>, arena: &ArenaMut<Arena>) -> Self {
         Self {
             db: db.clone(),
             arena: arena.clone(),
+            prepared_stmt,
             rs: Status::Ok,
             schemas: ArenaVec::new(arena),
             current: ArenaVec::new(arena),
@@ -63,6 +65,150 @@ impl PlanMaker {
     fn top_schema(&self) -> Option<&ArenaBox<ColumnSet>> {
         self.schemas.back()
     }
+
+    fn make_by_physical_selection_analyzed_val(&mut self,
+                                               analyzed: AnalyzedVal,
+                                               table: &TableRef,
+                                               columns: &ArenaBox<ColumnSet>,
+                                               limit: Option<u64>,
+                                               offset: Option<u64>) -> Result<()> {
+        let ops = match analyzed {
+            AnalyzedVal::And(sets, expr) => {
+                let ops = self.make_merging_by_sets(&sets, table, columns,
+                                                    None, None)?;
+                self.make_filtering(&expr, columns, &ops, limit, offset)
+            }
+            AnalyzedVal::Set(sets) => {
+                self.make_merging_by_sets(&sets, table, columns, limit, offset)?
+            }
+            AnalyzedVal::NeedEval(expr) => {
+                let ops = self.make_scan_table(table, columns,
+                                               None, None)?;
+                self.make_filtering(&expr, columns, &ops, limit, offset)
+            }
+            _ => unreachable!()
+        };
+        self.current.push(ops);
+        Ok(())
+    }
+
+    fn make_scan_table(&self, table: &TableRef, columns: &ArenaBox<ColumnSet>,
+                       limit: Option<u64>, offset: Option<u64>) -> Result<ArenaBox<dyn PhysicalPlanOps>> {
+        let mut begin_key = ArenaVec::new(&self.arena);
+        DB::encode_idx_id(0, &mut begin_key);
+        let mut end_key = ArenaVec::new(&self.arena);
+        DB::encode_idx_id(1, &mut end_key);
+
+        let iter = self.db.storage.new_iterator(&self.db.rd_opts,
+                                                &table.column_family).unwrap();
+        let ops = RangeScanOps::new(columns.clone(),
+                                    begin_key, true,
+                                    end_key, true,
+                                    limit, offset,
+                                    self.arena.clone(), &iter);
+        Ok(ArenaBox::new(ops, self.arena.get_mut()).into())
+    }
+
+    fn make_filtering(&self, expr: &ArenaBox<dyn Expression>, columns: &ArenaBox<ColumnSet>,
+                      child: &ArenaBox<dyn PhysicalPlanOps>,
+                      limit: Option<u64>, offset: Option<u64>) -> ArenaBox<dyn PhysicalPlanOps> {
+        let ops = FilteringOps::new(expr, child, columns,
+                                    self.prepared_stmt.clone(), &self.arena);
+        let child = ArenaBox::new(ops, self.arena.get_mut());
+        if limit.is_some() || offset.is_some() {
+            let rv = MergingOps::new(ArenaVec::of(child.into(), &self.arena), limit, offset);
+            ArenaBox::new(rv, self.arena.get_mut()).into()
+        } else {
+            child.into()
+        }
+    }
+
+    fn make_merging_by_sets(&self, sets: &[SelectionSet], table: &TableRef,
+                            columns: &ArenaBox<ColumnSet>,
+                            limit: Option<u64>, offset: Option<u64>) -> Result<ArenaBox<dyn PhysicalPlanOps>> {
+        debug_assert!(sets.len() > 0);
+        let mut children = ArenaVec::new(&self.arena);
+        if sets.len() == 1 {
+            self.make_physical_ops_by_set(sets.first().unwrap(), table, columns, limit, offset,
+                                          &mut children)?;
+        } else {
+            for set in sets {
+                self.make_physical_ops_by_set(set, table, columns, None, None,
+                                              &mut children)?;
+            }
+        }
+        debug_assert!(children.len() > 0);
+        if children.len() == 1 {
+            Ok(children.first().unwrap().clone().into())
+        } else {
+            let ops = MergingOps::new(children, limit, offset);
+            Ok(ArenaBox::new(ops, self.arena.get_mut()).into())
+        }
+    }
+
+    fn make_physical_ops_by_set(&self,
+                                set: &SelectionSet,
+                                table: &TableRef,
+                                columns: &ArenaBox<ColumnSet>,
+                                limit: Option<u64>,
+                                offset: Option<u64>,
+                                receiver: &mut ArenaVec<ArenaBox<dyn PhysicalPlanOps>>) -> Result<()> {
+        for range in set.segments.iter() {
+            let mut begin_key = ArenaVec::new(&self.arena);
+            DB::encode_idx_id(set.key_id, &mut begin_key);
+
+            let mut end_key = ArenaVec::new(&self.arena);
+            if range.max.is_inf() {
+                DB::encode_idx_id(set.key_id + 1, &mut end_key);
+            } else {
+                DB::encode_idx_id(set.key_id, &mut end_key);
+            }
+
+            if set.key_id == 0 { // is primary key
+                let col_id = table.metadata.primary_keys[set.part_of];
+                let col = table.get_col_by_id(col_id).unwrap();
+                DB::encode_row_key(&range.min, &col.ty, &mut begin_key)?;
+                DB::encode_row_key(&range.max, &col.ty, &mut end_key)?;
+            } else {
+                let key = table.get_2rd_idx_by_id(set.key_id).unwrap();
+                let col_id = key.key_parts[set.part_of];
+                let col = table.get_col_by_id(col_id).unwrap();
+                DB::encode_secondary_index(&range.min, &col.ty, &mut begin_key);
+                DB::encode_secondary_index(&range.max, &col.ty, &mut end_key);
+            }
+
+            let iter = self.db.storage.new_iterator(&self.db.rd_opts,
+                                                    &table.column_family).unwrap();
+            let ops = RangeScanOps::new(columns.clone(),
+                                        begin_key, range.left_close,
+                                        end_key, range.right_close,
+                                        if set.segments.len() == 1 { limit } else { None },
+                                        if set.segments.len() == 1 { offset } else { None },
+                                        self.arena.clone(), &iter);
+            receiver.push(ArenaBox::new(ops, self.arena.get_mut()).into())
+        }
+        Ok(())
+    }
+
+    fn build_column_set(&self, table: &TableRef, cols: &ArenaVec<(ArenaStr, ArenaStr)>) -> ArenaBox<ColumnSet> {
+        todo!()
+    }
+
+    fn eval_require_u64_literal(&self, may_expr: &Option<ArenaBox<dyn Expression>>) -> Result<Option<u64>> {
+        match may_expr {
+            Some(expr) => {
+                let mut evaluator = Evaluator::new(&self.arena);
+                let context = Arc::new(UniversalContext::new(self.prepared_stmt.clone()));
+                let mut owned_expr = expr.clone();
+                let val = evaluator.evaluate(owned_expr.deref_mut(), context)?;
+                match val {
+                    Value::Int(n) => Ok(Some(n as u64)),
+                    _ => Err(Status::corrupted("Require integral literal by limit of offset clause"))
+                }
+            }
+            None => Ok(None)
+        }
+    }
 }
 
 
@@ -80,10 +226,53 @@ impl Visitor for PlanMaker {
         for col in this.columns.iter_mut() {
             projection_col_visitor.visit(col);
         }
-        if let Some(table) = maybe_table {
-            if this.where_clause.is_none() {
-                //let plan = RangeScanOps::new()
+
+        if !projection_col_visitor.aggregators.is_empty() {
+            todo!()
+        }
+
+        let limit;
+        match self.eval_require_u64_literal(&this.limit_clause) {
+            Err(e) => {
+                self.rs = e;
+                return;
             }
+            Ok(val) => limit = val,
+        }
+
+        let offset;
+        match self.eval_require_u64_literal(&this.offset_clause) {
+            Err(e) => {
+                self.rs = e;
+                return;
+            }
+            Ok(val) => offset = val,
+        }
+
+        if let Some(table) = maybe_table {
+            let low_columns = self.build_column_set(&table,
+                                                    &projection_col_visitor.projection_fields);
+
+            if let Some(selection) = &mut this.where_clause {
+                let mut analyzer = PhysicalSelectionAnalyzer::new(&table, &self.arena, None);
+                match analyzer.analyze(selection.deref_mut()) {
+                    Err(e) => {
+                        self.rs = e;
+                        return;
+                    }
+                    Ok(analyzed_val) => {
+                        match self.make_by_physical_selection_analyzed_val(analyzed_val,
+                                                                           &table, &low_columns,
+                                                                           limit, offset) {
+                            Err(e) => self.rs = e,
+                            Ok(_) => (),
+                        }
+                    }
+                }
+            } else {
+                // TODO: just scan all table
+            }
+            return;
         }
 
         match &mut this.where_clause {
@@ -332,10 +521,10 @@ impl SelectionRange {
 impl Display for SelectionRange {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}{},{}{}",
-               if self.left_close {'['} else {'('},
+               if self.left_close { '[' } else { '(' },
                self.min,
                self.max,
-               if self.right_close {']'} else {')'})
+               if self.right_close { ']' } else { ')' })
     }
 }
 
@@ -417,6 +606,7 @@ impl AnalyzedVal {
         }
     }
 }
+
 
 impl PhysicalSelectionAnalyzer {
     fn new(table: &Arc<TableHandle>, arena: &ArenaMut<Arena>,

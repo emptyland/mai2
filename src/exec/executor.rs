@@ -885,7 +885,7 @@ impl Context for UpstreamContext {
     }
 }
 
-struct UniversalContext {
+pub struct UniversalContext {
     prepared_stmt: Option<ArenaBox<PreparedStatement>>,
 }
 
