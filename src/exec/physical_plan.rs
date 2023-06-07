@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
@@ -8,6 +9,7 @@ use crate::{Result, Status, storage};
 use crate::exec::db::{ColumnType, DB};
 use crate::exec::evaluator::Evaluator;
 use crate::sql::ast::Expression;
+use crate::storage::{ColumnFamily, ReadOptions};
 
 pub trait PhysicalPlanOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>>;
@@ -36,9 +38,13 @@ pub struct RangeScanOps {
     left_close: bool,
     range_end: ArenaVec<u8>,
     right_close: bool,
+    key_id: u64,
+    eof: Cell<bool>,
 
     arena: ArenaMut<Arena>,
     iter: Option<storage::IteratorArc>,
+    storage: Option<Arc<dyn storage::DB>>,
+    cf: Option<Arc<dyn ColumnFamily>>,
     col_id_to_order: HashMap<u32, usize>,
 }
 
@@ -51,12 +57,14 @@ impl RangeScanOps {
                limit: Option<u64>,
                offset: Option<u64>,
                arena: ArenaMut<Arena>,
-               iter: &storage::IteratorArc) -> Self {
+               storage: Arc<dyn storage::DB>,
+               cf: Arc<dyn ColumnFamily>) -> Self {
         let mut col_id_to_order = HashMap::new();
         for i in 0..projected_columns.columns.len() {
             let col = &projected_columns.columns[i];
             col_id_to_order.insert(col.id, i);
         }
+        let key_id = DB::parse_key_id(&range_begin);
         Self {
             projected_columns,
             pulled_rows: 0,
@@ -66,28 +74,69 @@ impl RangeScanOps {
             left_close,
             range_end,
             right_close,
+            key_id,
+            eof: Cell::new(false),
             arena,
-            iter: Some(iter.clone()),
+            iter: None,
+            storage: Some(storage),
+            cf: Some(cf),
             col_id_to_order,
         }
     }
 
+    fn key_id_bytes(&self) -> &[u8] {
+        &self.range_begin.as_slice()[..DB::KEY_ID_LEN]
+    }
+
     fn next_row<F>(&self, iter: &mut dyn storage::Iterator, mut each_col: F, arena: &ArenaMut<Arena>) -> Result<()>
         where F: FnMut(&[u8], &[u8]) {
-        debug_assert!(iter.key().len() >= DB::PRIMARY_KEY_ID_BYTES.len() + DB::COL_ID_LEN);
-        let row_key_ref = &iter.key()[..iter.key().len() - DB::COL_ID_LEN];
-        if !row_key_ref.starts_with(&DB::PRIMARY_KEY_ID_BYTES) {
-            return Ok(());
+        debug_assert!(iter.key().len() >= DB::KEY_ID_LEN + DB::COL_ID_LEN);
+        debug_assert!(!self.eof.get());
+
+        let key_ref = &iter.key()[..iter.key().len() - DB::COL_ID_LEN];
+        if !key_ref.starts_with(self.key_id_bytes()) {
+            return Err(Status::NotFound);
+        }
+        if key_ref.starts_with(&self.range_end) {
+            self.eof.set(true);
+            if !self.right_close {
+                return Err(Status::NotFound);
+            }
         }
 
         let mut row_key = ArenaVec::<u8>::new(arena);
-        row_key.write(row_key_ref).unwrap();
+        if self.key_id != 0 { // 2rd index
+            let rd_opts = ReadOptions::default();
+            let db = self.storage.as_ref().unwrap();
 
-        debug_assert!(iter.valid());
-        while iter.valid() && iter.key().starts_with(&row_key) {
-            each_col(iter.key(), iter.value());
+            row_key.write(iter.value()).unwrap();
+            let prefix_len = row_key.len();
+
+            for (col_id, _) in self.col_id_to_order.iter() {
+                row_key.write(&col_id.to_be_bytes()).unwrap();
+                let rs = db.get_pinnable(&rd_opts, self.cf.as_ref().unwrap(), &row_key);
+                match rs {
+                    Err(e) => if e.is_not_found() {
+                        // ignore, it's null value
+                    } else {
+                        return Err(e);
+                    }
+                    Ok(pinning) => each_col(&row_key, pinning.value())
+                }
+                row_key.truncate(prefix_len);
+            }
             iter.move_next();
+        } else {
+            row_key.write(key_ref).unwrap();
+
+            debug_assert!(iter.valid());
+            while iter.valid() && iter.key().starts_with(&row_key) {
+                each_col(iter.key(), iter.value());
+                iter.move_next();
+            }
         }
+
+
         if iter.status().is_corruption() {
             Err(iter.status())
         } else {
@@ -99,6 +148,9 @@ impl RangeScanOps {
 
 impl PhysicalPlanOps for RangeScanOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
+        let rd_opts = ReadOptions::default();
+        self.iter = Some(self.storage.as_ref().unwrap().new_iterator(&rd_opts, self.cf.as_ref().unwrap())?);
+
         let iter_box = self.iter.as_ref().cloned().unwrap();
         let mut iter = iter_box.borrow_mut();
         iter.seek(&self.range_begin);
@@ -118,10 +170,15 @@ impl PhysicalPlanOps for RangeScanOps {
 
     fn finalize(&mut self) {
         self.iter = None;
+        self.storage = None;
         self.col_id_to_order = HashMap::default();
     }
 
     fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        if self.eof.get() {
+            return None;
+        }
+
         if let Some(limit) = self.limit {
             if self.pulled_rows >= limit {
                 return None;
@@ -148,7 +205,9 @@ impl PhysicalPlanOps for RangeScanOps {
             }
         }, &arena);
         if let Err(e) = rs {
-            feedback.catch_error(e);
+            if !e.is_not_found() {
+                feedback.catch_error(e);
+            }
             None
         } else {
             self.pulled_rows += 1;
@@ -176,7 +235,7 @@ impl MergingOps {
             current: 0,
             children,
             pulled_rows: 0,
-            delta_rows: offset.map_or(0, |x|{x}),
+            delta_rows: offset.map_or(0, |x| { x }),
             limit,
             offset,
         }
@@ -194,17 +253,16 @@ impl PhysicalPlanOps for MergingOps {
 
     fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
         while self.current < self.children.len() {
-
             match self.children[self.current].next(feedback, zone) {
                 Some(row) => {
                     self.pulled_rows += 1;
                     if let Some(offset) = &self.offset {
                         if self.pulled_rows < *offset {
-                            continue
+                            continue;
                         }
                     }
                     return Some(row);
-                },
+                }
                 None => {
                     self.current += 1;
                 }
@@ -494,9 +552,11 @@ mod tests {
         columns.append("id", "", 1, ColumnType::Int(11));
         columns.append("name", "", 2, ColumnType::Varchar(64));
 
-        let iter = db.new_iterator(&ReadOptions::default(), &db.default_column_family())?;
-        let mut plan = RangeScanOps::new(columns, begin_key, true,
-                                         end_key, true, None, None, arena.clone(), &iter);
+        let mut plan = RangeScanOps::new(columns,
+                                         begin_key, true,
+                                         end_key, true, None, None,
+                                         arena.clone(), db.clone(),
+                                         db.default_column_family().clone());
         plan.prepare()?;
         let mut feedback = FeedbackImpl { status: Status::Ok };
         let mut i = 0i64;

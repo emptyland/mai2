@@ -4,7 +4,7 @@ use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::Arc;
 use crate::sql::ast::*;
-use crate::{break_visit, Corrupting, Result, Status, try_visit, visit_fatal};
+use crate::{break_visit, Corrupting, Result, Status, switch, try_visit, visit_fatal};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::{DB, TableHandle, TableRef};
 use crate::exec::evaluator::{Evaluator, Value};
@@ -14,7 +14,7 @@ use crate::exec::function::{Aggregator, ExecutionContext};
 use crate::exec::physical_plan::{FilteringOps, MergingOps, PhysicalPlanOps, RangeScanOps};
 
 
-struct PlanMaker {
+pub struct PlanMaker {
     db: Arc<DB>,
     arena: ArenaMut<Arena>,
     prepared_stmt: Option<ArenaBox<PreparedStatement>>,
@@ -35,6 +35,17 @@ impl PlanMaker {
         }
     }
 
+    pub fn make(&mut self, stmt: &mut dyn Statement) -> Result<ArenaBox<dyn PhysicalPlanOps>> {
+        self.schemas.clear();
+        self.current.clear();
+        self.rs = Status::Ok;
+        stmt.accept(self);
+        if self.rs.is_not_ok() {
+            Err(self.rs.clone())
+        } else {
+            Ok(self.current.pop().unwrap())
+        }
+    }
 
     fn visit_from_clause(&mut self, from: &mut dyn Relation) -> Option<Arc<TableHandle>> {
         if let Some(table_ref) = from.as_any().downcast_ref::<FromClause>() {
@@ -99,13 +110,12 @@ impl PlanMaker {
         let mut end_key = ArenaVec::new(&self.arena);
         DB::encode_idx_id(1, &mut end_key);
 
-        let iter = self.db.storage.new_iterator(&self.db.rd_opts,
-                                                &table.column_family).unwrap();
         let ops = RangeScanOps::new(columns.clone(),
                                     begin_key, true,
                                     end_key, true,
                                     limit, offset,
-                                    self.arena.clone(), &iter);
+                                    self.arena.clone(),
+                                    self.db.storage.clone(), table.column_family.clone());
         Ok(ArenaBox::new(ops, self.arena.get_mut()).into())
     }
 
@@ -177,21 +187,28 @@ impl PlanMaker {
                 DB::encode_secondary_index(&range.max, &col.ty, &mut end_key);
             }
 
-            let iter = self.db.storage.new_iterator(&self.db.rd_opts,
-                                                    &table.column_family).unwrap();
             let ops = RangeScanOps::new(columns.clone(),
                                         begin_key, range.left_close,
                                         end_key, range.right_close,
-                                        if set.segments.len() == 1 { limit } else { None },
-                                        if set.segments.len() == 1 { offset } else { None },
-                                        self.arena.clone(), &iter);
+                                        switch!(set.segments.len() == 1, limit, None),
+                                        switch!(set.segments.len() == 1, offset, None),
+                                        self.arena.clone(),
+                                        self.db.storage.clone(),
+                                        table.column_family.clone());
             receiver.push(ArenaBox::new(ops, self.arena.get_mut()).into())
         }
         Ok(())
     }
 
-    fn build_column_set(&self, table: &TableRef, cols: &ArenaVec<(ArenaStr, ArenaStr)>) -> ArenaBox<ColumnSet> {
-        todo!()
+    fn build_column_set(&self, table: &TableRef, alias: &ArenaStr, names: &[(ArenaStr, ArenaStr)]) -> ArenaBox<ColumnSet> {
+        let mut columns =
+            ColumnSet::new(switch!(alias.is_empty(), table.metadata.name.as_str(), alias.as_str()),
+                           &self.arena);
+        for (_, name) in names {
+            let col = table.get_col_by_name(&name.to_string()).unwrap();
+            columns.append(name.as_str(), alias.as_str(), col.id, col.ty.clone());
+        }
+        ArenaBox::new(columns, self.arena.get_mut())
     }
 
     fn eval_require_u64_literal(&self, may_expr: &Option<ArenaBox<dyn Expression>>) -> Result<Option<u64>> {
@@ -228,6 +245,9 @@ impl Visitor for PlanMaker {
         }
 
         if !projection_col_visitor.aggregators.is_empty() {
+            if !this.group_by_clause.is_empty() {
+                // TODO:
+            }
             todo!()
         }
 
@@ -250,7 +270,7 @@ impl Visitor for PlanMaker {
         }
 
         if let Some(table) = maybe_table {
-            let low_columns = self.build_column_set(&table,
+            let low_columns = self.build_column_set(&table, &this.alias,
                                                     &projection_col_visitor.projection_fields);
 
             if let Some(selection) = &mut this.where_clause {

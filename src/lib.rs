@@ -1,8 +1,8 @@
-mod storage;
-mod sql;
-mod exec;
-mod base;
+pub mod storage;
+pub mod exec;
 pub mod status;
+mod base;
+mod sql;
 
 pub type Result<T> = std::result::Result<T, Status>;
 
@@ -13,5 +13,11 @@ extern crate serde_yaml;
 extern crate serde;
 
 pub use crate::status::*;
+pub use crate::base::*;
 
-//fn main() {}
+#[macro_export]
+macro_rules! switch {
+    ($cond:expr, $then:expr, $others:expr) => {
+        if $cond {$then} else {$others}
+    }
+}

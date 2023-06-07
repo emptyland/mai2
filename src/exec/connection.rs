@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::io::Read;
 use std::ops::Deref;
 use std::sync::Weak;
+use serde_yaml::Value;
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaVec};
 use crate::exec::db::{ColumnType, DB};
 use crate::exec::executor::{ColumnSet, Executor, PreparedStatement, Tuple};
@@ -143,6 +144,9 @@ impl <'a> ResultRow<'a> {
     pub fn get_null(&self, i: usize) -> bool { self.tuple.get_null(i) }
     pub fn get_i64(&self, i: usize) -> Option<i64> { self.tuple.get_i64(i) }
     pub fn get_str(&self, i: usize) -> Option<&str> { self.tuple.get_str(i) }
+    pub fn get(&self, i: usize) -> &crate::exec::evaluator::Value { self.tuple.get(i) }
+
+    pub fn to_string(&self) -> String { format!("{}", self.tuple) }
 }
 
 

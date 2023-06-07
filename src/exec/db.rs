@@ -857,10 +857,15 @@ impl DB {
     }
 
     pub fn parse_key(key: &[u8]) -> (u64, u32) {
-        debug_assert!(key.len() > Self::PRIMARY_KEY_ID_BYTES.len() + Self::COL_ID_LEN);
-        let key_id = u32::from_be_bytes((&key[..Self::PRIMARY_KEY_ID_BYTES.len()]).try_into().unwrap()) as u64;
+        debug_assert!(key.len() > Self::KEY_ID_LEN + Self::COL_ID_LEN);
+        let key_id = u32::from_be_bytes((&key[..Self::KEY_ID_LEN]).try_into().unwrap()) as u64;
         let col_id = u32::from_be_bytes((&key[key.len() - Self::COL_ID_LEN..]).try_into().unwrap());
         (key_id, col_id)
+    }
+
+    pub fn parse_key_id(key: &[u8]) -> u64 {
+        debug_assert!(key.len() >= Self::KEY_ID_LEN);
+        u32::from_be_bytes((&key[..Self::KEY_ID_LEN]).try_into().unwrap()) as u64
     }
 
     fn get_table_handle(&self, name: &String) -> Option<(Arc<dyn ColumnFamily>, Arc<TableMetadata>)> {
@@ -1613,6 +1618,54 @@ mod tests {
         assert!(rs.next());
         let row = rs.current()?;
         assert!(row.get_null(0));
+        assert!(!rs.next());
+        Ok(())
+    }
+
+    #[test]
+    fn select_range_rows() -> Result<()> {
+        let _junk = JunkFilesCleaner::new("tests/db115");
+        let arena = Arena::new_val();
+        let db = DB::open("tests".to_string(), "db115".to_string())?;
+        let conn = db.connect();
+
+        let sql = " create table t1 {\n\
+                a int primary key auto_increment,\n\
+                b char(9)\n\
+                index idx_b(b)\n\
+            };\n\
+            insert into table t1(b) values (\"aaa\"),(\"bbb\"),(\"ccc\");\n\
+            ";
+        assert_eq!(3, conn.execute_str(sql, &arena.get_mut())?);
+
+        let mut rs = conn.execute_query_str("select * from t1 where a > 0", &arena.get_mut())?;
+        assert_eq!(2, rs.columns().columns.len());
+        assert_eq!("a", rs.column_name(0));
+        assert!(matches!(rs.column_ty(0), ColumnType::Int(_)));
+        assert_eq!("b", rs.column_name(1));
+        assert!(matches!(rs.column_ty(1), ColumnType::Char(_)));
+
+        assert!(rs.next());
+        let row = rs.current()?;
+        assert_eq!(Some(1), row.get_i64(0));
+        assert_eq!(Some("aaa"), row.get_str(1));
+        assert_eq!("(1, \"aaa\")", row.to_string());
+
+        assert!(rs.next());
+        assert_eq!("(2, \"bbb\")", rs.current()?.to_string());
+
+        assert!(rs.next());
+        assert_eq!("(3, \"ccc\")", rs.current()?.to_string());
+
+        assert!(!rs.next());
+
+        let mut rs = conn.execute_query_str("select * from t1 where b >= \"bbb\"", &arena.get_mut())?;
+        assert!(rs.next());
+        assert_eq!("(2, \"bbb\")", rs.current()?.to_string());
+
+        assert!(rs.next());
+        assert_eq!("(3, \"ccc\")", rs.current()?.to_string());
+
         assert!(!rs.next());
         Ok(())
     }

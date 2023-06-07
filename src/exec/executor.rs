@@ -1,6 +1,7 @@
 use std::alloc::Layout;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Display, Formatter};
 use std::intrinsics::copy_nonoverlapping;
 use std::io::{Read, Write};
 use std::iter::repeat;
@@ -19,6 +20,7 @@ use crate::exec::connection::ResultSet;
 use crate::exec::evaluator::{Context, Evaluator, expr_typing_reduce, Value};
 use crate::exec::function::{ExecutionContext, UDF};
 use crate::exec::physical_plan::{ProjectingOps, ReturningOneDummyOps};
+use crate::exec::planning::PlanMaker;
 use crate::sql::lexer::Token;
 use crate::sql::serialize::serialize_yaml_to_string;
 
@@ -597,7 +599,19 @@ impl Visitor for Executor {
                 }
             }
             Some(_) => {
-                todo!()
+                let db = self.db.upgrade().unwrap();
+                let _locking = db.lock_tables();
+                let mut planner =
+                    PlanMaker::new(&db, self.prepared_stmts.back().cloned(), &self.arena);
+                match planner.make(this) {
+                    Err(e) => self.rs = Err(e),
+                    Ok(root) => {
+                        match ResultSet::from_dcl_stmt(root) {
+                            Err(e) => self.rs = Err(e),
+                            Ok(rs) => self.result_set = Some(rs)
+                        }
+                    }
+                }
             }
         }
     }
@@ -766,6 +780,22 @@ impl Index<usize> for Tuple {
 
     fn index(&self, index: usize) -> &Self::Output {
         self.get(index)
+    }
+}
+
+impl Display for Tuple {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.row_key().is_empty() {
+            write!(f, "rowkey={:x?}", self.row_key())?;
+        }
+        f.write_str("(")?;
+        for i in 0..self.columns().columns.len() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{}", self[i])?
+        }
+        f.write_str(")")
     }
 }
 

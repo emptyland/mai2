@@ -1,8 +1,8 @@
 use crate::{Corrupting, sql, Status};
 
-mod db;
+pub mod db;
+pub mod connection;
 mod executor;
-mod connection;
 mod evaluator;
 mod locking;
 mod relational_plan;
