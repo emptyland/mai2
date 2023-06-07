@@ -40,8 +40,8 @@ pub struct RangeScanOps {
     right_close: bool,
     key_id: u64,
     eof: Cell<bool>,
-
     arena: ArenaMut<Arena>,
+
     iter: Option<storage::IteratorArc>,
     storage: Option<Arc<dyn storage::DB>>,
     cf: Option<Arc<dyn ColumnFamily>>,
@@ -90,16 +90,20 @@ impl RangeScanOps {
 
     fn is_primary_key_scanning(&self) -> bool { self.key_id == 0 }
 
+    fn get_index_key<'a>(&self, key: &'a [u8]) -> &'a [u8] {
+        if self.is_primary_key_scanning() {
+            &key[..key.len() - DB::COL_ID_LEN]
+        } else {
+            key
+        }
+    }
+
     fn next_row<F>(&self, iter: &mut dyn storage::Iterator, mut each_col: F, arena: &ArenaMut<Arena>) -> Result<()>
         where F: FnMut(&[u8], &[u8]) {
         debug_assert!(iter.key().len() >= DB::KEY_ID_LEN + DB::COL_ID_LEN);
         debug_assert!(!self.eof.get());
 
-        let key_ref = if self.is_primary_key_scanning() {
-            &iter.key()[..iter.key().len() - DB::COL_ID_LEN]
-        } else {
-            iter.key()
-        };
+        let key_ref = self.get_index_key(iter.key());
         if !key_ref.starts_with(self.key_id_bytes()) {
             return Err(Status::NotFound);
         }
@@ -111,7 +115,7 @@ impl RangeScanOps {
         }
 
         let mut row_key = ArenaVec::<u8>::new(arena);
-        if self.key_id != 0 { // 2rd index
+        if !self.is_primary_key_scanning() { // 2rd index
             let rd_opts = ReadOptions::default();
             let db = self.storage.as_ref().unwrap();
 
@@ -161,22 +165,29 @@ impl PhysicalPlanOps for RangeScanOps {
         let mut iter = iter_box.borrow_mut();
         iter.seek(&self.range_begin);
         if iter.status().is_corruption() {
-            Err(iter.status())
-        } else {
-            // skip offset
-            if let Some(offset) = self.offset {
-                while self.pulled_rows < offset {
-                    self.next_row(iter.deref_mut(), |_, _| {}, &mut self.arena.clone())?;
-                    self.pulled_rows += 1;
-                }
-            }
-            Ok(self.projected_columns.clone())
+            return Err(iter.status());
         }
+        let key = self.get_index_key(iter.key());
+        if key.starts_with(&self.range_begin) {
+            if !self.left_close {
+                iter.move_next();
+            }
+        }
+
+        // skip offset
+        if let Some(offset) = self.offset {
+            while self.pulled_rows < offset {
+                self.next_row(iter.deref_mut(), |_, _| {}, &mut self.arena.clone())?;
+                self.pulled_rows += 1;
+            }
+        }
+        Ok(self.projected_columns.clone())
     }
 
     fn finalize(&mut self) {
         self.iter = None;
         self.storage = None;
+        self.cf = None;
         self.col_id_to_order = HashMap::default();
     }
 
