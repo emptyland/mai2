@@ -58,8 +58,12 @@ fn sql_range_scanning() -> Result<()> {
     assert_eq!(199, i);
 
     let mut rs = conn.execute_query_str("select b, c from t1 where b >= 100 and b < 200", &arena)?;
+    i = 100;
     while rs.next() {
-        println!("row={}", rs.current()?.to_string());
+        let s = format!("({}, \"name={}\")", i, i);
+        assert_eq!(s, rs.current()?.to_string());
+        i += 1;
     }
+    assert_eq!(200, i);
     Ok(())
 }

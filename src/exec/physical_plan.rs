@@ -88,12 +88,18 @@ impl RangeScanOps {
         &self.range_begin.as_slice()[..DB::KEY_ID_LEN]
     }
 
+    fn is_primary_key_scanning(&self) -> bool { self.key_id == 0 }
+
     fn next_row<F>(&self, iter: &mut dyn storage::Iterator, mut each_col: F, arena: &ArenaMut<Arena>) -> Result<()>
         where F: FnMut(&[u8], &[u8]) {
         debug_assert!(iter.key().len() >= DB::KEY_ID_LEN + DB::COL_ID_LEN);
         debug_assert!(!self.eof.get());
 
-        let key_ref = &iter.key()[..iter.key().len() - DB::COL_ID_LEN];
+        let key_ref = if self.is_primary_key_scanning() {
+            &iter.key()[..iter.key().len() - DB::COL_ID_LEN]
+        } else {
+            iter.key()
+        };
         if !key_ref.starts_with(self.key_id_bytes()) {
             return Err(Status::NotFound);
         }
