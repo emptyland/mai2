@@ -647,8 +647,15 @@ impl ColumnSet {
             order,
         });
     }
+
+    pub fn len(&self) -> usize { self.columns.len() }
 }
 
+impl Index<usize> for ColumnSet {
+    type Output = Column;
+
+    fn index(&self, index: usize) -> &Self::Output { &self.columns[index] }
+}
 
 pub struct Column {
     pub name: ArenaStr,

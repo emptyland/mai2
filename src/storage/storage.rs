@@ -41,6 +41,11 @@ impl ColumnFamilyOptionsBuilder {
         self
     }
 
+    pub fn temporary(&mut self, temporary: bool) -> &mut Self {
+        self.opts.temporary = temporary;
+        self
+    }
+
     pub fn build(&mut self) -> ColumnFamilyOptions {
         self.opts.clone()
     }
@@ -53,6 +58,7 @@ pub struct ColumnFamilyOptions {
     pub write_buf_size: usize,
     pub block_restart_interval: usize,
     pub dir: String,
+    pub temporary: bool,
 }
 
 impl ColumnFamilyOptions {
@@ -73,6 +79,7 @@ impl Default for ColumnFamilyOptions {
             write_buf_size: 40 * 1024 * 1024,
             block_restart_interval: 16,
             dir: String::new(),
+            temporary: false,
         }
     }
 }

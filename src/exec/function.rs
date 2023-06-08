@@ -32,14 +32,15 @@ pub trait Aggregator {
     fn close(&self) {}
     fn signature(&self) -> ColumnType { ColumnType::BigInt(11) }
     fn new_buf(&self, arena: &ArenaMut<Arena>) -> ArenaBox<dyn Writable>;
-    fn iterate(&self, dest: &mut dyn Writable, args: &[&dyn Writable]) -> Result<()>;
-    fn terminate(&self, dest: &mut dyn Writable) -> Result<()>;
+    fn iterate(&self, dest: &mut dyn Writable, args: &[ArenaBox<dyn Writable>]) -> Result<()>;
+    fn terminate(&self, dest: &mut dyn Writable) -> Result<Value>;
     fn merge(&self, dest: &mut dyn Writable, input: &dyn Writable) -> Result<()>;
 }
 
 pub trait Writable {
     fn any(&self) -> &dyn Any;
     fn any_mut(&mut self) -> &mut dyn Any;
+    fn recv(&mut self, value: &Value) {}
 }
 
 pub struct Signature {
@@ -143,15 +144,16 @@ mod udaf {
             ArenaBox::new(NumberBuf::<i64>::default(), arena.get_mut()).into()
         }
 
-        fn iterate(&self, dest: &mut dyn Writable, _args: &[&dyn Writable]) -> Result<()> {
+        fn iterate(&self, dest: &mut dyn Writable, _args: &[ArenaBox<dyn Writable>]) -> Result<()> {
             let buf = NumberBuf::<i64>::cast_mut(dest);
             buf.rows += 1;
             buf.value += 1;
             Ok(())
         }
 
-        fn terminate(&self, _dest: &mut dyn Writable) -> Result<()> {
-            Ok(())
+        fn terminate(&self, dest: &mut dyn Writable) -> Result<Value> {
+            let buf = NumberBuf::<i64>::cast(dest);
+            Ok(Value::Int(buf.value))
         }
 
         fn merge(&self, dest: &mut dyn Writable, src: &dyn Writable) -> Result<()> {

@@ -48,6 +48,7 @@ pub enum Value {
 impl Value {
     pub fn is_null(&self) -> bool { self.eq(&Value::Null) }
     pub fn is_not_null(&self) -> bool { !self.is_null() && !self.is_undefined() }
+    pub fn is_certain(&self) -> bool { !self.is_null() && !self.is_undefined() && !self.is_inf() }
     pub fn is_undefined(&self) -> bool { self.eq(&Value::Undefined) }
     pub fn is_inf(&self) -> bool {
         match self {

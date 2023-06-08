@@ -8,10 +8,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use rusty_pool::ThreadPool;
+use serde_yaml::to_string;
 
 use crate::exec::connection::Connection;
-use crate::{Corrupting, log_debug, Status, storage};
+use crate::{ArenaVec, Corrupting, log_debug, Status, storage};
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, Logger};
+use crate::exec::db::ColumnType::Varchar;
 use crate::exec::evaluator::Value;
 use crate::exec::executor::{ColumnSet, SecondaryIndexBundle, Tuple};
 use crate::exec::locking::{LockingInstance, LockingManagement};
@@ -728,14 +730,118 @@ impl DB {
         Ok(())
     }
 
-    pub fn encode_secondary_index<W: Write>(value: &Value, ty: &ColumnType, wr: &mut W) {
-        if value.is_null() {
-            wr.write(&Self::NULL_BYTES).unwrap();
+    pub fn encode_key<W: Write>(value: &Value, wr: &mut W) {
+        if Self::encode_null_bytes(value, wr) {
             return;
         }
-        assert!(!value.is_undefined());
+        match value {
+            Value::Int(n) => { wr.write(&n.to_be_bytes()).unwrap(); }
+            Value::Float(n) => { wr.write(&n.to_be_bytes()).unwrap(); }
+            Value::Str(s) => { Self::encode_varchar_ty_for_key(s, wr); }
+            _ => unreachable!()
+        }
+    }
+
+    pub fn decode_tuple(columns: &ArenaBox<ColumnSet>, value: &[u8], arena: &ArenaMut<Arena>) -> Tuple {
+        let mut tuple = Tuple::with(columns, arena);
+        let mut p = 0usize;
+        for i in 0..columns.len() {
+            let col = &columns[i];
+            let (val, len) = Self::decode_row(&col.ty, &value[p..], arena);
+            tuple.set(i, val);
+            p += len;
+        }
+        tuple
+    }
+
+    pub fn decode_row(ty: &ColumnType, buf: &[u8], arena: &ArenaMut<Arena>) -> (Value, usize) {
+        if buf[0] == Self::NULL_BYTE {
+            return (Value::Null, 1);
+        }
+        match ty {
+            ColumnType::TinyInt(_)
+            | ColumnType::SmallInt(_)
+            | ColumnType::Int(_)
+            | ColumnType::BigInt(_) => {
+                (Value::Int(i64::from_le_bytes((&buf[1..9]).try_into().unwrap())), 9)
+            }
+            ColumnType::Float(_, _) => {
+                let f = f32::from_le_bytes((&buf[1..5]).try_into().unwrap());
+                (Value::Float(f as f64), 5)
+            }
+            ColumnType::Double(_, _) => {
+                let f = f64::from_le_bytes((&buf[1..9]).try_into().unwrap());
+                (Value::Float(f), 9)
+            }
+            ColumnType::Char(_)
+            | ColumnType::Varchar(_) => {
+                let len = u32::from_le_bytes((&buf[1..5]).try_into().unwrap()) as usize;
+                let str = std::str::from_utf8(&buf[5..5+len]).unwrap();
+                (Value::Str(ArenaStr::new(str, arena.get_mut())), 5+len)
+            }
+        }
+    }
+
+    pub fn encode_tuple<W: Write>(tuple: &Tuple, wr: &mut W) {
+        for i in 0..tuple.columns().columns.len() {
+            Self::encode_row(&tuple[i], &tuple.columns().columns[i].ty, wr)
+        }
+    }
+
+    pub fn encode_row<W: Write>(value: &Value, ty: &ColumnType, wr: &mut W) {
+        if Self::encode_null_bytes(value, wr) {
+            return;
+        }
+        match ty {
+            ColumnType::TinyInt(_)
+            | ColumnType::SmallInt(_)
+            | ColumnType::Int(_)
+            | ColumnType::BigInt(_) => {
+                match value {
+                    Value::Int(n) => wr.write(&n.to_le_bytes()).unwrap(),
+                    _ => unreachable!()
+                };
+            }
+            ColumnType::Float(_, _) => {
+                match value {
+                    Value::Float(f) => wr.write(&(*f as f32).to_le_bytes()).unwrap(),
+                    _ => unreachable!()
+                };
+            }
+            ColumnType::Double(_, _) => {
+                match value {
+                    Value::Float(f) => wr.write(&f.to_le_bytes()).unwrap(),
+                    _ => unreachable!()
+                };
+            }
+            ColumnType::Char(_)
+            | ColumnType::Varchar(_) => {
+                match value {
+                    Value::Str(s) => {
+                        wr.write(&(s.len() as u32).to_le_bytes()).unwrap();
+                        wr.write(s.as_bytes()).unwrap();
+                    },
+                    _ => unreachable!()
+                };
+            }
+        }
+    }
+
+    fn encode_null_bytes<W: Write>(value: &Value, wr: &mut W) -> bool {
+        if value.is_null() {
+            wr.write(&Self::NULL_BYTES).unwrap();
+            return true;
+        }
+        assert!(value.is_certain());
 
         wr.write(&Self::NOT_NULL_BYTES).unwrap();
+        false
+    }
+
+    pub fn encode_secondary_index<W: Write>(value: &Value, ty: &ColumnType, wr: &mut W) {
+        if Self::encode_null_bytes(value, wr) {
+            return;
+        }
         match ty {
             ColumnType::TinyInt(_)
             | ColumnType::SmallInt(_)
@@ -768,7 +874,7 @@ impl DB {
                     _ => unreachable!()
                 }
             }
-            ColumnType::Varchar(n) => {
+            ColumnType::Varchar(_) => {
                 match value {
                     Value::Str(s) => Self::encode_varchar_ty_for_key(s, wr),
                     Value::NegativeInf | Value::PositiveInf => (), // ignore
@@ -1244,6 +1350,33 @@ mod tests {
             2,
         ];
         assert_eq!(raw, buf.as_slice());
+    }
+
+    #[test]
+    fn row_encoding() {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let mut columns = ColumnSet::new("t1", &arena);
+        columns.append_with_name("a", ColumnType::Int(11));
+        columns.append_with_name("b", ColumnType::Float(0, 0));
+        columns.append_with_name("c", ColumnType::Double(0, 0));
+        columns.append_with_name("d", ColumnType::Varchar(255));
+        columns.append_with_name("e", ColumnType::Char(1));
+
+        let cols = ArenaBox::new(columns, arena.get_mut());
+        let mut row1 = Tuple::with(&cols, &arena);
+        row1.set(0, Value::Int(100));
+        row1.set(1, Value::Float(1.0));
+        row1.set(2, Value::Float(2.1));
+        row1.set(3, Value::Str(ArenaStr::new("HK man is dog!", arena.get_mut())));
+        row1.set(4, Value::Null);
+
+        let mut buf = ArenaVec::new(&arena);
+        DB::encode_tuple(&row1, &mut buf);
+        assert_eq!(43, buf.len());
+
+        let row2 = DB::decode_tuple(&cols, &buf, &arena);
+        assert_eq!(row1.to_string(), row2.to_string());
     }
 
     #[test]

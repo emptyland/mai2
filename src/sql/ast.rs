@@ -59,6 +59,7 @@ ast_nodes_impl![
     (Literal<ArenaStr>, visit_str_literal),
     (Literal<()>, visit_null_literal),
     (Placeholder, visit_placeholder),
+    (FastAccessHint, visit_fast_access_hint),
 ];
 
 #[macro_export]
@@ -374,6 +375,14 @@ pub struct Identifier {
     pub symbol: ArenaStr,
 }
 
+impl Identifier {
+    pub fn new(symbol: &str, arena: &ArenaMut<Arena>) -> ArenaBox<Self> {
+        ArenaBox::new(Self {
+            symbol: ArenaStr::new(symbol, arena.get_mut())
+        }, arena.get_mut())
+    }
+}
+
 expression_impl!(Identifier);
 
 pub struct Literal<T> {
@@ -427,6 +436,15 @@ impl Expression for BinaryExpression {
 pub struct FullyQualifiedName {
     pub prefix: ArenaStr,
     pub suffix: ArenaStr,
+}
+
+impl FullyQualifiedName {
+    pub fn new(prefix: &str, suffix: &str, arena: &ArenaMut<Arena>) -> ArenaBox<Self> {
+        ArenaBox::new(Self {
+            prefix: ArenaStr::new(prefix, arena.get_mut()),
+            suffix: ArenaStr::new(suffix, arena.get_mut()),
+        }, arena.get_mut())
+    }
 }
 
 expression_impl!(FullyQualifiedName);
@@ -485,6 +503,22 @@ pub struct Placeholder {
 }
 
 expression_impl!(Placeholder);
+
+pub struct FastAccessHint {
+    pub offset: usize,
+    pub origin: ArenaBox<dyn Expression>,
+}
+
+impl FastAccessHint {
+    pub fn new(offset: usize, origin: ArenaBox<dyn Expression>, arena: &ArenaMut<Arena>) -> ArenaBox<Self> {
+        ArenaBox::new(Self {
+            offset,
+            origin,
+        }, arena.get_mut())
+    }
+}
+
+expression_impl!(FastAccessHint);
 
 pub struct Factory {
     pub arena: ArenaMut<Arena>,
@@ -665,6 +699,10 @@ impl Factory {
         }, self.arena.get_mut())
     }
 
+    pub fn new_fast_access_hint(&self, offset: usize, origin: ArenaBox<dyn Expression>) -> ArenaBox<FastAccessHint> {
+        FastAccessHint::new(offset, origin, &self.arena)
+    }
+
     pub fn str(&self, raw: &str) -> ArenaStr {
         ArenaStr::new(raw, self.arena.get_mut())
     }
@@ -715,11 +753,23 @@ impl From<ArenaBox<dyn Statement>> for ArenaBox<dyn Relation> {
     }
 }
 
+pub mod utils {
+    use std::ptr;
+    use crate::ArenaBox;
+    use crate::sql::ast::Expression;
+
+    pub fn replace_expr(dest: &mut ArenaBox<dyn Expression>, ast: ArenaBox<dyn Expression>) {
+        let ptr = dest as *mut ArenaBox<dyn Expression>;
+        unsafe { ptr::write(ptr, ast) }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
     use std::ops::DerefMut;
     use std::ptr::NonNull;
+    use crate::sql::serialize::serialize_expr_to_string;
     use super::*;
 
     #[test]
@@ -743,10 +793,38 @@ mod tests {
 
     #[test]
     fn trait_cast() {
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_ref();
         let factory = Factory::new(&arena.get_mut());
         let name = factory.str("a");
         let node = factory.new_create_table(name, false);
-        let ast: ArenaBox<dyn Statement> = node.into();
+        let _ast: ArenaBox<dyn Statement> = node.into();
+    }
+
+    #[test]
+    fn expr_replacing() {
+        let arena = Arena::new_ref();
+        let factory = Factory::new(&arena.get_mut());
+        let lhs = factory.new_literal(100i64);
+        let rhs = factory.new_literal(200i64);
+        let mut expr = factory.new_binary_expr(Operator::Add, lhs.into(), rhs.into());
+        let yaml = serialize_expr_to_string(expr.deref_mut());
+        assert_eq!("BinaryExpression:
+  op: Add(+)
+  lhs:
+    IntLiteral: 100
+  rhs:
+    IntLiteral: 200
+", yaml);
+
+        let rhs = factory.new_literal(factory.str("aaaa"));
+        utils::replace_expr(expr.rhs_mut(), rhs.into());
+        let yaml = serialize_expr_to_string(expr.deref_mut());
+        assert_eq!("BinaryExpression:
+  op: Add(+)
+  lhs:
+    IntLiteral: 100
+  rhs:
+    StrLiteral: aaaa
+", yaml);
     }
 }

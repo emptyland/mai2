@@ -346,6 +346,10 @@ impl Visitor for YamlWriter<'_> {
     fn visit_placeholder(&mut self, this: &mut Placeholder) {
         emit_header!(self, "Placeholder: {}", this.order);
     }
+
+    fn visit_fast_access_hint(&mut self, this: &mut FastAccessHint) {
+        emit_header!(self, "FastAccessHint: {}", this.offset);
+    }
 }
 
 #[cfg(test)]

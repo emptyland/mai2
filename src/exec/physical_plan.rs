@@ -1,15 +1,19 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::Write;
+use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use zstd::zstd_safe::WriteBuf;
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaStr, ArenaVec};
 use crate::exec::executor::{ColumnSet, PreparedStatement, Tuple, UpstreamContext};
 use crate::{Result, Status, storage};
+use crate::exec::connection::FeedbackImpl;
 use crate::exec::db::{ColumnType, DB};
 use crate::exec::evaluator::Evaluator;
+use crate::exec::function::{Aggregator, Writable};
 use crate::sql::ast::Expression;
-use crate::storage::{ColumnFamily, ReadOptions};
+use crate::storage::{ColumnFamily, ColumnFamilyOptions, config, IteratorArc, ReadOptions, WriteOptions};
 
 pub trait PhysicalPlanOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>>;
@@ -107,7 +111,7 @@ impl RangeScanOps {
         if !key_ref.starts_with(self.key_id_bytes()) {
             return Err(Status::NotFound);
         }
-        if key_ref.starts_with(&self.range_end) {
+        if key_ref == self.range_end.as_slice() {
             self.eof.set(true);
             if !self.right_close {
                 return Err(Status::NotFound);
@@ -168,7 +172,7 @@ impl PhysicalPlanOps for RangeScanOps {
             return Err(iter.status());
         }
         let key = self.get_index_key(iter.key());
-        if key.starts_with(&self.range_begin) {
+        if key == self.range_begin.as_slice() {
             if !self.left_close {
                 iter.move_next();
             }
@@ -521,6 +525,263 @@ impl PhysicalPlanOps for RenamingOps {
                 Some(tuple)
             }
             _ => None
+        }
+    }
+
+    fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
+        ArenaVec::of(self.child.clone(), &self.arena)
+    }
+}
+
+pub struct AggregatorBundle {
+    acc: ArenaBox<dyn Aggregator>,
+    args: ArenaVec<ArenaBox<dyn Expression>>,
+    rets: ArenaBox<dyn Writable>,
+    bufs: ArenaVec<ArenaBox<dyn Writable>>,
+}
+
+impl AggregatorBundle {
+    pub fn new(acc: &ArenaBox<dyn Aggregator>, params: &[ArenaBox<dyn Expression>], arena: &ArenaMut<Arena>) -> Self {
+        let mut args = ArenaVec::new(arena);
+        let mut bufs = ArenaVec::new(arena);
+        for arg in params {
+            args.push(arg.clone());
+            bufs.push(acc.new_buf(&arena));
+        }
+        Self {
+            acc: acc.clone(),
+            args,
+            rets: acc.new_buf(arena),
+            bufs
+        }
+    }
+}
+
+pub struct GroupingAggregatorOps {
+    group_keys: ArenaVec<ArenaBox<dyn Expression>>,
+    aggregators: ArenaVec<AggregatorBundle>,
+    child: ArenaBox<dyn PhysicalPlanOps>,
+    arena: ArenaMut<Arena>,
+    projected_columns: ArenaBox<ColumnSet>,
+    upstream_columns: Option<ArenaBox<ColumnSet>>,
+    eof: bool,
+    current_key: ArenaVec<u8>,
+
+    context: Option<Arc<UpstreamContext>>,
+    storage: Option<Arc<dyn storage::DB>>,
+    cf: Option<Arc<dyn ColumnFamily>>,
+    iter: Option<IteratorArc>,
+}
+
+impl GroupingAggregatorOps {
+    fn group_by_keys(&self, cf: &Arc<dyn ColumnFamily>, upstream_cols: &ArenaBox<ColumnSet>,
+                     upstream: &mut dyn PhysicalPlanOps) -> Result<u64> {
+        let mut count = 0u64;
+        let context = self.context.as_ref().unwrap();
+
+        let mut zone = Arena::new_ref();
+        let arena = zone.get_mut();
+        let mut feedback = FeedbackImpl { status: Status::Ok };
+
+        let mut evaluator = Evaluator::new(&arena);
+        let wr_opts = WriteOptions::default();
+        loop {
+            if zone.rss_in_bytes > 10 * config::MB {
+                zone = Arena::new_ref();
+            }
+
+            match upstream.next(&mut feedback, &zone) {
+                Some(tuple) => {
+                    let mut key = ArenaVec::new(&arena);
+                    let mut row = ArenaVec::new(&arena);
+                    context.attach(&tuple);
+                    for expr_box in &self.group_keys {
+                        let mut expr = expr_box.clone();
+                        let value = evaluator.evaluate(expr.deref_mut(), context.clone())?;
+                        DB::encode_key(&value, &mut key);
+                    }
+                    key.write(&count.to_be_bytes()).unwrap();
+
+                    DB::encode_tuple(&tuple, &mut row);
+                    self.storage().insert(&wr_opts, cf, &key, &row)?;
+                }
+                None => break
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn aggregators_iterate(&mut self, tuple: &Tuple, context: &Arc<UpstreamContext>,
+                           zone: &ArenaRef<Arena>) -> Result<()> {
+        context.attach(tuple);
+        let arena = zone.get_mut();
+        let mut evaluator = Evaluator::new(&arena);
+
+        debug_assert_eq!(self.aggregators.len(), self.projected_columns.len());
+        for agg in self.aggregators.iter_mut() {
+            for i in 0..agg.args.len() {
+                let mut expr = agg.args[i].clone();
+                let value = evaluator.evaluate(expr.deref_mut(), context.clone())?;
+                agg.bufs[i].recv(&value);
+            }
+            agg.acc.iterate(agg.rets.deref_mut(), &agg.bufs)?;
+        }
+        Ok(())
+    }
+
+    fn aggregators_terminate(&mut self, zone: &ArenaRef<Arena>) -> Result<Tuple> {
+        let arena = zone.get_mut();
+        let mut tuple = Tuple::with(&self.projected_columns, &arena);
+
+        for i in 0..self.aggregators.len() {
+            let agg = &mut self.aggregators[i];
+            let value = agg.acc.terminate(agg.rets.deref_mut())?;
+            tuple.set(i, value);
+        }
+        Ok(tuple)
+    }
+
+    fn overwrite_current_key(&mut self, key: &[u8]) {
+        self.current_key.clear();
+        self.current_key.write(&key[..key.len() - size_of::<u64>()]).unwrap();
+    }
+
+    fn storage(&self) -> &dyn storage::DB {
+        self.storage.as_ref().unwrap().as_ref()
+    }
+}
+
+// select a, count(*) from t1 group by a;
+impl PhysicalPlanOps for GroupingAggregatorOps {
+    fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
+        let upstream_cols = self.child.prepare()?;
+        let mut context = UpstreamContext::new(None, &self.arena);
+        context.add(upstream_cols.deref());
+        self.context = Some(Arc::new(context));
+
+        if !self.group_keys.is_empty() {
+            let opts = ColumnFamilyOptions::with()
+                .temporary(true)
+                .build();
+            let cf = self.storage().new_column_family("grouping", opts)?;
+            let mut upstream = self.child.clone();
+            self.group_by_keys(&cf, &upstream_cols, upstream.deref_mut())?;
+
+            let rd_opts = ReadOptions::default();
+            let iter_box = self.storage().new_iterator(&rd_opts, &cf)?;
+            let mut iter = iter_box.borrow_mut();
+            iter.seek_to_first();
+            if iter.status().is_not_ok() {
+                return Err(iter.status().clone());
+            }
+            if iter.valid() {
+                self.overwrite_current_key(iter.key());
+            }
+
+            drop(iter);
+            self.iter = Some(iter_box);
+            self.cf = Some(cf);
+        }
+
+        self.upstream_columns = Some(upstream_cols);
+        Ok(self.projected_columns.clone())
+    }
+
+    fn finalize(&mut self) {
+        // drop the temp table
+        match &self.cf {
+            Some(cf) => self.storage().drop_column_family(cf.clone()).unwrap(),
+            None => (),
+        }
+        self.context = None;
+        self.cf = None;
+        self.iter = None;
+        self.storage = None;
+    }
+
+    fn next(&mut self, _feedback: &mut dyn Feedback, _zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        let context = self.context.as_ref().cloned().unwrap();
+
+        if self.group_keys.is_empty() {
+            let mut feedback = FeedbackImpl { status: Status::Ok };
+            let mut zone = Arena::new_ref();
+
+            debug_assert_eq!(self.aggregators.len(), self.projected_columns.len());
+            loop {
+                if zone.rss_in_bytes >= 10 * config::MB {
+                    zone = Arena::new_ref();
+                }
+                let rs = self.child.next(&mut feedback, &zone);
+                match rs {
+                    Some(tuple) => match self.aggregators_iterate(&tuple, &context, &zone) {
+                        Err(e) => {
+                            _feedback.catch_error(e);
+                            return None;
+                        }
+                        Ok(_) => ()
+                    }
+                    None => {
+                        if feedback.status.is_not_ok() {
+                            _feedback.catch_error(feedback.status.clone());
+                            return None;
+                        }
+                        break;
+                    }
+                } // match
+            } // loop
+            match self.aggregators_terminate(&_zone) {
+                Err(e) => {
+                    _feedback.catch_error(e);
+                    None
+                }
+                Ok(tuple) => Some(tuple)
+            }
+        } else {
+            let iter_box = self.iter.as_ref().cloned().unwrap();
+            let mut iter = iter_box.borrow_mut();
+            if !iter.valid() {
+                return None;
+            }
+
+            let mut zone = Arena::new_ref();
+            while self.current_key.starts_with(iter.key()) {
+                if zone.rss_in_bytes >= 10 * config::MB {
+                    zone = Arena::new_ref();
+                }
+                let arena = zone.get_mut();
+
+                let tuple = DB::decode_tuple(self.upstream_columns.as_ref().unwrap(),
+                                             iter.value(), &arena);
+                match self.aggregators_iterate(&tuple, &context, &zone) {
+                    Err(e) => {
+                        _feedback.catch_error(e);
+                        return None;
+                    }
+                    Ok(_) => ()
+                }
+
+                iter.move_next();
+                if !iter.valid() {
+                    self.eof = true;
+                    break;
+                }
+            }
+            if iter.valid() {
+                self.overwrite_current_key(iter.key());
+            }
+            if iter.status().is_not_ok() {
+                _feedback.catch_error(iter.status().clone());
+                return None;
+            }
+
+            match self.aggregators_terminate(&_zone) {
+                Err(e) => {
+                    _feedback.catch_error(e);
+                    None
+                }
+                Ok(tuple) => Some(tuple)
+            }
         }
     }
 

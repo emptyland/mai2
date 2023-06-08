@@ -699,7 +699,7 @@ impl <T: PartialEq> PartialEq for ArenaVec<T> {
 
 impl <T: Eq> Eq for ArenaVec<T> {}
 
-impl<T> Index<usize> for ArenaVec<T> {
+impl <T> Index<usize> for ArenaVec<T> {
     type Output = T;
 
     fn index(&self, index: usize) -> &Self::Output {

@@ -11,7 +11,7 @@ use crate::exec::evaluator::{Evaluator, Value};
 use crate::exec::executor::{Column, ColumnSet, PreparedStatement, UniversalContext};
 use crate::exec::function;
 use crate::exec::function::{Aggregator, ExecutionContext};
-use crate::exec::physical_plan::{FilteringOps, MergingOps, PhysicalPlanOps, RangeScanOps};
+use crate::exec::physical_plan::{AggregatorBundle, FilteringOps, MergingOps, PhysicalPlanOps, RangeScanOps};
 
 
 pub struct PlanMaker {
@@ -239,7 +239,7 @@ impl Visitor for PlanMaker {
             return;
         }
         let mut projection_col_visitor =
-            ProjectionColumnVisitor::new(self.top_schema().unwrap(), &self.arena);
+            ProjectionColumnsVisitor::new(self.top_schema().unwrap(), &self.arena);
         for col in this.columns.iter_mut() {
             projection_col_visitor.visit(col);
         }
@@ -986,19 +986,21 @@ impl Visitor for PhysicalSelectionAnalyzer {
     }
 }
 
-struct ProjectionColumnVisitor {
+struct ProjectionColumnsVisitor {
     schema: ArenaBox<ColumnSet>,
-    aggregators: ArenaVec<(ArenaStr, ArenaBox<dyn Aggregator>)>,
+    rewriting: ArenaVec<Option<ArenaBox<dyn Expression>>>,
+    aggregators: ArenaVec<AggregatorBundle>,
     in_agg_calling: i32,
     projection_fields: ArenaVec<(ArenaStr, ArenaStr)>,
     arena: ArenaMut<Arena>,
     rs: Status,
 }
 
-impl ProjectionColumnVisitor {
+impl ProjectionColumnsVisitor {
     fn new(schema: &ArenaBox<ColumnSet>, arena: &ArenaMut<Arena>) -> Self {
         Self {
             schema: schema.clone(),
+            rewriting: ArenaVec::new(arena),
             aggregators: ArenaVec::new(arena),
             in_agg_calling: 0,
             projection_fields: ArenaVec::new(arena),
@@ -1009,14 +1011,19 @@ impl ProjectionColumnVisitor {
 
     fn visit(&mut self, col: &mut SelectColumnItem) -> Status {
         match &mut col.expr {
-            SelectColumn::Expr(expr) => expr.accept(self),
+            SelectColumn::Expr(expr) => {
+                expr.accept(self);
+                if let Some(ast) = self.rewrite() {
+                    utils::replace_expr(expr, ast);
+                }
+            }
             SelectColumn::Star => {
                 let schema = self.schema.clone();
-                self.install_all_schema_fields(schema.schema.as_str(), schema.deref());
+                self.install_all_schema_fields(schema.schema.as_str(), schema.deref(), |_, _| {});
             }
             SelectColumn::SuffixStar(prefix) => {
                 let schema = self.schema.clone();
-                self.install_all_schema_fields(prefix.as_str(), schema.deref());
+                self.install_all_schema_fields(prefix.as_str(), schema.deref(), |_, _| {});
             }
         }
         self.rs.clone()
@@ -1032,58 +1039,105 @@ impl ProjectionColumnVisitor {
         self.projection_fields.push(full_name);
     }
 
-    fn install_all_schema_fields(&mut self, schema: &str, columns: &ColumnSet) {
+    fn install_all_schema_fields<F>(&mut self, schema: &str, columns: &ColumnSet, mut callback: F)
+        where F: FnMut(&str, &str) {
         if schema == columns.schema.as_str() {
             for col in &columns.columns {
                 self.add_projection_field(ArenaStr::default(), col.name.clone());
+                callback("", col.name.as_str());
             }
         } else {
             columns.columns.iter()
                 .filter(|x| { x.desc.as_str() == schema })
                 .for_each(|x| {
                     self.add_projection_field(x.desc.clone(), x.name.clone());
+                    callback(x.desc.as_str(), x.name.as_str());
                 })
         }
     }
 
-    fn enter_aggregator_calling(&mut self, name: &ArenaStr, agg: &ArenaBox<dyn Aggregator>) {
+    fn enter_aggregator_calling(&mut self, agg: &ArenaBox<dyn Aggregator>,
+                                args: &[ArenaBox<dyn Expression>]) -> usize {
         self.in_agg_calling += 1;
-        for (dest, _) in &self.aggregators {
-            if dest == name {
-                return;
-            }
-        }
-        self.aggregators.push((name.clone(), agg.clone()));
+        let bundle = AggregatorBundle::new(agg, args, &self.arena);
+        let rv = self.aggregators.len();
+        self.aggregators.push(bundle);
+        rv
     }
 
     fn exit_aggregator_calling(&mut self) {
         self.in_agg_calling -= 1;
     }
+
+    fn rewrite(&mut self) -> Option<ArenaBox<dyn Expression>> {
+        match self.rewriting.pop() {
+            Some(top) => top,
+            None => None,
+        }
+    }
+
+    fn dont_rewrite(&mut self) { self.rewriting.push(None); }
+
+    fn want_rewrite(&mut self, ast: ArenaBox<dyn Expression>) { self.rewriting.push(Some(ast)); }
 }
 
-impl Visitor for ProjectionColumnVisitor {
+macro_rules! try_visit {
+    ($self:ident, $node:expr) => {
+        {
+            $node.accept($self);
+            if let Some(ast) = $self.rewrite() {
+                utils::replace_expr($node, ast);
+            }
+            if $self.rs.is_not_ok() {
+                return;
+            }
+        }
+    }
+}
+
+macro_rules! break_visit {
+    ($self:ident, $node:expr) => {
+        {
+            $node.accept($self);
+            if let Some(ast) = $self.rewrite() {
+                utils::replace_expr($node, ast);
+            }
+            if $self.rs.is_not_ok() {
+                break;
+            }
+        }
+    }
+}
+
+impl Visitor for ProjectionColumnsVisitor {
     fn visit_identifier(&mut self, this: &mut Identifier) {
         self.add_projection_field(ArenaStr::default(), this.symbol.clone());
+        self.dont_rewrite();
     }
 
     fn visit_full_qualified_name(&mut self, this: &mut FullyQualifiedName) {
         self.add_projection_field(this.prefix.clone(), this.suffix.clone());
+        self.dont_rewrite();
     }
     fn visit_unary_expression(&mut self, this: &mut UnaryExpression) {
-        this.operands_mut()[0].accept(self);
+        try_visit!(self, &mut this.operands_mut()[0]);
+        self.dont_rewrite();
     }
     fn visit_binary_expression(&mut self, this: &mut BinaryExpression) {
         try_visit!(self, this.lhs_mut());
-        this.rhs_mut().accept(self);
+        try_visit!(self, this.rhs_mut());
+        self.dont_rewrite();
     }
     fn visit_in_literal_set(&mut self, this: &mut InLiteralSet) {
-        try_visit!(self, this.lhs);
+        try_visit!(self, this.lhs_mut());
         for literal in this.set.iter_mut() {
             try_visit!(self, literal);
         }
+        self.dont_rewrite();
     }
     fn visit_in_relation(&mut self, this: &mut InRelation) {
-        this.lhs.accept(self);
+        try_visit!(self, this.lhs_mut());
+        self.dont_rewrite();
     }
 
     fn visit_call_function(&mut self, this: &mut CallFunction) {
@@ -1093,34 +1147,50 @@ impl Visitor for ProjectionColumnVisitor {
                 if self.in_agg_calling > 0 {
                     visit_fatal!(self, "Nested aggregator calling: {}", this.callee_name);
                 }
-                self.enter_aggregator_calling(&this.callee_name, &udaf);
+
+                let fast_access_hint;
                 if this.in_args_star {
                     let schema = self.schema.clone();
-                    self.install_all_schema_fields(schema.schema.as_str(), schema.deref());
+                    let mut args = ArenaVec::new(&self.arena);
+                    self.install_all_schema_fields(schema.schema.as_str(),
+                                                   schema.deref(),
+                                                   |prefix, name| {
+                                                       if prefix.is_empty() {
+                                                           args.push(Identifier::new(name, &args.owns).into());
+                                                       } else {
+                                                           args.push(FullyQualifiedName::new(prefix, name, &args.owns).into());
+                                                       }
+                                                   });
+                    fast_access_hint = self.enter_aggregator_calling(&udaf, &args);
                 } else {
+                    fast_access_hint = self.enter_aggregator_calling(&udaf, &this.args);
                     for arg in this.args.iter_mut() {
                         break_visit!(self, arg);
                     }
                 }
                 self.exit_aggregator_calling();
+                let hint = FastAccessHint::new(fast_access_hint,
+                                               ArenaBox::from(this).into(), &self.arena);
+                self.want_rewrite(hint.into());
             }
             None => {
                 for arg in this.args.iter_mut() {
                     break_visit!(self, arg);
                 }
+                self.dont_rewrite();
             }
         }
     }
 
-    fn visit_int_literal(&mut self, _this: &mut Literal<i64>) {}
+    fn visit_int_literal(&mut self, _this: &mut Literal<i64>) { self.dont_rewrite(); }
 
-    fn visit_float_literal(&mut self, _this: &mut Literal<f64>) {}
+    fn visit_float_literal(&mut self, _this: &mut Literal<f64>) { self.dont_rewrite(); }
 
-    fn visit_str_literal(&mut self, _this: &mut Literal<ArenaStr>) {}
+    fn visit_str_literal(&mut self, _this: &mut Literal<ArenaStr>) { self.dont_rewrite(); }
 
-    fn visit_null_literal(&mut self, _this: &mut Literal<()>) {}
+    fn visit_null_literal(&mut self, _this: &mut Literal<()>) { self.dont_rewrite(); }
 
-    fn visit_placeholder(&mut self, _this: &mut Placeholder) {}
+    fn visit_placeholder(&mut self, _this: &mut Placeholder) { self.dont_rewrite(); }
 }
 
 #[cfg(test)]
