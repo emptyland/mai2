@@ -1,3 +1,4 @@
+use std::ops::DerefMut;
 use mai2::exec::db::DB;
 use mai2::storage::JunkFilesCleaner;
 use mai2::{Arena, Result};
@@ -96,5 +97,38 @@ fn sql_select_col_expression() -> Result<()> {
     assert!(ok);
 
     assert_eq!("(2, 2)", rs.current()?.to_string());
+    Ok(())
+}
+
+#[test]
+fn sql_select_agg_count() -> Result<()> {
+    const N: i32 = 1000;
+
+    let _junk = JunkFilesCleaner::new("tests/dbi-004");
+    let zone = Arena::new_val();
+    let db = DB::open("tests".to_string(), "dbi-004".to_string())?;
+    let conn = db.connect();
+
+    let sql = " create table t1 {\n\
+                a int primary key auto_increment,\n\
+                b int,\n\
+                c varchar(64) \n\
+                index idx_b(b)\n\
+            };\n";
+    let arena = zone.get_mut();
+    assert_eq!(0, conn.execute_str(sql, &arena)?);
+
+    let sql = "insert into table t1(b,c) values (?,?)";
+    let mut prepared_stmt = conn.prepare_str(sql, &arena)?[0].clone();
+
+    for i in 0..N {
+        prepared_stmt.bind_i64(0, (i + 100) as i64);
+        prepared_stmt.bind_string(1, format!("timeline-{i}"), arena.get_mut());
+        assert_eq!(1, conn.execute_prepared_statement(&mut prepared_stmt)?);
+    }
+
+    let mut rs = conn.execute_query_str("select count(a) + 999 from t1 where a > 0", &arena)?;
+    assert!(rs.next());
+    assert_eq!("(1999)", rs.current()?.to_string()); // 1000 + 999
     Ok(())
 }

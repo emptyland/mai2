@@ -357,6 +357,10 @@ impl Visitor for Evaluator {
     fn visit_placeholder(&mut self, this: &mut Placeholder) {
         self.ret(self.env().bound_param(this.order).clone())
     }
+
+    fn visit_fast_access_hint(&mut self, this: &mut FastAccessHint) {
+        self.ret(self.env().fast_access(this.offset).clone())
+    }
 }
 
 

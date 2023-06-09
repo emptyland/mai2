@@ -648,7 +648,7 @@ impl GroupingAggregatorOps {
         let arena = zone.get_mut();
         let mut evaluator = Evaluator::new(&arena);
 
-        debug_assert_eq!(self.aggregators.len(), self.projected_columns.len());
+        debug_assert!(self.aggregators.len() <= self.projected_columns.len());
         for agg in self.aggregators.iter_mut() {
             for i in 0..agg.args.len() {
                 let mut expr = agg.args[i].clone();
@@ -737,7 +737,7 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
             let mut feedback = FeedbackImpl { status: Status::Ok };
             let mut zone = Arena::new_ref();
 
-            debug_assert_eq!(self.aggregators.len(), self.projected_columns.len());
+            debug_assert!(self.aggregators.len() <= self.projected_columns.len());
             loop {
                 if zone.rss_in_bytes >= 10 * config::MB {
                     zone = Arena::new_ref();
