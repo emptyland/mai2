@@ -473,10 +473,6 @@ impl<'a> Parser<'a> {
                     alias: ArenaStr::default(),
                 }
             }
-            // Token::Id(symbol) => {
-            //     self.move_next()?;
-            //
-            // }
             _ => {
                 SelectColumnItem {
                     expr: SelectColumn::Expr(self.parse_expr()?),
@@ -543,7 +539,7 @@ impl<'a> Parser<'a> {
 
 
     fn parse_primary(&mut self) -> Result<ArenaBox<dyn Expression>> {
-        let _start_pos = self.lexer.current_position();
+        let start_pos = self.lexer.current_position();
         match self.peek().token.clone() {
             Token::LParent => {
                 self.move_next()?;
@@ -569,9 +565,13 @@ impl<'a> Parser<'a> {
                     let suffix = self.match_id()?;
                     Ok(self.factory.new_fully_qualified_name(symbol, suffix).into())
                 } else if self.test(Token::LParent)? {
-                    //self.move_next()?;
                     let distinct = self.test(Token::Distinct)?;
                     let mut call = self.factory.new_call_function(symbol, distinct);
+                    if self.test(Token::Star)? {
+                        call.in_args_star = true;
+                        self.match_expected(Token::RParent)?;
+                        return Ok(call.into());
+                    }
                     while !self.test(Token::RParent)? {
                         let arg = self.parse_expr()?;
                         call.args.push(arg);
@@ -585,7 +585,11 @@ impl<'a> Parser<'a> {
                     Ok(self.factory.new_identifier(symbol).into())
                 }
             }
-            _ => unreachable!()
+            _ => {
+                let message = format!("Unexpected primary expression, expected: {:?}",
+                                      self.peek().token);
+                Err(self.concat_syntax_error(start_pos, message))
+            }
         }
     }
 
@@ -853,6 +857,43 @@ on t1.id = t2.id
     - IntLiteral: 1
 ", yaml);
         Ok(())
+    }
+
+    #[test]
+    fn parsing_select_issue001() -> Result<()> {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let yaml = parse_to_yaml(arena, "select a+1, b - 20 from t1 where a = 1", false)?;
+        assert_eq!("Select:
+  distinct: false
+  columns:
+    - expr:
+        BinaryExpression:
+          op: Add(+)
+          lhs:
+            Identifier: a
+          rhs:
+            IntLiteral: 1
+    - expr:
+        BinaryExpression:
+          op: Sub(-)
+          lhs:
+            Identifier: b
+          rhs:
+            IntLiteral: 20
+  from:
+    FromClause:
+      name: t1
+  where:
+    BinaryExpression:
+      op: Eq(=)
+      lhs:
+        Identifier: a
+      rhs:
+        IntLiteral: 1
+", yaml);
+        Ok(())
+
     }
 
     fn parse_all_to_yaml(arena: ArenaMut<Arena>, sql: &str) -> Result<String> {

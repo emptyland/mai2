@@ -67,3 +67,34 @@ fn sql_range_scanning() -> Result<()> {
     assert_eq!(200, i);
     Ok(())
 }
+
+#[test]
+fn sql_select_col_expression() -> Result<()> {
+    let _junk = JunkFilesCleaner::new("tests/dbi-003");
+    let zone = Arena::new_val();
+    let db = DB::open("tests".to_string(), "dbi-003".to_string())?;
+    let conn = db.connect();
+
+    let sql = " create table t1 {\n\
+                a int primary key auto_increment,\n\
+                b int,\n\
+                c varchar(64) \n\
+                index idx_b(b)\n\
+            };\n\
+            insert into table t1(b,c) values (22, \"hello\");\n\
+            ";
+    let arena = zone.get_mut();
+    assert_eq!(1, conn.execute_str(sql, &arena)?);
+
+    let mut rs = conn.execute_query_str("select a + 1, b - 20 from t1 where a = 1", &arena)?;
+    assert_eq!(2, rs.columns().len());
+    assert_eq!("_1", rs.column_name(0));
+    assert_eq!("_2", rs.column_name(1));
+
+    let ok = rs.next();
+    assert!(rs.status.is_ok());
+    assert!(ok);
+
+    assert_eq!("(2, 2)", rs.current()?.to_string());
+    Ok(())
+}

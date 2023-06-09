@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::ops::{Add, DerefMut, Sub, Mul};
 use std::str::FromStr;
 use std::sync::Arc;
-use crate::{Corrupting, Result, Status};
+use crate::{Corrupting, Result, Status, try_visit};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::ColumnType;
 use crate::exec::function::{AnyFn, ExecutionContext, new_any_fn, Signature, UDF};
@@ -400,6 +400,7 @@ impl Visitor for TypingReducer {
         let value = self.env().resolve(this.symbol.as_str());
         if value.is_undefined() {
             self.rs = Status::corrupted(format!("Unresolved symbol: {}", this.symbol.as_str()));
+            return;
         }
         self.ret(Self::reduce_value_type(&value));
     }
@@ -410,6 +411,7 @@ impl Visitor for TypingReducer {
         if value.is_undefined() {
             self.rs = Status::corrupted(format!("Unresolved symbol: {}.{}",
                                                 this.prefix.as_str(), this.suffix.as_str()));
+            return;
         }
         self.ret(Self::reduce_value_type(&value));
     }
@@ -507,6 +509,11 @@ impl Visitor for TypingReducer {
 
     fn visit_placeholder(&mut self, this: &mut Placeholder) {
         let ty = TypingReducer::reduce_value_type(self.env().bound_param(this.order));
+        self.ret(ty);
+    }
+
+    fn visit_fast_access_hint(&mut self, this: &mut FastAccessHint) {
+        let ty = TypingReducer::reduce_value_type(self.env().fast_access(this.offset));
         self.ret(ty);
     }
 }

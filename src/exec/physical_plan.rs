@@ -392,6 +392,7 @@ impl ProjectingOps {
                arena: ArenaMut<Arena>,
                projected_columns: ArenaBox<ColumnSet>,
                prepared_stmt: Option<ArenaBox<PreparedStatement>>) -> Self {
+        debug_assert_eq!(columns.len(), projected_columns.len());
         Self {
             columns,
             child,
@@ -407,9 +408,11 @@ impl PhysicalPlanOps for ProjectingOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
         let mut context = UpstreamContext::new(self.prepared_stmt.clone(),
                                                &self.arena);
-        context.add(self.projected_columns.deref());
+
+        let cols = self.child.prepare()?;
+        context.add(cols.deref());
+
         self.context = Some(Arc::new(context));
-        self.child.prepare()?;
         Ok(self.projected_columns.clone())
     }
 
@@ -429,7 +432,7 @@ impl PhysicalPlanOps for ProjectingOps {
                 context.attach(&tuple);
 
                 let mut rv = Tuple::with(&self.projected_columns, &arena);
-                for i in 0..self.projected_columns.columns.len() {
+                for i in 0..self.projected_columns.len() {
                     let expr = &mut self.columns[i];
                     let rs = evaluator.evaluate(expr.deref_mut(),
                                                 context.clone());
@@ -555,6 +558,10 @@ impl AggregatorBundle {
             bufs
         }
     }
+
+    pub fn rets_ty(&self) -> ColumnType { self.acc.signature() }
+
+    pub fn args_len(&self) -> usize { self.args.len() }
 }
 
 pub struct GroupingAggregatorOps {
@@ -574,6 +581,29 @@ pub struct GroupingAggregatorOps {
 }
 
 impl GroupingAggregatorOps {
+    pub fn new(group_keys: ArenaVec<ArenaBox<dyn Expression>>,
+               aggregators: ArenaVec<AggregatorBundle>,
+               child: ArenaBox<dyn PhysicalPlanOps>,
+               arena: ArenaMut<Arena>,
+               projected_columns: ArenaBox<ColumnSet>,
+               storage: Arc<dyn storage::DB>) -> Self {
+        let current_key = ArenaVec::new(&arena);
+        Self {
+            group_keys,
+            aggregators,
+            child,
+            arena,
+            projected_columns,
+            upstream_columns: None,
+            eof: false,
+            current_key,
+            context: None,
+            storage: Some(storage),
+            cf: None,
+            iter: None,
+        }
+    }
+
     fn group_by_keys(&self, cf: &Arc<dyn ColumnFamily>, upstream_cols: &ArenaBox<ColumnSet>,
                      upstream: &mut dyn PhysicalPlanOps) -> Result<u64> {
         let mut count = 0u64;

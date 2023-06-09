@@ -133,6 +133,17 @@ mod udf {
             })
         }
     });
+    pure_udf_impl!(Concat, ["str->str"], args, arena, {
+        if args.is_empty() {
+            Ok(Value::Null)
+        } else {
+            let mut buf = String::new();
+            for arg in args {
+                buf.push_str(format!("{arg}").as_str());
+            }
+            Ok(Value::Str(ArenaStr::new(buf.as_str(), arena.get_mut())))
+        }
+    });
 }
 
 mod udaf {
@@ -224,6 +235,7 @@ impl BuiltinFns {
         let mut udfs = HashMap::<&'static str, fn (&ExecutionContext)->ArenaBox<dyn UDF>>::new();
         udfs.insert("version", udf::Version::new);
         udfs.insert("length", udf::Length::new);
+        udfs.insert("concat", udf::Concat::new);
 
         let mut udafs = HashMap::<&'static str, fn (&ExecutionContext)->ArenaBox<dyn Aggregator>>::new();
         udafs.insert("count", udaf::Count::new);

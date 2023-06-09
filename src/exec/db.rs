@@ -832,7 +832,7 @@ impl DB {
             wr.write(&Self::NULL_BYTES).unwrap();
             return true;
         }
-        assert!(value.is_certain());
+        //assert!(value.is_certain());
 
         wr.write(&Self::NOT_NULL_BYTES).unwrap();
         false

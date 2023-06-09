@@ -648,6 +648,23 @@ impl ColumnSet {
         });
     }
 
+    pub fn find_by_name(&self, prefix: &str, suffix: &str) -> Option<&Column> {
+        if prefix == self.schema.as_str() {
+            for col in &self.columns {
+                if col.name.as_str() == suffix {
+                    return Some(col)
+                }
+            }
+        } else {
+            for col in &self.columns {
+                if col.name.as_str() == suffix && col.desc.as_str() == prefix {
+                    return Some(col)
+                }
+            }
+        }
+        None
+    }
+
     pub fn len(&self) -> usize { self.columns.len() }
 }
 
@@ -824,6 +841,21 @@ impl SecondaryIndexBundle {
     }
 }
 
+macro_rules! bound_param_impl {
+    ($self:ident, $order:ident) => {
+        match $self.prepared_stmt.as_ref() {
+            Some(ps) => {
+                if $order >= ps.parameters_len() {
+                    &Value::Undefined
+                } else {
+                    &ps.parameters[$order]
+                }
+            }
+            None => &Value::Undefined
+        }
+    };
+}
+
 pub struct UpstreamContext {
     prepared_stmt: Option<ArenaBox<PreparedStatement>>,
     arena: ArenaMut<Arena>,
@@ -892,16 +924,7 @@ impl Context for UpstreamContext {
     }
 
     fn bound_param(&self, order: usize) -> &Value {
-        match self.prepared_stmt.as_ref() {
-            Some(ps) => {
-                if order >= ps.parameters_len() {
-                    &Value::Undefined
-                } else {
-                    &ps.parameters[order]
-                }
-            }
-            None => &Value::Undefined
-        }
+        bound_param_impl!(self, order)
     }
 
     fn get_udf(&self, name: &str) -> Option<ArenaBox<dyn UDF>> {
@@ -936,15 +959,63 @@ impl UniversalContext {
 
 impl Context for UniversalContext {
     fn bound_param(&self, order: usize) -> &Value {
-        match self.prepared_stmt.as_ref() {
-            Some(ps) => {
-                if order >= ps.parameters_len() {
-                    &Value::Undefined
-                } else {
-                    &ps.parameters[order]
-                }
-            }
-            None => &Value::Undefined
+        bound_param_impl!(self, order)
+    }
+}
+
+pub struct TypingStubContext {
+    prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+    cols: ArenaBox<ColumnSet>,
+    int_ty: Value,
+    float_ty: Value,
+    str_ty: Value,
+}
+
+impl TypingStubContext {
+    pub fn new(prepared_stmt: Option<ArenaBox<PreparedStatement>>, cols: &ArenaBox<ColumnSet>) -> Self {
+        Self {
+            prepared_stmt,
+            cols: cols.clone(),
+            int_ty: Value::Int(i64::default()),
+            float_ty: Value::Float(f64::default()),
+            str_ty: Value::Str(ArenaStr::default()),
         }
+    }
+
+    pub fn ty_to_stub_value(&self, ty: &ColumnType) -> &Value {
+        match ty {
+            ColumnType::TinyInt(_)
+            | ColumnType::SmallInt(_)
+            | ColumnType::Int(_)
+            | ColumnType::BigInt(_) => &self.int_ty,
+            ColumnType::Float(_, _)
+            | ColumnType::Double(_, _) => &self.float_ty,
+            ColumnType::Char(_)
+            | ColumnType::Varchar(_) => &self.str_ty,
+        }
+    }
+}
+
+impl Context for TypingStubContext {
+    fn fast_access(&self, i: usize) -> &Value { self.ty_to_stub_value(&self.cols[i].ty) }
+
+    fn resolve(&self, name: &str) -> Value {
+        self.resolve_fully_qualified("", name)
+    }
+
+    fn resolve_fully_qualified(&self, prefix: &str, suffix: &str) -> Value {
+        match self.cols.find_by_name(prefix, suffix) {
+            Some(col) => self.ty_to_stub_value(&col.ty).clone(),
+            None => Value::Undefined
+        }
+    }
+
+    fn bound_param(&self, order: usize) -> &Value {
+        bound_param_impl!(self, order)
+    }
+
+    fn get_udf(&self, name: &str) -> Option<ArenaBox<dyn UDF>> {
+        let ctx = ExecutionContext::new(false, &self.cols.arena);
+        function::new_udf(name, &ctx)
     }
 }

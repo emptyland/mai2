@@ -503,6 +503,18 @@ impl Display for ArenaStr {
 }
 
 
+#[macro_export]
+macro_rules! arena_vec {
+    ($arena:expr, [$($x:expr),+ $(,)?]) => {
+        {
+            let mut tmp = $crate::base::ArenaVec::new($arena);
+            $(tmp.push($x);)*
+            tmp
+        }
+    };
+    ($arena:expr) => { $crate::base::ArenaVec::new($arena) }
+}
+
 pub struct ArenaVec<T> {
     naked: NonNull<[T]>,
     len: usize,
@@ -608,6 +620,40 @@ impl<T> ArenaVec<T> {
         }
     }
 
+    pub fn replace_more(&mut self, i: usize, other: &mut Self) -> usize {
+        if other.is_empty() {
+            return 0;
+        }
+        if i >= self.len() {
+            panic!("i out of range for replace_more");
+        }
+        let incremental_len = other.len() - 1;
+        self.extend_if_needed(incremental_len);
+        unsafe {
+            let src = addr_of!(self.naked.as_ref()[i + 1]);
+            let dst = addr_of_mut!(self.naked.as_mut()[i + other.len()]);
+            ptr::copy(src, dst, self.len() - i - 1);
+        }
+        unsafe {
+            let src = addr_of!(other.naked.as_ref()[0]);
+            let dst = addr_of_mut!(self.naked.as_mut()[i]);
+            ptr::copy_nonoverlapping(src, dst, other.len());
+        }
+        other.len = 0;
+        incremental_len
+    }
+
+    pub fn append(&mut self, other: &mut Self) {
+        let dest = self.extend_if_needed(other.len());
+        debug_assert_eq!(dest.len(), other.len());
+        unsafe {
+            ptr::copy_nonoverlapping(addr_of!(other.as_slice()[0]),
+                                     addr_of_mut!(dest[0]),
+                                     other.len());
+        }
+        other.clear();
+    }
+
     pub fn clear(&mut self) { self.len = 0; }
 
     pub fn truncate(&mut self, want: usize) {
@@ -650,18 +696,20 @@ impl<T> ArenaVec<T> {
 }
 
 impl <T: Clone> Clone for ArenaVec<T> {
-    fn clone(&self) -> Self {
-        let mut other = Self::with_capacity(self.capacity(), &self.owns);
-        for elem in self {
-            other.push(elem.clone());
-        }
-        other
-    }
+    fn clone(&self) -> Self { self.dup(&self.owns) }
 }
 
 impl <T: Clone> ArenaVec<T> {
     pub fn to_vec(&self) -> Vec<T> {
         Vec::from(self.as_slice())
+    }
+
+    pub fn dup(&self, arena: &ArenaMut<Arena>) -> Self {
+        let mut other = Self::with_capacity(self.capacity(), arena);
+        for elem in self {
+            other.push(elem.clone());
+        }
+        other
     }
 }
 
@@ -872,5 +920,32 @@ mod tests {
         for i in 0..n {
             assert_eq!(i, vec[i]);
         }
+    }
+
+    #[test]
+    fn arena_vec_replace_more() {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let mut a = arena_vec!(&arena, [1, 2, 3]);
+        let mut b = arena_vec!(&arena, [6, 5, 4]);
+
+        a.replace_more(1, &mut b);
+        assert_eq!(5, a.len());
+        assert_eq!(0, b.len());
+        assert_eq!([1, 6, 5, 4, 3], a.as_slice());
+
+        let mut a = arena_vec!(&arena, [1, 2, 3]);
+        let mut b = arena_vec!(&arena, [6, 5, 4]);
+        a.replace_more(2, &mut b);
+        assert_eq!(5, a.len());
+        assert_eq!(0, b.len());
+        assert_eq!([1, 2, 6, 5, 4], a.as_slice());
+
+        let mut a = arena_vec!(&arena, [1, 2, 3]);
+        let mut b = arena_vec!(&arena, [6, 5, 4]);
+        a.replace_more(0, &mut b);
+        assert_eq!(5, a.len());
+        assert_eq!(0, b.len());
+        assert_eq!([6, 5, 4, 2, 3], a.as_slice());
     }
 }

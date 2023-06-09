@@ -1,5 +1,6 @@
 use std::env::args;
 use std::fmt::{Display, Formatter};
+use std::mem::replace;
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -7,11 +8,11 @@ use crate::sql::ast::*;
 use crate::{break_visit, Corrupting, Result, Status, switch, try_visit, visit_fatal};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::{DB, TableHandle, TableRef};
-use crate::exec::evaluator::{Evaluator, Value};
-use crate::exec::executor::{Column, ColumnSet, PreparedStatement, UniversalContext};
+use crate::exec::evaluator::{Evaluator, TypingReducer, Value};
+use crate::exec::executor::{Column, ColumnSet, PreparedStatement, TypingStubContext, UniversalContext};
 use crate::exec::function;
 use crate::exec::function::{Aggregator, ExecutionContext};
-use crate::exec::physical_plan::{AggregatorBundle, FilteringOps, MergingOps, PhysicalPlanOps, RangeScanOps};
+use crate::exec::physical_plan::{AggregatorBundle, FilteringOps, GroupingAggregatorOps, MergingOps, PhysicalPlanOps, ProjectingOps, RangeScanOps};
 
 
 pub struct PlanMaker {
@@ -99,6 +100,7 @@ impl PlanMaker {
             }
             _ => unreachable!()
         };
+        self.schemas.push(columns.clone());
         self.current.push(ops);
         Ok(())
     }
@@ -211,6 +213,82 @@ impl PlanMaker {
         ArenaBox::new(columns, self.arena.get_mut())
     }
 
+    fn merge_aggregators_columns_set(&self, aggregators: &[AggregatorBundle],
+                                     up_cols: &ColumnSet) -> ArenaBox<ColumnSet> {
+        let mut cols = ColumnSet::new(up_cols.schema.as_str(), &self.arena);
+        let mut i = 0;
+        for agg in aggregators {
+            i += 1;
+            let name = format!("_a_{i}");
+            cols.append_with_name(name.as_str(), agg.rets_ty());
+        }
+        drop(i);
+
+        for col in &up_cols.columns {
+            cols.append(col.name.as_str(), col.desc.as_str(), col.id, col.ty.clone());
+        }
+        ArenaBox::new(cols, self.arena.get_mut())
+    }
+
+    fn make_projecting(&mut self, columns: &[SelectColumnItem], alias: &str) -> Result<()> {
+        let up_cols = self.schemas.pop().unwrap();
+        let up_plan = self.current.pop().unwrap();
+        let mut cols = ColumnSet::new(
+            switch!(alias.is_empty(), up_cols.schema.as_str(), alias),
+            &self.arena,
+        );
+
+        let context =
+            Arc::new(TypingStubContext::new(self.prepared_stmt.clone(), &up_cols));
+        let mut reducer = TypingReducer::new(&self.arena);
+
+        let mut exprs = ArenaVec::new(&self.arena);
+        let mut i = 0;
+        for col_item in columns {
+            debug_assert!(matches!(col_item.expr, SelectColumn::Expr(_)));
+            let mut expr;
+            if let SelectColumn::Expr(e) = &col_item.expr {
+                expr = e.clone();
+            } else {
+                unreachable!()
+            }
+
+            let certain_col =
+                if let Some((prefix, suffix)) = self.analyze_require_id_literal(expr.deref()) {
+                    up_cols.find_by_name(prefix.as_str(), suffix.as_str())
+                } else {
+                    None
+                };
+
+            let ty = if let Some(col) = &certain_col {
+                col.ty.clone()
+            } else {
+                reducer.reduce(expr.deref_mut(), context.clone())?
+            };
+            //let ty = reducer.reduce(expr.deref_mut(), context.clone())?;
+            let name = if !col_item.alias.is_empty() {
+                col_item.alias.to_string()
+            } else if let Some((_, suffix)) = self.analyze_require_id_literal(expr.deref()) {
+                suffix.to_string()
+            } else {
+                i += 1;
+                format!("_{i}")
+            };
+            cols.append(name.as_str(), "", 0, ty);
+            exprs.push(expr);
+        }
+
+        let projected_cols = ArenaBox::new(cols, self.arena.get_mut());
+        let plan = ProjectingOps::new(exprs,
+                                      up_plan,
+                                      self.arena.clone(),
+                                      projected_cols.clone(),
+                                      self.prepared_stmt.clone());
+        self.schemas.push(projected_cols.clone());
+        self.current.push(ArenaBox::new(plan, self.arena.get_mut()).into());
+        Ok(())
+    }
+
     fn eval_require_u64_literal(&self, may_expr: &Option<ArenaBox<dyn Expression>>) -> Result<Option<u64>> {
         match may_expr {
             Some(expr) => {
@@ -224,6 +302,16 @@ impl PlanMaker {
                 }
             }
             None => Ok(None)
+        }
+    }
+
+    fn analyze_require_id_literal(&self, expr: &dyn Expression) -> Option<(ArenaStr, ArenaStr)> {
+        if let Some(id) = expr.as_any().downcast_ref::<Identifier>() {
+            Some((ArenaStr::default(), id.symbol.clone()))
+        } else if let Some(full_name) = expr.as_any().downcast_ref::<FullyQualifiedName>() {
+            Some((full_name.prefix.clone(), full_name.suffix.clone()))
+        } else {
+            None
         }
     }
 }
@@ -240,15 +328,12 @@ impl Visitor for PlanMaker {
         }
         let mut projection_col_visitor =
             ProjectionColumnsVisitor::new(self.top_schema().unwrap(), &self.arena);
-        for col in this.columns.iter_mut() {
-            projection_col_visitor.visit(col);
-        }
-
-        if !projection_col_visitor.aggregators.is_empty() {
-            if !this.group_by_clause.is_empty() {
-                // TODO:
+        match projection_col_visitor.try_rewrite(&mut this.columns) {
+            Err(e) => {
+                self.rs = e;
+                return;
             }
-            todo!()
+            Ok(_) => ()
         }
 
         let limit;
@@ -269,7 +354,7 @@ impl Visitor for PlanMaker {
             Ok(val) => offset = val,
         }
 
-        if let Some(table) = maybe_table {
+        if let Some(table) = &maybe_table {
             let low_columns = self.build_column_set(&table, &this.alias,
                                                     &projection_col_visitor.projection_fields);
 
@@ -291,15 +376,46 @@ impl Visitor for PlanMaker {
                 }
             } else {
                 // TODO: just scan all table
+                todo!()
             }
+        }
+
+        if maybe_table.is_none() {
+            match &mut this.where_clause {
+                Some(filter) => {}
+                None => ()
+            }
+            todo!()
+        }
+
+        if !projection_col_visitor.aggregators.is_empty() {
+            let up_cols = self.schemas.pop().unwrap();
+            let up_plan = self.current.pop().unwrap();
+            let cols =
+                self.merge_aggregators_columns_set(&projection_col_visitor.aggregators, &up_cols);
+            let grouping_plan =
+                GroupingAggregatorOps::new(this.group_by_clause.dup(&self.arena),
+                                           projection_col_visitor.grab_aggregators(),
+                                           up_plan,
+                                           self.arena.clone(),
+                                           cols.clone(),
+                                           self.db.storage.clone());
+            self.schemas.push(cols);
+            self.current.push(ArenaBox::new(grouping_plan, self.arena.get_mut()).into());
+        } else if !this.group_by_clause.is_empty() {
+            self.rs = Status::corrupted("Group by clause without aggregator");
             return;
         }
 
-        match &mut this.where_clause {
-            Some(filter) => {}
-            None => ()
+        // TODO: Order by:
+
+        match self.make_projecting(&this.columns, this.alias.as_str()) {
+            Err(e) => {
+                self.rs = e;
+                return;
+            }
+            Ok(_) => ()
         }
-        todo!()
     }
 }
 
@@ -1009,24 +1125,62 @@ impl ProjectionColumnsVisitor {
         }
     }
 
-    fn visit(&mut self, col: &mut SelectColumnItem) -> Status {
-        match &mut col.expr {
-            SelectColumn::Expr(expr) => {
-                expr.accept(self);
-                if let Some(ast) = self.rewrite() {
-                    utils::replace_expr(expr, ast);
+    fn try_rewrite(&mut self, cols: &mut ArenaVec<SelectColumnItem>) -> Result<()> {
+        let mut i = 0;
+        while i < cols.len() {
+            let col = &mut cols[i];
+            match &mut col.expr {
+                SelectColumn::Expr(expr) => {
+                    expr.accept(self);
+                    if self.rs.is_not_ok() {
+                        break;
+                    }
+                    if let Some(ast) = self.rewrite() {
+                        utils::replace_expr(expr, ast);
+                    }
+                    i += 1;
+                }
+                SelectColumn::Star => {
+                    let schema = self.schema.clone();
+                    let arena = self.arena.clone();
+                    let mut incremental = ArenaVec::new(&arena);
+                    self.install_all_schema_fields(schema.schema.as_str(),
+                                                   schema.deref(),
+                                                   |_, name| {
+                                                       let id = Identifier::new(name, &arena);
+                                                       incremental.push(SelectColumnItem {
+                                                           expr: SelectColumn::Expr(id.into()),
+                                                           alias: ArenaStr::default(),
+                                                       });
+                                                   });
+                    i += cols.replace_more(i, &mut incremental);
+                }
+                SelectColumn::SuffixStar(prefix) => {
+                    let schema = self.schema.clone();
+                    let arena = self.arena.clone();
+                    let mut incremental = ArenaVec::new(&arena);
+                    self.install_all_schema_fields(prefix.as_str(),
+                                                   schema.deref(),
+                                                   |prefix, suffix| {
+                                                       let id = FullyQualifiedName::new(prefix, suffix, &arena);
+                                                       incremental.push(SelectColumnItem {
+                                                           expr: SelectColumn::Expr(id.into()),
+                                                           alias: ArenaStr::default(),
+                                                       });
+                                                   });
+                    i += cols.replace_more(i, &mut incremental);
                 }
             }
-            SelectColumn::Star => {
-                let schema = self.schema.clone();
-                self.install_all_schema_fields(schema.schema.as_str(), schema.deref(), |_, _| {});
-            }
-            SelectColumn::SuffixStar(prefix) => {
-                let schema = self.schema.clone();
-                self.install_all_schema_fields(prefix.as_str(), schema.deref(), |_, _| {});
-            }
         }
-        self.rs.clone()
+        if self.rs.is_not_ok() {
+            Err(self.rs.clone())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn grab_aggregators(&mut self) -> ArenaVec<AggregatorBundle> {
+        replace(&mut self.aggregators, ArenaVec::new(&self.arena))
     }
 
     fn add_projection_field(&mut self, prefix: ArenaStr, suffix: ArenaStr) {
@@ -1195,6 +1349,7 @@ impl Visitor for ProjectionColumnsVisitor {
 
 #[cfg(test)]
 mod tests {
+    use crate::exec::db::ColumnType;
     use crate::exec::from_sql_result;
     use crate::sql::ast::*;
     use crate::sql::parser::Parser;
@@ -1320,6 +1475,87 @@ mod tests {
         let b = SelectionRange::from_min_to_max(Value::Int(-1), Value::Int(1), true, true);
         assert!(a.union(&b).unwrap().is_inf());
         assert!(b.union(&a).unwrap().is_inf());
+    }
+
+    #[test]
+    fn projecting_field_names_analyzing() -> Result<()> {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let mut ast = parse_sql_as_select("select a,b,c;", &arena)?;
+        let cols = ArenaBox::new(ColumnSet::new("default", &arena), arena.get_mut());
+        let mut visitor = ProjectionColumnsVisitor::new(&cols, &arena);
+        visitor.try_rewrite(&mut ast.columns)?;
+        assert!(visitor.aggregators.is_empty());
+        assert_eq!(3, visitor.projection_fields.len());
+        assert_eq!("a", visitor.projection_fields[0].1.as_str());
+        assert_eq!("b", visitor.projection_fields[1].1.as_str());
+        assert_eq!("c", visitor.projection_fields[2].1.as_str());
+        Ok(())
+    }
+
+    #[test]
+    fn projecting_aggregator_analyzing() -> Result<()> {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let mut ast = parse_sql_as_select("select a + count(a), count(*);", &arena)?;
+        let mut cols = ColumnSet::new("default", &arena);
+        cols.append("a", "", 1, ColumnType::Int(11));
+        cols.append("b", "", 2, ColumnType::Char(9));
+        cols.append("c", "", 3, ColumnType::TinyInt(1));
+        let mut visitor =
+            ProjectionColumnsVisitor::new(&ArenaBox::new(cols, arena.get_mut()), &arena);
+        visitor.try_rewrite(&mut ast.columns)?;
+
+        assert_eq!(2, visitor.aggregators.len());
+        assert_eq!(1, visitor.aggregators[0].args_len());
+        assert_eq!(3, visitor.aggregators[1].args_len());
+        let yaml = if let SelectColumn::Expr(expr) = &mut ast.columns[0].expr {
+            serialize_expr_to_string(expr.deref_mut())
+        } else {
+            String::default()
+        };
+        assert_eq!("BinaryExpression:
+  op: Add(+)
+  lhs:
+    Identifier: a
+  rhs:
+    FastAccessHint: 0
+", yaml);
+
+        let yaml = if let SelectColumn::Expr(expr) = &mut ast.columns[1].expr {
+            serialize_expr_to_string(expr.deref_mut())
+        } else {
+            String::default()
+        };
+        assert_eq!("FastAccessHint: 1\n", yaml);
+
+        assert_eq!(3, visitor.projection_fields.len());
+        assert_eq!("", visitor.projection_fields[0].0.as_str());
+        assert_eq!("a", visitor.projection_fields[0].1.as_str());
+        assert_eq!("", visitor.projection_fields[1].0.as_str());
+        assert_eq!("b", visitor.projection_fields[1].1.as_str());
+        assert_eq!("", visitor.projection_fields[2].0.as_str());
+        assert_eq!("c", visitor.projection_fields[2].1.as_str());
+        Ok(())
+    }
+
+    #[test]
+    fn projecting_star_rewriting() -> Result<()> {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let mut ast = parse_sql_as_select("select a, *, b;", &arena)?;
+        let mut cols = ColumnSet::new("default", &arena);
+        cols.append("a", "", 1, ColumnType::Int(11));
+        cols.append("b", "", 2, ColumnType::Char(9));
+        cols.append("c", "", 3, ColumnType::TinyInt(1));
+        let mut visitor =
+            ProjectionColumnsVisitor::new(&ArenaBox::new(cols, arena.get_mut()), &arena);
+
+        assert_eq!(3, ast.columns.len());
+        visitor.try_rewrite(&mut ast.columns)?;
+        assert_eq!(5, ast.columns.len());
+
+        Ok(())
     }
 
     #[test]
