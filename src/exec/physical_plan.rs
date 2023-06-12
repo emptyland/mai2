@@ -4,10 +4,9 @@ use std::io::Write;
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use zstd::zstd_safe::WriteBuf;
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaStr, ArenaVec};
 use crate::exec::executor::{ColumnSet, PreparedStatement, Tuple, UpstreamContext};
-use crate::{Result, Status, storage};
+use crate::{corrupted_err, Result, Status, Corrupting, storage};
 use crate::exec::connection::FeedbackImpl;
 use crate::exec::db::{ColumnType, DB};
 use crate::exec::evaluator::Evaluator;
@@ -540,11 +539,14 @@ pub struct AggregatorBundle {
     acc: ArenaBox<dyn Aggregator>,
     args: ArenaVec<ArenaBox<dyn Expression>>,
     rets: ArenaBox<dyn Writable>,
+    rets_ty: Option<ColumnType>,
     bufs: ArenaVec<ArenaBox<dyn Writable>>,
 }
 
 impl AggregatorBundle {
-    pub fn new(acc: &ArenaBox<dyn Aggregator>, params: &[ArenaBox<dyn Expression>], arena: &ArenaMut<Arena>) -> Self {
+    pub fn new(acc: &ArenaBox<dyn Aggregator>,
+               params: &[ArenaBox<dyn Expression>],
+               arena: &ArenaMut<Arena>) -> Self {
         let mut args = ArenaVec::new(arena);
         let mut bufs = ArenaVec::new(arena);
         for arg in params {
@@ -555,13 +557,20 @@ impl AggregatorBundle {
             acc: acc.clone(),
             args,
             rets: acc.new_buf(arena),
-            bufs
+            rets_ty: None,
+            bufs,
         }
     }
 
-    pub fn rets_ty(&self) -> ColumnType { self.acc.signature() }
+    pub fn returning_ty(&self) -> ColumnType { self.rets_ty.clone().unwrap() }
+
+    pub fn reduce_returning_ty(&mut self, params: &[ColumnType]) {
+        self.rets_ty = Some(self.acc.signature(params))
+    }
 
     pub fn args_len(&self) -> usize { self.args.len() }
+
+    pub fn args_mut(&mut self) -> &mut [ArenaBox<dyn Expression>] { &mut self.args }
 }
 
 pub struct GroupingAggregatorOps {
@@ -604,7 +613,7 @@ impl GroupingAggregatorOps {
         }
     }
 
-    fn group_by_keys(&self, cf: &Arc<dyn ColumnFamily>, upstream_cols: &ArenaBox<ColumnSet>,
+    fn group_by_keys(&self, cf: &Arc<dyn ColumnFamily>,
                      upstream: &mut dyn PhysicalPlanOps) -> Result<u64> {
         let mut count = 0u64;
         let context = self.context.as_ref().unwrap();
@@ -660,14 +669,26 @@ impl GroupingAggregatorOps {
         Ok(())
     }
 
-    fn aggregators_terminate(&mut self, zone: &ArenaRef<Arena>) -> Result<Tuple> {
+    fn aggregators_terminate(&mut self, zone: &ArenaRef<Arena>, input: &Tuple) -> Result<Tuple> {
         let arena = zone.get_mut();
         let mut tuple = Tuple::with(&self.projected_columns, &arena);
 
+        debug_assert!(self.aggregators.len() <= self.projected_columns.len());
         for i in 0..self.aggregators.len() {
             let agg = &mut self.aggregators[i];
             let value = agg.acc.terminate(agg.rets.deref_mut())?;
             tuple.set(i, value);
+            agg.rets.clear();
+        }
+
+        for i in self.aggregators.len()..self.projected_columns.len() {
+            let dest_col = &self.projected_columns[i];
+            let rs = input.columns().index_by_name(dest_col.desc.as_str(),
+                                                  dest_col.name.as_str());
+            match rs {
+                Some(col) => tuple.set(i, input.get(col).dup(&arena)),
+                None => return corrupted_err!("Column not found: {}", dest_col.name)
+            }
         }
         Ok(tuple)
     }
@@ -696,7 +717,7 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
                 .build();
             let cf = self.storage().new_column_family("grouping", opts)?;
             let mut upstream = self.child.clone();
-            self.group_by_keys(&cf, &upstream_cols, upstream.deref_mut())?;
+            self.group_by_keys(&cf, upstream.deref_mut())?;
 
             let rd_opts = ReadOptions::default();
             let iter_box = self.storage().new_iterator(&rd_opts, &cf)?;
@@ -736,6 +757,7 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
         if self.group_keys.is_empty() {
             let mut feedback = FeedbackImpl { status: Status::Ok };
             let mut zone = Arena::new_ref();
+            let mut group_tuple = None;
 
             debug_assert!(self.aggregators.len() <= self.projected_columns.len());
             loop {
@@ -749,7 +771,7 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
                             _feedback.catch_error(e);
                             return None;
                         }
-                        Ok(_) => ()
+                        Ok(_) => group_tuple = Some(tuple)
                     }
                     None => {
                         if feedback.status.is_not_ok() {
@@ -760,7 +782,7 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
                     }
                 } // match
             } // loop
-            match self.aggregators_terminate(&_zone) {
+            match self.aggregators_terminate(&_zone, group_tuple.as_ref().unwrap()) {
                 Err(e) => {
                     _feedback.catch_error(e);
                     None
@@ -775,7 +797,10 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
             }
 
             let mut zone = Arena::new_ref();
-            while self.current_key.starts_with(iter.key()) {
+            let mut group_tuple = None;
+            // dbg!(iter.key());
+            // dbg!(&self.current_key);
+            while &iter.key()[..iter.key().len() - 8] == self.current_key.as_slice() {
                 if zone.rss_in_bytes >= 10 * config::MB {
                     zone = Arena::new_ref();
                 }
@@ -791,6 +816,7 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
                     Ok(_) => ()
                 }
 
+                group_tuple = Some(tuple);
                 iter.move_next();
                 if !iter.valid() {
                     self.eof = true;
@@ -805,7 +831,7 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
                 return None;
             }
 
-            match self.aggregators_terminate(&_zone) {
+            match self.aggregators_terminate(&_zone, group_tuple.as_ref().unwrap()) {
                 Err(e) => {
                     _feedback.catch_error(e);
                     None

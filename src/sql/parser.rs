@@ -372,6 +372,10 @@ impl<'a> Parser<'a> {
             if self.test(Token::Group)? {
                 self.match_expected(Token::By)?;
                 self.parse_expr_at_least_one(&mut node.group_by_clause)?;
+
+                if self.test(Token::Having)? {
+                    node.having_clause = Some(self.parse_expr()?);
+                }
             }
 
             if self.test(Token::Order)? {

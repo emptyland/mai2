@@ -1,6 +1,8 @@
 use std::any::Any;
 use std::collections::HashMap;
-use crate::{Corrupting, Result, Status};
+use std::ptr;
+use std::ptr::{addr_of, addr_of_mut};
+use crate::{Corrupting, Result, Status, utils};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaVec};
 use crate::exec::db::ColumnType;
 use crate::exec::evaluator::Value;
@@ -14,7 +16,7 @@ impl ExecutionContext {
     pub fn new(distinct: bool, arena: &ArenaMut<Arena>) -> Self {
         Self {
             arena: arena.clone(),
-            distinct
+            distinct,
         }
     }
 }
@@ -30,7 +32,7 @@ pub trait UDF {
 pub trait Aggregator {
     fn setup(&self) -> Result<()> { Ok(()) }
     fn close(&self) {}
-    fn signature(&self) -> ColumnType { ColumnType::BigInt(11) }
+    fn signature(&self, _params: &[ColumnType]) -> ColumnType { ColumnType::BigInt(11) }
     fn new_buf(&self, arena: &ArenaMut<Arena>) -> ArenaBox<dyn Writable>;
     fn iterate(&self, dest: &mut dyn Writable, args: &[ArenaBox<dyn Writable>]) -> Result<()>;
     fn terminate(&self, dest: &mut dyn Writable) -> Result<Value>;
@@ -40,7 +42,8 @@ pub trait Aggregator {
 pub trait Writable {
     fn any(&self) -> &dyn Any;
     fn any_mut(&mut self) -> &mut dyn Any;
-    fn recv(&mut self, value: &Value) {}
+    fn clear(&mut self);
+    fn recv(&mut self, _value: &Value) {}
 }
 
 pub struct Signature {
@@ -55,7 +58,7 @@ impl Signature {
         if let Some(part) = parts.next() {
             params_part = part;
         } else {
-            return Err(Status::corrupted("bad format"))
+            return Err(Status::corrupted("bad format"));
         }
 
         let mut params = ArenaVec::new(arena);
@@ -69,7 +72,7 @@ impl Signature {
         if let Some(part) = parts.next() {
             ret_val_part = part;
         } else {
-            return Err(Status::corrupted("bad format"))
+            return Err(Status::corrupted("bad format"));
         }
         Ok(Self {
             ret_val: Self::parse_str_to_ty(ret_val_part),
@@ -107,8 +110,8 @@ macro_rules! pure_udf_impl {
 
 macro_rules! pure_udaf_def {
     ($name:ident) => {
-        pub struct Count;
-        impl Count {
+        pub struct $name;
+        impl $name {
             pub fn new(ctx: &ExecutionContext) -> ArenaBox<dyn Aggregator> {
                 ArenaBox::new(Self{}, ctx.arena.get_mut()).into()
             }
@@ -147,6 +150,9 @@ mod udf {
 }
 
 mod udaf {
+    use std::ops::Deref;
+    use crate::corrupted_err;
+    use crate::exec::evaluator::Evaluator;
     use super::*;
 
     pure_udaf_def!(Count);
@@ -176,13 +182,88 @@ mod udaf {
         }
     }
 
-    #[derive(Default)]
-    struct NumberBuf<T: Default> {
-        value: T,
-        rows: usize,
+    pure_udaf_def!(Sum);
+    impl Sum {
+        fn apply(dest: &mut dyn Writable, arg: &dyn Writable) {
+            let rv = VariableNumberBuf::cast_mut(dest);
+            let input = VariableNumberBuf::cast(arg);
+            match &mut rv.number {
+                VariableNumber::Unknown => rv.number = input.number.clone(),
+                VariableNumber::Integral(buf) => match &input.number {
+                    VariableNumber::Integral(n) => {
+                        buf.value += n.value;
+                        buf.rows += 1;
+                    }
+                    VariableNumber::Floating(n) => {
+                        let new_buf = NumberBuf{
+                            value: buf.value as f64 + n.value,
+                            rows: buf.rows + 1
+                        };
+                        rv.number = VariableNumber::Floating(new_buf);
+                    }
+                    _ => unreachable!()
+                }
+                VariableNumber::Floating(buf) => match &input.number {
+                    VariableNumber::Integral(n) => {
+                        buf.value += n.value as f64;
+                        buf.rows += 1;
+                    }
+                    VariableNumber::Floating(n) => {
+                        buf.value += n.value;
+                        buf.rows += 1;
+                    }
+                    _ => unreachable!()
+                }
+            }
+        }
+    }
+    impl Aggregator for Sum {
+        fn signature(&self, params: &[ColumnType]) -> ColumnType {
+            if params.len() < 1 {
+                ColumnType::BigInt(11)
+            } else if params[0].is_integral() {
+                ColumnType::BigInt(11)
+            } else if params[0].is_floating() {
+                ColumnType::Double(0, 0)
+            } else {
+                ColumnType::BigInt(11)
+            }
+        }
+
+        fn new_buf(&self, arena: &ArenaMut<Arena>) -> ArenaBox<dyn Writable> {
+            ArenaBox::new(VariableNumberBuf::default(), arena.get_mut()).into()
+        }
+
+        fn iterate(&self, dest: &mut dyn Writable, args: &[ArenaBox<dyn Writable>]) -> Result<()> {
+            if args.len() != 1 {
+                return corrupted_err!("Invalid number of arguments, need 1, expected: {}", args.len())
+            }
+            Sum::apply(dest, args[0].deref());
+            Ok(())
+        }
+
+        fn terminate(&self, dest: &mut dyn Writable) -> Result<Value> {
+            let rs = VariableNumberBuf::cast_mut(dest);
+            let rv = match &rs.number {
+                VariableNumber::Unknown => Value::Null,
+                VariableNumber::Integral(buf) => Value::Int(buf.value),
+                VariableNumber::Floating(buf) => Value::Float(buf.value),
+            };
+            Ok(rv)
+        }
+
+        fn merge(&self, dest: &mut dyn Writable, input: &dyn Writable) -> Result<()> {
+            Sum::apply(dest, input);
+            Ok(())
+        }
     }
 
-    impl <T: Default + 'static> NumberBuf<T> {
+    #[derive(Default)]
+    struct VariableNumberBuf {
+        number: VariableNumber,
+    }
+
+    impl VariableNumberBuf {
         fn cast(input: &dyn Writable) -> &Self {
             input.any().downcast_ref::<Self>().unwrap()
         }
@@ -192,13 +273,91 @@ mod udaf {
         }
     }
 
-    impl <T: Default + 'static> Writable for NumberBuf<T> {
+    impl Writable for VariableNumberBuf {
+        fn any(&self) -> &dyn Any { self }
+        fn any_mut(&mut self) -> &mut dyn Any { self }
+
+        fn clear(&mut self) {
+            match &mut self.number {
+                VariableNumber::Floating(buf) => buf.clear(),
+                VariableNumber::Integral(buf) => buf.clear(),
+                _ => ()
+            }
+        }
+
+        fn recv(&mut self, value: &Value) {
+            let input = Evaluator::require_number(value);
+            match input {
+                Value::Int(n) => match &mut self.number {
+                    VariableNumber::Unknown =>
+                        self.number = VariableNumber::Integral(NumberBuf { value: n, rows: 1 }),
+                    VariableNumber::Integral(buf) => {
+                        buf.value += n;
+                        buf.rows += 1;
+                    }
+                    VariableNumber::Floating(buf) => {
+                        buf.value += n as f64;
+                        buf.rows += 1;
+                    }
+                }
+                Value::Float(n) => match &mut self.number {
+                    VariableNumber::Unknown =>
+                        self.number = VariableNumber::Floating(NumberBuf { value: n, rows: 1 }),
+                    VariableNumber::Integral(buf) => {
+                        let new_buf = NumberBuf {
+                            value: buf.value as f64 + n,
+                            rows: buf.rows + 1,
+                        };
+                        self.number = VariableNumber::Floating(new_buf);
+                    }
+                    VariableNumber::Floating(buf) => {
+                        buf.value += n;
+                        buf.rows += 1;
+                    }
+                }
+                Value::Null => (), // Ignore NULL value
+                _ => unreachable!()
+            }
+        }
+    }
+
+    #[derive(Default, Clone)]
+    enum VariableNumber {
+        #[default]
+        Unknown,
+        Integral(NumberBuf<i64>),
+        Floating(NumberBuf<f64>),
+        //
+    }
+
+    #[derive(Default, Clone)]
+    struct NumberBuf<T: Default> {
+        value: T,
+        rows: usize,
+    }
+
+    impl<T: Default + 'static> NumberBuf<T> {
+        fn cast(input: &dyn Writable) -> &Self {
+            input.any().downcast_ref::<Self>().unwrap()
+        }
+
+        fn cast_mut(input: &mut dyn Writable) -> &mut Self {
+            input.any_mut().downcast_mut::<Self>().unwrap()
+        }
+    }
+
+    impl<T: Default + 'static> Writable for NumberBuf<T> {
         fn any(&self) -> &dyn Any {
             self
         }
 
         fn any_mut(&mut self) -> &mut dyn Any {
             self
+        }
+
+        fn clear(&mut self) {
+            self.value = T::default();
+            self.rows = 0;
         }
     }
 
@@ -226,19 +385,20 @@ lazy_static! {
 }
 
 struct BuiltinFns {
-    udfs: HashMap<&'static str, fn (&ExecutionContext)->ArenaBox<dyn UDF>>,
-    udafs: HashMap<&'static str, fn (&ExecutionContext)->ArenaBox<dyn Aggregator>>
+    udfs: HashMap<&'static str, fn(&ExecutionContext) -> ArenaBox<dyn UDF>>,
+    udafs: HashMap<&'static str, fn(&ExecutionContext) -> ArenaBox<dyn Aggregator>>,
 }
 
 impl BuiltinFns {
     fn new() -> Self {
-        let mut udfs = HashMap::<&'static str, fn (&ExecutionContext)->ArenaBox<dyn UDF>>::new();
+        let mut udfs = HashMap::<&'static str, fn(&ExecutionContext) -> ArenaBox<dyn UDF>>::new();
         udfs.insert("version", udf::Version::new);
         udfs.insert("length", udf::Length::new);
         udfs.insert("concat", udf::Concat::new);
 
-        let mut udafs = HashMap::<&'static str, fn (&ExecutionContext)->ArenaBox<dyn Aggregator>>::new();
+        let mut udafs = HashMap::<&'static str, fn(&ExecutionContext) -> ArenaBox<dyn Aggregator>>::new();
         udafs.insert("count", udaf::Count::new);
+        udafs.insert("sum", udaf::Sum::new);
         Self {
             udfs,
             udafs,
@@ -246,7 +406,8 @@ impl BuiltinFns {
     }
 
     fn new_udf(&self, name: &str, ctx: &ExecutionContext) -> Option<ArenaBox<dyn UDF>> {
-        match self.udfs.get(name) {
+        let buf: [u8;64] = utils::to_ascii_lowercase(name);
+        match self.udfs.get(std::str::from_utf8(&buf[..name.len()]).unwrap()) {
             Some(new) =>
                 Some(new(ctx)),
             None => None
@@ -254,7 +415,8 @@ impl BuiltinFns {
     }
 
     fn new_udaf(&self, name: &str, ctx: &ExecutionContext) -> Option<ArenaBox<dyn Aggregator>> {
-        match self.udafs.get(name) {
+        let buf: [u8;64] = utils::to_ascii_lowercase(name);
+        match self.udafs.get(std::str::from_utf8(&buf[..name.len()]).unwrap()) {
             Some(new) =>
                 Some(new(ctx)),
             None => None
@@ -284,7 +446,6 @@ pub enum AnyFn {
     Udf(ArenaBox<dyn UDF>),
     Udaf(ArenaBox<dyn Aggregator>),
 }
-
 
 
 #[cfg(test)]

@@ -181,7 +181,7 @@ impl Executor {
                         let col = table.get_col_by_id(*id).unwrap();
                         DB::encode_secondary_index(tuple.get(col.order), &col.ty, &mut key);
                     }
-                    if !unique_keys[i].insert(key.to_vec()) {
+                    if index.unique && !unique_keys[i].insert(key.to_vec()) {
                         let message = format!("Duplicated secondary key, index {} is unique.",
                                               table.metadata.secondary_indices[i].name);
                         Err(Status::corrupted(message))?;
@@ -205,11 +205,11 @@ impl Executor {
         for col in this.columns.iter_mut() {
             match col.expr {
                 SelectColumn::Expr(ref mut expr) => {
-                    let ty = expr_typing_reduce(expr.deref_mut(), context.clone(), &self.arena);
+                    let ty = expr_typing_reduce(expr.deref_mut(), context.clone(), &self.arena)?;
                     if col.alias.is_empty() {
-                        columns.append_with_name(format!("_{i}").as_str(), ty.unwrap());
+                        columns.append_with_name(format!("_{i}").as_str(), ty);
                     } else {
-                        columns.append_with_name(col.alias.as_str(), ty.unwrap());
+                        columns.append_with_name(col.alias.as_str(), ty);
                     }
                     columns_expr.push(expr.clone());
                 }
@@ -649,16 +649,23 @@ impl ColumnSet {
     }
 
     pub fn find_by_name(&self, prefix: &str, suffix: &str) -> Option<&Column> {
+        self.index_by_name(prefix, suffix).map(|x| {
+            &self.columns[x]
+        })
+    }
+
+    pub fn index_by_name(&self, prefix: &str, suffix: &str) -> Option<usize> {
         if prefix == self.schema.as_str() {
-            for col in &self.columns {
-                if col.name.as_str() == suffix {
-                    return Some(col)
+            for i in 0..self.columns.len() {
+                if self.columns[i].name.as_str() == suffix {
+                    return Some(i)
                 }
             }
         } else {
-            for col in &self.columns {
+            for i in 0..self.columns.len() {
+                let col = &self.columns[i];
                 if col.name.as_str() == suffix && col.desc.as_str() == prefix {
-                    return Some(col)
+                    return Some(i)
                 }
             }
         }

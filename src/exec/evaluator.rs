@@ -56,6 +56,13 @@ impl Value {
             _ => false,
         }
     }
+
+    pub fn dup(&self, arena: &ArenaMut<Arena>) -> Value {
+        match self {
+            Self::Str(s) => Value::Str(ArenaStr::new(s.as_str(), arena.get_mut())),
+            _ => self.clone()
+        }
+    }
 }
 
 impl Display for Value {
@@ -173,7 +180,7 @@ impl Evaluator {
         }
     }
 
-    fn require_number(origin: &Value) -> Value {
+    pub fn require_number(origin: &Value) -> Value {
         match origin {
             Value::Str(s) => {
                 let n = i64::from_str_radix(s.as_str(), 10);
@@ -491,7 +498,13 @@ impl Visitor for TypingReducer {
                 let sig = Signature::parse(udf.signatures()[0], &self.arena).unwrap();
                 self.ret(sig.ret_val);
             }
-            AnyFn::Udaf(udaf) => self.ret(udaf.signature())
+            AnyFn::Udaf(udaf) => {
+                let mut params = ArenaVec::new(&self.arena);
+                for arg in this.args.iter_mut() {
+                    params.push(self.reduce_returning(arg.deref_mut()));
+                }
+                self.ret(udaf.signature(&params))
+            }
         }
     }
 

@@ -6,6 +6,20 @@ pub enum Status {
     Eof,
 }
 
+#[macro_export]
+macro_rules! corrupted_err {
+    ($($arg:tt)+) => {
+        Err($crate::corrupted!($($arg)+))
+    }
+}
+
+#[macro_export]
+macro_rules! corrupted {
+    ($($arg:tt)+) => {
+        $crate::Status::corrupted(format!($($arg)+))
+    };
+}
+
 impl Status {
     pub fn is_ok(&self) -> bool { matches!(self, Self::Ok) }
     pub fn is_corruption(&self) -> bool { matches!(self, Self::Corruption(_)) }

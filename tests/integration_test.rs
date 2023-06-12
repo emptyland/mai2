@@ -1,4 +1,3 @@
-use std::ops::DerefMut;
 use mai2::exec::db::DB;
 use mai2::storage::JunkFilesCleaner;
 use mai2::{Arena, Result};
@@ -130,5 +129,51 @@ fn sql_select_agg_count() -> Result<()> {
     let mut rs = conn.execute_query_str("select count(a) + 999 from t1 where a > 0", &arena)?;
     assert!(rs.next());
     assert_eq!("(1999)", rs.current()?.to_string()); // 1000 + 999
+    Ok(())
+}
+
+#[test]
+fn sql_select_agg_count_with_group_by() -> Result<()> {
+    let _junk = JunkFilesCleaner::new("tests/dbi-005");
+    let zone = Arena::new_val();
+    let db = DB::open("tests".to_string(), "dbi-005".to_string())?;
+    let conn = db.connect();
+
+    let sql = " create table t1 {\n\
+                id int primary key auto_increment,\n\
+                record int,\n\
+                name varchar(64) \n\
+                index idx_name(name)\n\
+            };\n";
+    let arena = zone.get_mut();
+    assert_eq!(0, conn.execute_str(sql, &arena)?);
+
+    let affected_rows = conn.execute_str("\
+insert into table t1(record, name) values
+(1, \"John\"),
+(2, \"John\"),
+(3, \"John\"),
+(4, \"Tom\"),
+(1, \"Tom\"),
+(1, \"Jerry\"),
+(1, \"Jerry\"),
+(1, \"Jerry\"),
+(1, \"Jerry\"),
+(1, \"ST\");
+    ", &arena)?;
+    assert_eq!(10, affected_rows);
+
+    let mut rs = conn.execute_query_str("select name, count(1) from t1 where id > 0 group by name", &arena)?;
+    // while rs.next() {
+    //     let row = rs.current()?;
+    //     println!("{}", row.to_string());
+    // }
+    assert!(rs.next());
+    assert_eq!("(\"Jerry\", 4)", rs.current()?.to_string());
+    /*
+("John", 3)
+("ST", 1)
+("Tom", 2)
+     */
     Ok(())
 }

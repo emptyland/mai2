@@ -1,4 +1,6 @@
 use std::num::Wrapping;
+use std::ptr;
+use std::ptr::{addr_of, addr_of_mut};
 
 pub const BLOOM_FILTER_HASHES_ORDER: [fn(&[u8]) -> u32; 5] = [
     js_hash,
@@ -67,4 +69,15 @@ pub fn round_down<T>(x: *mut T, m: i64) -> *mut T {
 // return RoundDown<T>(static_cast<T>(x + m - 1), m);
 pub fn round_up<T>(x: *mut T, m: i64) -> *mut T {
     round_down((x as i64 + m - 1) as *mut T, m)
+}
+
+pub fn to_ascii_lowercase<const N: usize>(input: &str) -> [u8;N] {
+    let mut buf: [u8;N] = [0;N];
+    debug_assert!(input.as_bytes().len() <= buf.len());
+    unsafe {
+        ptr::copy_nonoverlapping(addr_of!(input.as_bytes()[0]), addr_of_mut!(buf[0]),
+                                 input.len());
+    }
+    buf[..input.len()].make_ascii_lowercase();
+    buf
 }

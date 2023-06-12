@@ -1,4 +1,3 @@
-use std::env::args;
 use std::fmt::{Display, Formatter};
 use std::mem::replace;
 use std::ops::{Deref, DerefMut};
@@ -9,7 +8,7 @@ use crate::{break_visit, Corrupting, Result, Status, switch, try_visit, visit_fa
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::{DB, TableHandle, TableRef};
 use crate::exec::evaluator::{Evaluator, TypingReducer, Value};
-use crate::exec::executor::{Column, ColumnSet, PreparedStatement, TypingStubContext, UniversalContext};
+use crate::exec::executor::{ColumnSet, PreparedStatement, TypingStubContext, UniversalContext};
 use crate::exec::function;
 use crate::exec::function::{Aggregator, ExecutionContext};
 use crate::exec::physical_plan::{AggregatorBundle, FilteringOps, GroupingAggregatorOps, MergingOps, PhysicalPlanOps, ProjectingOps, RangeScanOps};
@@ -220,7 +219,7 @@ impl PlanMaker {
         for agg in aggregators {
             i += 1;
             let name = format!("_a_{i}");
-            cols.append_with_name(name.as_str(), agg.rets_ty());
+            cols.append_with_name(name.as_str(), agg.returning_ty().clone());
         }
         drop(i);
 
@@ -228,6 +227,22 @@ impl PlanMaker {
             cols.append(col.name.as_str(), col.desc.as_str(), col.id, col.ty.clone());
         }
         ArenaBox::new(cols, self.arena.get_mut())
+    }
+
+    fn reduce_aggregators_returning_ty(&self, aggregators: &mut [AggregatorBundle],
+                                       up_cols: &ArenaBox<ColumnSet>) -> Result<()> {
+        let context =
+            Arc::new(TypingStubContext::new(self.prepared_stmt.clone(), up_cols));
+        let mut reducer = TypingReducer::new(&self.arena);
+        let mut params = ArenaVec::new(&self.arena);
+        for agg in aggregators {
+            for expr in agg.args_mut() {
+                params.push(reducer.reduce(expr.deref_mut(), context.clone())?);
+            }
+            agg.reduce_returning_ty(&params);
+            params.clear();
+        }
+        Ok(())
     }
 
     fn make_projecting(&mut self, columns: &[SelectColumnItem], alias: &str) -> Result<()> {
@@ -390,12 +405,22 @@ impl Visitor for PlanMaker {
 
         if !projection_col_visitor.aggregators.is_empty() {
             let up_cols = self.schemas.pop().unwrap();
+            let mut aggregators = projection_col_visitor.grab_aggregators();
+            match self.reduce_aggregators_returning_ty(&mut aggregators, &up_cols) {
+                Err(e) => {
+                    self.rs = e;
+                    return;
+                }
+                Ok(_) => ()
+            }
+
             let up_plan = self.current.pop().unwrap();
             let cols =
-                self.merge_aggregators_columns_set(&projection_col_visitor.aggregators, &up_cols);
+                self.merge_aggregators_columns_set(&aggregators, &up_cols);
+
             let grouping_plan =
                 GroupingAggregatorOps::new(this.group_by_clause.dup(&self.arena),
-                                           projection_col_visitor.grab_aggregators(),
+                                           aggregators,
                                            up_plan,
                                            self.arena.clone(),
                                            cols.clone(),
