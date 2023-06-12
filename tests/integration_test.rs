@@ -170,10 +170,13 @@ insert into table t1(record, name) values
     // }
     assert!(rs.next());
     assert_eq!("(\"Jerry\", 4)", rs.current()?.to_string());
-    /*
-("John", 3)
-("ST", 1)
-("Tom", 2)
-     */
+    assert!(rs.next());
+    assert_eq!("(\"John\", 3)", rs.current()?.to_string());
+    assert!(rs.next());
+    assert_eq!("(\"ST\", 1)", rs.current()?.to_string());
+    assert!(rs.next());
+    assert_eq!("(\"Tom\", 2)", rs.current()?.to_string());
+    assert!(!rs.next());
+
     Ok(())
 }
