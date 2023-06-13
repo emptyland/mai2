@@ -170,6 +170,7 @@ pub trait ColumnFamily: Send + Sync {
     //fn as_any_mut(&mut self) -> &mut dyn Any;
     fn name(&self) -> String;
     fn id(&self) -> u32;
+    fn temporary(&self) -> bool;
     fn comparator(&self) -> Rc<dyn Comparator>;
     fn get_descriptor(&self) -> Result<ColumnFamilyDescriptor>;
 }
@@ -183,6 +184,7 @@ pub const REDO_HEADER_SIZE: usize = size_of::<u64>() + size_of::<u32>();
 #[derive(Default, Clone, Debug)]
 pub struct WriteBatch {
     redo: Vec<u8>,
+    need_wal: u32,
     pub number_of_ops: usize,
 }
 
@@ -197,8 +199,17 @@ impl WriteBatch {
         buf.extend(iter::repeat(0).take(REDO_HEADER_SIZE));
         Self {
             redo: buf,
+            need_wal: 0,
             number_of_ops: 0,
         }
+    }
+
+    pub fn should_write_wal(&self) -> bool {
+        self.need_wal > 0
+    }
+
+    pub fn should_ignore_wal(&self) -> bool {
+        !self.should_write_wal()
     }
 
     pub fn take_redo(mut self, sequence_number: u64) -> Vec<u8> {
@@ -222,6 +233,7 @@ impl WriteBatch {
         self.redo.write(key).unwrap();
         (value.len() as u32).write_to(&mut self.redo);
         self.redo.write(value).unwrap();
+        self.need_wal += if cf.temporary() {0} else {1};
     }
 
     pub fn delete(&mut self, cf: &Arc<dyn ColumnFamily>, key: &[u8]) {
@@ -229,6 +241,7 @@ impl WriteBatch {
         self.redo.push(Tag::Deletion.to_byte());
         (key.len() as u32).write_to(&mut self.redo);
         self.redo.write(key).unwrap();
+        self.need_wal += if cf.temporary() {0} else {1};
     }
 
     pub fn iterate<S>(&self, stub: &S) where S: WriteBatchStub {

@@ -15,6 +15,13 @@ pub trait FixedEncode<T: Sized> {
     fn write_fixed(&self, buf: &mut Vec<u8>) -> usize;
 }
 
+impl VarintEncode<bool> for bool {
+    fn write_to(&self, buf: &mut Vec<u8>) -> usize {
+        buf.push(if *self {1} else {0});
+        1
+    }
+}
+
 impl VarintEncode<i32> for i32 {
     fn write_to(&self, buf: &mut Vec<u8>) -> usize {
         zig_zag32_encode(*self).write_to(buf)
@@ -109,6 +116,13 @@ impl Decoder {
     pub fn read_slice<'a>(&mut self, buf: &'a [u8]) -> io::Result<&'a [u8]> {
         let len: u32 = self.read_from(buf)?;
         self.take_slice(buf, len as usize)
+    }
+}
+
+impl VarintDecode<bool> for Decoder {
+    fn read_from(&mut self, buf: &[u8]) -> io::Result<bool> {
+        let slice = self.take_slice(buf, 1)?;
+        Ok(slice[0] != 0)
     }
 }
 

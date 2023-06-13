@@ -343,6 +343,7 @@ pub struct ColumnFamilyHandle {
     db: *const u8,
     id: u32,
     name: String,
+    temporary: bool,
     mutex: Arc<Mutex<VersionSet>>,
     core: Arc<ColumnFamilyImpl>,
 }
@@ -355,6 +356,7 @@ impl ColumnFamilyHandle {
             db: 0 as *const u8,
             id,
             name,
+            temporary: core.options.temporary,
             core: core.clone(),
             mutex: mutex.clone(),
         })
@@ -376,6 +378,10 @@ impl ColumnFamily for ColumnFamilyHandle {
 
     fn id(&self) -> u32 {
         self.id
+    }
+
+    fn temporary(&self) -> bool {
+        self.temporary
     }
 
     fn comparator(&self) -> Rc<dyn Comparator> {

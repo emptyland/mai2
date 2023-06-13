@@ -25,7 +25,7 @@ use crate::base::{Logger, Decoder, VarintDecode, VarintEncode};
 use crate::storage::Status;
 use crate::storage::Status::NotFound;
 use crate::storage::wal::{LogReader, LogWriter};
-use crate::Result;
+use crate::{log_warn, Result};
 
 pub struct VersionSet {
     env: Arc<dyn Env>,
@@ -84,13 +84,21 @@ impl VersionSet {
             assert_eq!(read_in_bytes, record.len());
 
             if patch.has_column_family_creation() {
-                if !desc.contains_key(&patch.cf_creation.name) {
+                let temporary = patch.cf_creation.temporary;
+                if !temporary && !desc.contains_key(&patch.cf_creation.name) {
                     return Err(io::Error::new(io::ErrorKind::InvalidData,
                                               format!("column family options: {} not found",
                                                       patch.cf_creation.name)));
                 }
 
-                let opts = desc.get(&patch.cf_creation.name).unwrap();
+                let temporary_opts = ColumnFamilyOptions::with()
+                    .temporary(true)
+                    .build();
+                let opts = if temporary {
+                    &temporary_opts
+                } else {
+                    desc.get(&patch.cf_creation.name).unwrap()
+                };
                 if patch.cf_creation.comparator_name != opts.user_comparator.name() {
                     return Err(io::Error::new(io::ErrorKind::InvalidData,
                                               format!("difference comparator: {} vs {}",
@@ -102,6 +110,10 @@ impl VersionSet {
                                                    patch.cf_creation.cf_id,
                                                    patch.cf_creation.name.clone(),
                                                    opts.clone());
+                if temporary {
+                    log_warn!(self.logger, "Temporary column family: {} not dropped yet!",
+                        patch.cf_creation.name);
+                }
             }
 
             if patch.has_column_family_deletion() {
@@ -223,6 +235,7 @@ impl VersionSet {
         for cfi in borrowed_cfs.column_family_impls() {
             let mut patch = VersionPatch::default();
             patch.create_column_family(cfi.id(), cfi.name().clone(),
+                                       cfi.options().temporary,
                                        cfi.internal_key_cmp.user_cmp.name());
             patch.set_redo_log(cfi.id(), cfi.redo_log_number());
 
@@ -410,6 +423,7 @@ mod patch {
     pub struct CFCreation {
         pub cf_id: u32,
         pub name: String,
+        pub temporary: bool,
         pub comparator_name: String,
     }
 
@@ -460,6 +474,7 @@ mod patch {
             let mut size = 0;
             size += self.cf_id.write_to(buf);
             size += self.name.write_to(buf);
+            size += self.temporary.write_to(buf);
             size += self.comparator_name.write_to(buf);
             size
         }
@@ -563,6 +578,7 @@ impl VersionPatch {
                     patch.set_max_column_family(decoder.read_from(bytes)?),
                 patch::Field::AddColumnFamily =>
                     patch.create_column_family(decoder.read_from(bytes)?,
+                                               decoder.read_from(bytes)?,
                                                decoder.read_from(bytes)?,
                                                decoder.read_from(bytes)?),
                 patch::Field::DropColumnFamily =>
@@ -696,11 +712,12 @@ impl VersionPatch {
 
     pub const fn column_family_deletion(&self) -> u32 { self.cf_deletion }
 
-    pub fn create_column_family(&mut self, cf_id: u32, name: String, comparator_name: String) {
+    pub fn create_column_family(&mut self, cf_id: u32, name: String, temporary: bool, comparator_name: String) {
         self.set_field(patch::Field::AddColumnFamily);
         self.cf_creation = patch::CFCreation {
             cf_id,
             name,
+            temporary,
             comparator_name,
         };
     }

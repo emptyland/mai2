@@ -15,7 +15,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 
 use crate::storage::{config, storage, wal, files};
-use crate::{log_debug, log_error, log_info};
+use crate::{corrupted_err, log_debug, log_error, log_info};
 use crate::storage::cache::TableCache;
 use crate::storage::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
 use crate::storage::compaction::{Compact, Compaction};
@@ -296,22 +296,14 @@ impl DBImpl {
         let mutex = self.versions.clone();
         let mut versions = mutex.lock().unwrap();
         let mut history: BTreeSet<u64> = from_io_result(versions.recover(&cfs, manifest_file_number))?;
-        assert!(history.len() >= 1);
-
-        #[cfg(test)]
-        {
-            log_debug!(self.logger, "recover versions history:");
-            for number in history.iter() {
-                log_debug!(self.logger, "history={}", number);
-            }
-        }
+        debug_assert!(history.len() >= 1);
 
         if self.options.create_missing_column_families {
             for cfi in versions.column_families().borrow().column_family_impls() {
                 cfs.remove(cfi.name());
             }
             for (name, opts) in cfs {
-                self.internal_new_column_family(name, opts, &mut versions)?;
+                self.internal_new_column_family(name.as_str(), opts, &mut versions)?;
             }
         }
 
@@ -434,19 +426,33 @@ impl DBImpl {
         Ok(())
     }
 
-    fn internal_new_column_family(&self, name: String, options: ColumnFamilyOptions,
+    fn internal_new_column_family(&self, name: &str, options: ColumnFamilyOptions,
                                   locking: &mut MutexGuard<VersionSet>)
                                   -> Result<u32> {
+        let name = if options.temporary {
+            let cfs = locking.column_families().borrow();
+            let mut tmp_name = name.to_string();
+            let mut i = 0;
+            while cfs.get_column_family_by_name(&tmp_name).is_some() {
+                i += 1;
+                tmp_name = format!("{name}-{i}")
+            }
+            tmp_name
+        } else {
+            name.to_string()
+        };
+
         let (id, patch) = {
             let versions = locking.deref_mut();
             let mut cfs = versions.column_families().borrow_mut();
             if cfs.get_column_family_by_name(&name).is_some() {
-                return Err(Status::corrupted(format!("duplicated column family name: {}", &name)));
+                return corrupted_err!("Duplicated column family name: {}", &name);
             }
 
             let new_id = cfs.next_column_family_id();
             let mut patch = VersionPatch::default();
             patch.create_column_family(new_id, name.clone(),
+                                       options.temporary,
                                        options.user_comparator.name().clone());
             (new_id, patch)
         };
@@ -466,12 +472,17 @@ impl DBImpl {
                 versions = self.make_room_for_write(cfi, versions)?;
             }
         }
-        let redo = updates.take_redo(last_version + 1);
-        let mut redo_logger = self.redo_log.take().unwrap();
-        from_io_result(redo_logger.log.append(redo.as_slice()))?;
-        self.redo_log.set(Some(redo_logger));
 
-        self.flush_redo_log(options.sync, &mut versions);
+        let should_write_wal = updates.should_write_wal();
+        let redo = updates.take_redo(last_version + 1);
+        // temporary column families don't need writing wal
+        if should_write_wal {
+            let mut redo_logger = self.redo_log.take().unwrap();
+            from_io_result(redo_logger.log.append(redo.as_slice()))?;
+            self.redo_log.set(Some(redo_logger));
+
+            self.flush_redo_log(options.sync, &mut versions);
+        }
 
         let handler = WritingHandler::new(0, false,
                                           last_version + 1,
@@ -900,7 +911,7 @@ impl DB for DBImpl {
         //--------------------------lock version-set------------------------------------------------
         let mutex = self.versions.clone();
         let mut versions = mutex.lock().unwrap();
-        let id = self.internal_new_column_family(String::from(name), options, &mut versions)?;
+        let id = self.internal_new_column_family(name, options, &mut versions)?;
 
         let cfs = versions.column_families().borrow();
         let cfi = cfs.get_column_family_by_id(id).unwrap();
@@ -1041,6 +1052,17 @@ impl Drop for DBImpl {
             worker.join_handle.join().unwrap();
             drop(worker.tx);
         }
+
+        // Cleanup all temporary column families:
+        // let locking = self.versions.lock().unwrap();
+        // let cfs = locking.column_families().borrow_mut();
+        // for cf in cfs.column_families.values() {
+        //     cf.drop_it();
+        // }
+        //
+        // drop(cfs);
+        // drop(locking);
+
         log_debug!(self.logger, "drop it! DBImpl");
     }
 }
