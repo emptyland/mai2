@@ -83,6 +83,19 @@ macro_rules! try_visit {
 }
 
 #[macro_export]
+macro_rules! try_eval {
+    ($self:expr, $expr:expr) => {
+        {
+            let _rv = $expr;
+            if $self.rs.is_not_ok() {
+                return;
+            }
+            _rv
+        }
+    };
+}
+
+#[macro_export]
 macro_rules! break_visit {
     ($self:ident, $node:expr) => {
         {

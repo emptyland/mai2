@@ -1,7 +1,7 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::{Cell, RefCell};
 use std::{iter, mem, ptr, slice};
-use std::cmp::min;
+use std::cmp::{min, Ordering};
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
@@ -487,6 +487,12 @@ impl Debug for ArenaStr {
 impl PartialEq for ArenaStr {
     fn eq(&self, other: &Self) -> bool {
         self.as_str() == other.as_str()
+    }
+}
+
+impl PartialOrd for ArenaStr {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.as_str().partial_cmp(other.as_str())
     }
 }
 

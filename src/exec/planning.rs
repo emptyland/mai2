@@ -396,11 +396,22 @@ impl Visitor for PlanMaker {
         }
 
         if maybe_table.is_none() {
-            match &mut this.where_clause {
-                Some(filter) => {}
-                None => ()
-            }
+            // match &mut this.where_clause {
+            //     Some(filter) => {}
+            //     None => ()
+            // }
             todo!()
+        }
+
+        if let Some(having) = &mut this.having_clause {
+            debug_assert!(!this.group_by_clause.is_empty());
+            match projection_col_visitor.try_rewrite_expr(having) {
+                Err(e) => {
+                    self.rs = e;
+                    return;
+                }
+                Ok(_) => ()
+            }
         }
 
         if !projection_col_visitor.aggregators.is_empty() {
@@ -430,6 +441,22 @@ impl Visitor for PlanMaker {
         } else if !this.group_by_clause.is_empty() {
             self.rs = Status::corrupted("Group by clause without aggregator");
             return;
+        }
+
+        if let Some(having) = &this.having_clause {
+            let up_cols = self.schemas.pop().unwrap();
+            let up_plan = self.current.pop().unwrap();
+
+            debug_assert!(!this.group_by_clause.is_empty());
+            let filtering_plan = FilteringOps::new(
+                having,
+                &up_plan,
+                &up_cols,
+                self.prepared_stmt.clone(),
+                &self.arena);
+
+            self.schemas.push(up_cols);
+            self.current.push(ArenaBox::new(filtering_plan, self.arena.get_mut()).into());
         }
 
         // TODO: Order by:
@@ -1156,13 +1183,7 @@ impl ProjectionColumnsVisitor {
             let col = &mut cols[i];
             match &mut col.expr {
                 SelectColumn::Expr(expr) => {
-                    expr.accept(self);
-                    if self.rs.is_not_ok() {
-                        break;
-                    }
-                    if let Some(ast) = self.rewrite() {
-                        utils::replace_expr(expr, ast);
-                    }
+                    self.try_rewrite_expr(expr)?;
                     i += 1;
                 }
                 SelectColumn::Star => {
@@ -1202,6 +1223,17 @@ impl ProjectionColumnsVisitor {
         } else {
             Ok(())
         }
+    }
+
+    fn try_rewrite_expr(&mut self, expr: &mut ArenaBox<dyn Expression>) -> Result<()> {
+        expr.accept(self);
+        if self.rs.is_not_ok() {
+            return Err(self.rs.clone());
+        }
+        if let Some(ast) = self.rewrite() {
+            utils::replace_expr(expr, ast);
+        }
+        Ok(())
     }
 
     fn grab_aggregators(&mut self) -> ArenaVec<AggregatorBundle> {

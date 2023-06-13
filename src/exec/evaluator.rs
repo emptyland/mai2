@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::ops::{Add, DerefMut, Sub, Mul};
 use std::str::FromStr;
 use std::sync::Arc;
-use crate::{Corrupting, Result, Status, try_visit};
+use crate::{Corrupting, Result, Status, try_eval, try_visit};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::ColumnType;
 use crate::exec::function::{AnyFn, ExecutionContext, new_any_fn, Signature, UDF};
@@ -54,6 +54,30 @@ impl Value {
         match self {
             Self::NegativeInf | Self::PositiveInf => true,
             _ => false,
+        }
+    }
+
+    pub fn is_str(&self) -> bool { matches!(self, Self::Str(_)) }
+    pub fn unwrap_str(&self) -> &ArenaStr {
+        match self {
+            Self::Str(s) => s,
+            _ => panic!("Not Str(ArenaStr) value")
+        }
+    }
+
+    pub fn is_int(&self) -> bool { matches!(self, Self::Int(_)) }
+    pub fn unwrap_int(&self) -> i64 {
+        match self {
+            Self::Int(n) => *n,
+            _ => panic!("Not Int(i64) value")
+        }
+    }
+
+    pub fn is_float(&self) -> bool { matches!(self, Self::Float(_)) }
+    pub fn unwrap_float(&self) -> f64 {
+        match self {
+            Self::Float(n) => *n,
+            _ => panic!("Not Float(f64) value")
         }
     }
 
@@ -182,20 +206,53 @@ impl Evaluator {
 
     pub fn require_number(origin: &Value) -> Value {
         match origin {
-            Value::Str(s) => {
-                let n = i64::from_str_radix(s.as_str(), 10);
-                if n.is_err() {
-                    let f = f64::from_str(s.as_str());
-                    if f.is_err() {
-                        Value::Null
-                    } else {
-                        Value::Float(f.unwrap())
-                    }
-                } else {
-                    Value::Int(n.unwrap())
-                }
-            }
+            Value::Str(s) => Self::require_number_from_str(s),
             _ => origin.clone()
+        }
+    }
+
+    pub fn require_number_from_str(origin: &ArenaStr) -> Value {
+        let n = i64::from_str_radix(origin.as_str(), 10);
+        if n.is_err() {
+            let f = f64::from_str(origin.as_str());
+            if f.is_err() {
+                Value::Null
+            } else {
+                Value::Float(f.unwrap())
+            }
+        } else {
+            Value::Int(n.unwrap())
+        }
+    }
+
+    fn eval_compare_number(lhs: &Value, rhs: &Value, op: &Operator) -> Value {
+        match lhs {
+            Value::Int(a) => match rhs {
+                Value::Int(b) => Self::eval_compare_op(*a, *b, op),
+                Value::Float(b) => Self::eval_compare_op(*a as f64, *b, op),
+                Value::Null => Value::Null,
+                _ => unreachable!()
+            }
+            Value::Float(a) => match rhs {
+                Value::Int(b) => Self::eval_compare_op(*a, *b as f64, op),
+                Value::Float(b) => Self::eval_compare_op(*a, *b, op),
+                Value::Null => Value::Null,
+                _ => unreachable!()
+            }
+            Value::Null => Value::Null,
+            _ => unreachable!()
+        }
+    }
+
+    fn eval_compare_op<T: PartialOrd>(lhs: T, rhs: T, op: &Operator) -> Value {
+        match op {
+            Operator::Lt => Value::Int(if lhs < rhs {1} else {0}),
+            Operator::Le => Value::Int(if lhs <= rhs {1} else {0}),
+            Operator::Gt => Value::Int(if lhs > rhs {1} else {0}),
+            Operator::Ge => Value::Int(if lhs >= rhs {1} else {0}),
+            Operator::Eq => Value::Int(if lhs == rhs {1} else {0}),
+            Operator::Ne => Value::Int(if lhs != rhs {1} else {0}),
+            _ => unreachable!()
         }
     }
 }
@@ -205,7 +262,17 @@ macro_rules! process_airth_op {
     ($self:ident, $this:ident, $call:ident) => {
         {
             let lhs = Self::require_number(&$self.evaluate_returning($this.lhs_mut().deref_mut()));
+            if $self.rs.is_not_ok() {
+                return;
+            }
             let rhs = Self::require_number(&$self.evaluate_returning($this.rhs_mut().deref_mut()));
+            if $self.rs.is_not_ok() {
+                return;
+            }
+            if lhs.is_null() || rhs.is_null() {
+                $self.ret(Value::Null);
+                return;
+            }
             match lhs {
                 Value::Int(a) => match rhs {
                     Value::Int(b) => $self.ret(Value::Int(a.$call(b))),
@@ -270,7 +337,17 @@ impl Visitor for Evaluator {
             Operator::Mul => process_airth_op!(self, this, mul),
             Operator::Div => {
                 let lhs = Self::require_number(&self.evaluate_returning(this.lhs_mut().deref_mut()));
+                if self.rs.is_not_ok() {
+                    return;
+                }
                 let rhs = Self::require_number(&self.evaluate_returning(this.rhs_mut().deref_mut()));
+                if self.rs.is_not_ok() {
+                    return;
+                }
+                if lhs.is_null() || rhs.is_null() {
+                    self.ret(Value::Null);
+                    return;
+                }
                 match lhs {
                     Value::Int(a) => match rhs {
                         Value::Int(b) => self.ret(if b == 0 {Value::Null} else {Value::Int(a / b)}),
@@ -285,9 +362,34 @@ impl Visitor for Evaluator {
                     _ => self.ret(lhs)
                 }
             }
+            Operator::Lt | Operator::Le | Operator::Gt | Operator::Ge | Operator::Eq | Operator::Ne => {
+                let lhs = try_eval!(self, self.evaluate_returning(this.lhs_mut().deref_mut()));
+                let rhs = try_eval!(self, self.evaluate_returning(this.rhs_mut().deref_mut()));
+                let rv = match &lhs {
+                    Value::Int(_) =>
+                        Self::eval_compare_number(&lhs, &Self::require_number(&rhs), this.op()),
+                    Value::Float(_) =>
+                        Self::eval_compare_number(&lhs, &Self::require_number(&rhs), this.op()),
+                    Value::Str(s) => match &rhs {
+                        Value::Str(b) =>
+                            Self::eval_compare_op(s, b, this.op()),
+                        _ =>
+                            Self::eval_compare_number(&Self::require_number(&lhs), &rhs, this.op()),
+                    }
+                    Value::Null => Value::Null,
+                    _ => unreachable!()
+                };
+                self.ret(rv);
+            }
             Operator::And => {
                 let lhs = Self::require_int(&self.evaluate_returning(this.lhs_mut().deref_mut()));
+                if self.rs.is_not_ok() {
+                    return;
+                }
                 let rhs = Self::require_int(&self.evaluate_returning(this.rhs_mut().deref_mut()));
+                if self.rs.is_not_ok() {
+                    return;
+                }
                 match lhs {
                     Value::Int(a) => match rhs {
                         Value::Int(b) => self.ret(Value::Int(if a != 0 && b != 0 {1} else {0})),

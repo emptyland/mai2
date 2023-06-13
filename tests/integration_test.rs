@@ -177,6 +177,17 @@ insert into table t1(record, name) values
     assert!(rs.next());
     assert_eq!("(\"Tom\", 2)", rs.current()?.to_string());
     assert!(!rs.next());
+    drop(rs);
 
+    let mut rs = conn.execute_query_str("select name, count(1)
+    from t1 where id > 0
+    group by name
+    having count(1) > 2
+    ", &arena)?;
+    assert!(rs.next());
+    assert_eq!("(\"Jerry\", 4)", rs.current()?.to_string());
+    assert!(rs.next());
+    assert_eq!("(\"John\", 3)", rs.current()?.to_string());
+    assert!(!rs.next());
     Ok(())
 }
