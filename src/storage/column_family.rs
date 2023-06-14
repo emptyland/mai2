@@ -488,6 +488,15 @@ impl ColumnFamilySet {
             .map(|x| x.1)
             .collect()
     }
+
+    pub fn temporary_column_families(&self) -> Vec<Arc<ColumnFamilyImpl>> {
+        self.column_families.values()
+            .enumerate()
+            .map(|(_, x)| {x})
+            .filter(|x|{x.options().temporary})
+            .cloned()
+            .collect()
+    }
 }
 
 #[cfg(test)]

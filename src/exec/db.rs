@@ -1604,10 +1604,11 @@ mod tests {
 
     #[test]
     fn large_insert_into_table() -> Result<()> {
+        const N: i32 = 300000;
+
         let _junk = JunkFilesCleaner::new("tests/db110");
         let arena = Arena::new_ref();
         let db = DB::open("tests".to_string(), "db110".to_string())?;
-        let n = 300000;
         let conn = db.connect();
         let sql = " create table t1 {\n\
                 a int primary key auto_increment,\n\
@@ -1620,13 +1621,13 @@ mod tests {
         let mut stmt = conn.prepare_str(sql, &arena.get_mut())?.first().cloned().unwrap();
 
         let jiffies = db.env.current_time_mills();
-        for i in 0..n {
+        for i in 0..N {
             stmt.bind_i64(0, i as i64);
             stmt.bind_null(1);
             conn.execute_prepared_statement(&mut stmt)?;
         }
         let cost = (db.env.current_time_mills() - jiffies) as f32 / 1000f32;
-        println!("qps: {}", n as f32 / cost);
+        println!("qps: {}", N as f32 / cost);
 
         Ok(())
     }
@@ -1799,6 +1800,39 @@ mod tests {
         assert!(rs.next());
         assert_eq!("(3, \"ccc\")", rs.current()?.to_string());
 
+        assert!(!rs.next());
+        Ok(())
+    }
+
+    #[test]
+    fn select_from_prepared_statement() -> Result<()> {
+        let junk = JunkFilesCleaner::new("tests/db116");
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let db = DB::open(junk.ensure().path, junk.ensure().name)?;
+        let conn = db.connect();
+
+        let sql = " create table t1 {\n\
+                a int primary key auto_increment,\n\
+                b char(9)\n\
+                index idx_b(b)\n\
+            };\n\
+            insert into table t1(b) values (\"aaa\"),(\"bbb\"),(\"ccc\");\n\
+            ";
+        assert_eq!(3, conn.execute_str(sql, &arena)?);
+
+
+        let mut stmt = conn.prepare_str("select count(*) from t1 where a >= ?", &arena)?[0].clone();
+        stmt.bind_i64(0, 1);
+        let mut rs = conn.execute_query_prepared_statement(&mut stmt, &arena)?;
+        assert!(rs.next());
+        assert_eq!("(3)", rs.current()?.to_string());
+        assert!(!rs.next());
+
+        stmt.bind_i64(0, 2);
+        let mut rs = conn.execute_query_prepared_statement(&mut stmt, &arena)?;
+        assert!(rs.next());
+        assert_eq!("(2)", rs.current()?.to_string());
         assert!(!rs.next());
         Ok(())
     }

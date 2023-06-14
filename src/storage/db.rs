@@ -461,6 +461,21 @@ impl DBImpl {
         Ok(id)
     }
 
+    fn drop_column_family_impl<'a>(&'a self, cfi: Arc<ColumnFamilyImpl>,
+                               mut versions: MutexGuard<'a, VersionSet>) -> Result<MutexGuard<VersionSet>> {
+        while cfi.background_progress() {
+            // Waiting for all background progress done
+            versions = cfi.background_cv.wait(versions).unwrap();
+        }
+        let mut patch = VersionPatch::default();
+        patch.drop_column_family(cfi.id());
+
+        let cf_opts = cfi.options().clone();
+        from_io_result(versions.log_and_apply(cf_opts, patch))?;
+        from_io_result(cfi.uninstall(&self.env))?;
+        Ok(versions)
+    }
+
     fn write_impl(&self, options: &WriteOptions, updates: WriteBatch) -> Result<()> {
         let mutex = self.versions.clone();
         let mut versions = mutex.lock().unwrap();
@@ -927,25 +942,27 @@ impl DB for DBImpl {
             return Err(Status::corrupted("can not drop default column family!"));
         }
 
-        //--------------------------lock version-set------------------------------------------------
         let cfi = ColumnFamilyImpl::from(&column_family);
         if cfi.dropped() {
             return Err(Status::corrupted(format!("column family: {} has dropped",
                                                  cfi.name())));
         }
 
-        let mut versions = self.versions.lock().unwrap();
-        while cfi.background_progress() {
-            // Waiting for all background progress done
-            versions = cfi.background_cv.wait(versions).unwrap();
-        }
-        let mut patch = VersionPatch::default();
-        patch.drop_column_family(cfi.id());
-
-        let cf_opts = cfi.options().clone();
-        from_io_result(versions.log_and_apply(cf_opts, patch))?;
-        from_io_result(cfi.uninstall(&self.env))?;
+        //--------------------------lock version-set------------------------------------------------
+        let versions = self.versions.lock().unwrap();
+        drop(self.drop_column_family_impl(cfi, versions)?);
         Ok(())
+        // while cfi.background_progress() {
+        //     // Waiting for all background progress done
+        //     versions = cfi.background_cv.wait(versions).unwrap();
+        // }
+        // let mut patch = VersionPatch::default();
+        // patch.drop_column_family(cfi.id());
+        //
+        // let cf_opts = cfi.options().clone();
+        // from_io_result(versions.log_and_apply(cf_opts, patch))?;
+        // from_io_result(cfi.uninstall(&self.env))?;
+        // Ok(())
         //--------------------------unlock version-set----------------------------------------------
     }
 
@@ -1054,16 +1071,14 @@ impl Drop for DBImpl {
         }
 
         // Cleanup all temporary column families:
-        // let locking = self.versions.lock().unwrap();
-        // let cfs = locking.column_families().borrow_mut();
-        // for cf in cfs.column_families.values() {
-        //     cf.drop_it();
-        // }
-        //
-        // drop(cfs);
-        // drop(locking);
-
-        log_debug!(self.logger, "drop it! DBImpl");
+        let mut locking = self.versions.lock().unwrap();
+        let cfs = locking.column_families().borrow().temporary_column_families();
+        log_debug!(self.logger, "temporary column families: {} will be cleanup.", cfs.len());
+        for cfi in cfs {
+            debug_assert!(cfi.options().temporary);
+            locking = self.drop_column_family_impl(cfi.clone(), locking).unwrap();
+        }
+        drop(locking);
     }
 }
 
@@ -1370,6 +1385,88 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn temporary_column_families() -> Result<()> {
+        let junk = JunkFilesCleaner::new("tests/db8");
+        assert_eq!("tests", junk.ensure().path);
+        assert_eq!("db8", junk.ensure().name);
+        let db = open_test_db(&junk.ensure().name)?;
+        let opts = ColumnFamilyOptions::with()
+            .temporary(true)
+            .build();
+        let cf1 = db.new_column_family("tmp", opts.clone())?;
+        let cf2 = db.new_column_family("tmp", opts.clone())?;
+        assert!(cf1.temporary() && cf2.temporary());
+        assert_ne!(cf1.id(), cf2.id());
+        assert_ne!(cf1.name(), cf2.name());
+        assert_eq!("tmp", cf1.name());
+        assert!(cf2.name().starts_with("tmp"));
+        drop(db);
+
+        let desc = [ColumnFamilyDescriptor {
+            name: DEFAULT_COLUMN_FAMILY_NAME.to_string(),
+            options: ColumnFamilyOptions::default(),
+        }];
+
+        let db = load_test_db(junk.ensure().name.as_str(), &desc)?;
+        let cfs = db.get_all_column_families()?;
+        assert_eq!(1, cfs.len());
+        assert_eq!(0, cfs[0].id());
+        Ok(())
+    }
+
+    #[test]
+    fn temporary_writing() -> Result<()> {
+        let junk = JunkFilesCleaner::new("tests/db9");
+        let db = open_test_db(&junk.ensure().name)?;
+        let opts = ColumnFamilyOptions::with()
+            .temporary(true)
+            .build();
+        let cf = db.new_column_family("tmp", opts.clone())?;
+
+        let kvs = [
+            ("0000", "aaaa"),
+            ("0001", "bbbb"),
+            ("0002", "cccc"),
+            ("0003", "dddd"),
+            ("0004", "eeee"),
+            ("0005", "ffff"),
+            ("0006", "gggg"),
+        ];
+        insert_key_value_pairs(&db, &cf, &kvs)?;
+        check_key_value_pairs(&db, &cf, &kvs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn temporary_large_insertion() -> Result<()> {
+        const N: i32 = 100000;
+        let junk = JunkFilesCleaner::new("tests/db10");
+        let db = open_test_db(&junk.ensure().name)?;
+        let opts = ColumnFamilyOptions::with()
+            .temporary(true)
+            .build();
+        let cf = db.new_column_family("temporary_large_insertion",
+                                      opts.clone())?;
+
+        let blank_val = String::from_iter(iter::repeat('c').take(1024));
+        let wr_opts = WriteOptions::default();
+        for i in 0..N {
+            let k = format!("k-{i}");
+            db.insert(&wr_opts, &cf, k.as_bytes(), blank_val.as_bytes())?;
+        }
+
+        let rd_opts = ReadOptions::default();
+        for i in 0..N {
+            let k = format!("k-{i}");
+            let v = db.get_pinnable(&rd_opts, &cf, k.as_bytes())?;
+            assert_eq!(blank_val.len(), v.value().len());
+            assert_eq!('c', v.value()[0] as char);
+            assert_eq!('c', v.value()[3] as char);
+        }
         Ok(())
     }
 

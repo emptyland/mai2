@@ -433,6 +433,28 @@ impl JunkFilesCleaner {
     pub fn path(&self, i: usize) -> &Path {
         Path::new(self.path_str(i))
     }
+
+    pub fn ensure(&self) -> JunkPath {
+        let first = self.paths.first().unwrap();
+        match first.rfind("/") {
+            Some(pos) => {
+                let parts = first.split_at(pos);
+                JunkPath {
+                    path: parts.0.to_string(),
+                    name: (&parts.1[1..]).to_string(),
+                }
+            }
+            None => JunkPath {
+                path: String::default(),
+                name: first.clone(),
+            }
+        }
+    }
+}
+
+pub struct JunkPath {
+    pub path: String,
+    pub name: String,
 }
 
 impl Drop for JunkFilesCleaner {

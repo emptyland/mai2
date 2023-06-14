@@ -175,6 +175,40 @@ impl Arena {
         Ok(chunk.as_ptr() as *mut T)
     }
 
+    pub fn contains_box<T>(&self, p: &ArenaBox<T>) -> bool {
+        self.contains(p.naked.as_ptr())
+    }
+
+    pub fn contains<T>(&self, p: *const T) -> bool {
+        let mut head = &self.pages;
+        let exists = loop {
+            match head {
+                Some(page) => unsafe {
+                    if page.as_ref().contains(p) {
+                        break true
+                    }
+                    head = &page.as_ref().next;
+                }
+                None => break false
+            }
+        };
+        if exists {
+            return true;
+        }
+        let mut head = &self.large;
+        loop {
+            match head {
+                Some(page) => unsafe {
+                    if page.as_ref().contains(p) {
+                        break true
+                    }
+                    head = &page.as_ref().next;
+                }
+                None => break false
+            }
+        }
+    }
+
     pub fn normal_pages_count(&self) -> i32 {
         let mut head = &self.pages;
         let mut count = 0;
@@ -294,6 +328,12 @@ impl NormalPage {
         self.remaining -= layout.size() + padding_size;
         NonNull::new(slice_from_raw_parts_mut(aligned, layout.size()))
     }
+
+    pub fn contains<T>(&self, i: *const T) -> bool {
+        let p = i as *const u8;
+        let begin = addr_of!(self.chunk[0]);
+        p >= begin && p < self.free
+    }
 }
 
 impl LargePage {
@@ -316,6 +356,15 @@ impl LargePage {
         let layout = Layout::from_size_align(page_layout.size() +
                                                  page.as_ref().size, page_layout.align()).unwrap();
         dealloc(page.as_ptr() as *mut u8, layout);
+    }
+
+    pub fn contains<T>(&self, i: *const T) -> bool {
+        unsafe {
+            let begin = (addr_of!(*self) as *const u8).add(size_of::<Self>());
+            let end = begin.add(self.size);
+            let p = i as *const u8;
+            p >= begin && p < end
+        }
     }
 }
 
@@ -369,6 +418,14 @@ impl <T> From<&T> for ArenaBox<T> {
     fn from(value: &T) -> Self {
         Self {
             naked: NonNull::new(value as *const T as *mut T).unwrap()
+        }
+    }
+}
+
+impl <T: ?Sized> From<NonNull<T>> for ArenaBox<T> {
+    fn from(value: NonNull<T>) -> Self {
+        Self {
+            naked: value
         }
     }
 }

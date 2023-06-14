@@ -4,9 +4,9 @@ use mai2::{Arena, Result};
 
 #[test]
 fn sql_create_table_and_insert() -> Result<()> {
-    let _junk = JunkFilesCleaner::new("tests/dbi-001");
+    let junk = JunkFilesCleaner::new("tests/dbi-001");
     let arena = Arena::new_val();
-    let db = DB::open("tests".to_string(), "dbi-001".to_string())?;
+    let db = DB::open(junk.ensure().path, junk.ensure().name)?;
     let conn = db.connect();
 
     let sql = " create table t1 {\n\
@@ -25,9 +25,9 @@ fn sql_create_table_and_insert() -> Result<()> {
 fn sql_range_scanning() -> Result<()> {
     const N: i32 = 1000;
 
-    let _junk = JunkFilesCleaner::new("tests/dbi-002");
+    let junk = JunkFilesCleaner::new("tests/dbi-002");
     let zone = Arena::new_val();
-    let db = DB::open("tests".to_string(), "dbi-002".to_string())?;
+    let db = DB::open(junk.ensure().path, junk.ensure().name)?;
     let conn = db.connect();
 
     let sql = " create table t1 {\n\
@@ -70,9 +70,9 @@ fn sql_range_scanning() -> Result<()> {
 
 #[test]
 fn sql_select_col_expression() -> Result<()> {
-    let _junk = JunkFilesCleaner::new("tests/dbi-003");
+    let junk = JunkFilesCleaner::new("tests/dbi-003");
     let zone = Arena::new_val();
-    let db = DB::open("tests".to_string(), "dbi-003".to_string())?;
+    let db = DB::open(junk.ensure().path, junk.ensure().name)?;
     let conn = db.connect();
 
     let sql = " create table t1 {\n\
@@ -103,9 +103,9 @@ fn sql_select_col_expression() -> Result<()> {
 fn sql_select_agg_count() -> Result<()> {
     const N: i32 = 1000;
 
-    let _junk = JunkFilesCleaner::new("tests/dbi-004");
+    let junk = JunkFilesCleaner::new("tests/dbi-004");
     let zone = Arena::new_val();
-    let db = DB::open("tests".to_string(), "dbi-004".to_string())?;
+    let db = DB::open(junk.ensure().path, junk.ensure().name)?;
     let conn = db.connect();
 
     let sql = " create table t1 {\n\
@@ -134,9 +134,9 @@ fn sql_select_agg_count() -> Result<()> {
 
 #[test]
 fn sql_select_agg_count_with_group_by() -> Result<()> {
-    let _junk = JunkFilesCleaner::new("tests/dbi-005");
+    let junk = JunkFilesCleaner::new("tests/dbi-005");
     let zone = Arena::new_val();
-    let db = DB::open("tests".to_string(), "dbi-005".to_string())?;
+    let db = DB::open(junk.ensure().path, junk.ensure().name)?;
     let conn = db.connect();
 
     let sql = " create table t1 {\n\

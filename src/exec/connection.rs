@@ -6,7 +6,7 @@ use serde_yaml::Value;
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaVec};
 use crate::exec::db::{ColumnType, DB};
 use crate::exec::executor::{ColumnSet, Executor, PreparedStatement, Tuple};
-use crate::exec::physical_plan::{Feedback, PhysicalPlanOps};
+use crate::exec::physical_plan::{EmptyOps, Feedback, PhysicalPlanOps};
 use crate::{Result, Status};
 use crate::storage::{config, MemorySequentialFile};
 
@@ -54,6 +54,16 @@ impl Connection {
     pub fn execute_query(&self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<ResultSet> {
         self.executor.borrow_mut().execute_query(reader, arena)
     }
+
+    /// Execute prepared statement and returning `ResultSet`.
+    /// # params:
+    /// `prepared`: prepared statement by executed.
+    /// `arena`: Plans and `ColumnSet` allocated from this object.
+    pub fn execute_query_prepared_statement(&self,
+                                            prepared: &mut ArenaBox<PreparedStatement>,
+                                            arena: &ArenaMut<Arena>) -> Result<ResultSet> {
+        self.executor.borrow_mut().execute_query_prepared_statement(prepared, arena)
+    }
 }
 
 impl Drop for Connection {
@@ -77,6 +87,22 @@ pub struct ResultSet {
 }
 
 impl ResultSet {
+    pub fn from_affected_rows(affected_rows: u64) -> Self {
+        let zone = Arena::new_ref();
+        let arena = zone.get_mut();
+        let mut root = ArenaBox::new(EmptyOps::new(&arena), arena.get_mut());
+        Self {
+            arena: zone,
+            columns: root.prepare().unwrap(),
+            current: None,
+            status: Status::Ok,
+            fetched_rows: 0,
+            affected_rows,
+            returning_id: None,
+            plan_root: root.into(),
+        }
+    }
+
     pub fn from_dcl_stmt(mut plan_root: ArenaBox<dyn PhysicalPlanOps>) -> Result<Self> {
         let columns = plan_root.prepare()?;
         Ok(Self {
@@ -90,6 +116,8 @@ impl ResultSet {
             plan_root,
         })
     }
+
+    pub fn affected_rows(&self) -> u64 { self.affected_rows }
 
     pub fn columns(&self) -> &ColumnSet { self.columns.deref() }
 

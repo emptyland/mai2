@@ -164,11 +164,16 @@ pub struct WriteOptions {
     pub sync: bool,
 }
 
-
+/// ColumnFamily is a single LSM-tree.
+/// Use DB::new_column_family to create a new column-family.
 pub trait ColumnFamily: Send + Sync {
     fn as_any(&self) -> &dyn Any;
-    //fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// Name of column-family
     fn name(&self) -> String;
+
+    /// Id of column-family, 0 is `default_column_family`, normal column-family's id is
+    /// greater than 0
     fn id(&self) -> u32;
     fn temporary(&self) -> bool;
     fn comparator(&self) -> Rc<dyn Comparator>;

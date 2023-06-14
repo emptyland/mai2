@@ -755,17 +755,20 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
         let context = self.context.as_ref().cloned().unwrap();
 
         if self.group_keys.is_empty() {
-            let mut feedback = FeedbackImpl { status: Status::Ok };
             let mut zone = Arena::new_ref();
-            let mut group_tuple = None;
+            let mut group_tuple = Option::<Tuple>::None;
 
             debug_assert!(self.aggregators.len() <= self.projected_columns.len());
             loop {
                 if zone.rss_in_bytes >= 10 * config::MB {
-                    zone = Arena::new_ref();
+                    let new_zone = Arena::new_ref();
+                    if let Some(tuple) = &group_tuple {
+                        group_tuple = Some(tuple.dup(&new_zone.get_mut()));
+                    }
+                    drop(zone);
+                    zone = new_zone;
                 }
-                let rs = self.child.next(&mut feedback, &zone);
-                match rs {
+                match self.child.next(_feedback, &zone) {
                     Some(tuple) => match self.aggregators_iterate(&tuple, &context, &zone) {
                         Err(e) => {
                             _feedback.catch_error(e);
@@ -773,15 +776,12 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
                         }
                         Ok(_) => group_tuple = Some(tuple)
                     }
-                    None => {
-                        if feedback.status.is_not_ok() {
-                            _feedback.catch_error(feedback.status.clone());
-                            return None;
-                        }
-                        break;
-                    }
+                    None => break
                 } // match
             } // loop
+            if group_tuple.is_none() {
+                return None;
+            }
             match self.aggregators_terminate(&_zone, group_tuple.as_ref().unwrap()) {
                 Err(e) => {
                     _feedback.catch_error(e);
@@ -797,12 +797,15 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
             }
 
             let mut zone = Arena::new_ref();
-            let mut group_tuple = None;
-            // dbg!(iter.key());
-            // dbg!(&self.current_key);
+            let mut group_tuple = Option::<Tuple>::None;
             while &iter.key()[..iter.key().len() - 8] == self.current_key.as_slice() {
                 if zone.rss_in_bytes >= 10 * config::MB {
-                    zone = Arena::new_ref();
+                    let new_zone = Arena::new_ref();
+                    if let Some(tuple) = &group_tuple {
+                        group_tuple = Some(tuple.dup(&new_zone.get_mut()));
+                    }
+                    drop(zone);
+                    zone = new_zone;
                 }
                 let arena = zone.get_mut();
 
@@ -843,6 +846,32 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
 
     fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
         ArenaVec::of(self.child.clone(), &self.arena)
+    }
+}
+
+pub struct EmptyOps {
+    arena: ArenaMut<Arena>
+}
+
+impl EmptyOps {
+    pub fn new(arena: &ArenaMut<Arena>) -> Self {
+        Self { arena: arena.clone() }
+    }
+}
+
+impl PhysicalPlanOps for EmptyOps {
+    fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
+        let mut columns = ColumnSet::new("<empty>", &self.arena);
+        columns.append_with_name("_", ColumnType::Int(1));
+        Ok(ArenaBox::new(columns, self.arena.get_mut()))
+    }
+
+    fn next(&mut self, _feedback: &mut dyn Feedback, _zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        None
+    }
+
+    fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
+        ArenaVec::new(&self.arena)
     }
 }
 

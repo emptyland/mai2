@@ -47,6 +47,13 @@ impl PlanMaker {
         }
     }
 
+    fn arena_of_ast(&self) -> &ArenaMut<Arena> {
+        match &self.prepared_stmt {
+            Some(stmt) => stmt.owns_arena(),
+            None => &self.arena,
+        }
+    }
+
     fn visit_from_clause(&mut self, from: &mut dyn Relation) -> Option<Arc<TableHandle>> {
         if let Some(table_ref) = from.as_any().downcast_ref::<FromClause>() {
             let tables = self.db.lock_tables();
@@ -342,7 +349,9 @@ impl Visitor for PlanMaker {
             return;
         }
         let mut projection_col_visitor =
-            ProjectionColumnsVisitor::new(self.top_schema().unwrap(), &self.arena);
+            ProjectionColumnsVisitor::new(self.top_schema().unwrap(),
+                                          self.arena_of_ast(),
+                                          &self.arena);
         match projection_col_visitor.try_rewrite(&mut this.columns) {
             Err(e) => {
                 self.rs = e;
@@ -374,7 +383,9 @@ impl Visitor for PlanMaker {
                                                     &projection_col_visitor.projection_fields);
 
             if let Some(selection) = &mut this.where_clause {
-                let mut analyzer = PhysicalSelectionAnalyzer::new(&table, &self.arena, None);
+                let mut analyzer =
+                    PhysicalSelectionAnalyzer::new(&table, &self.arena,
+                                                   self.prepared_stmt.clone());
                 match analyzer.analyze(selection.deref_mut()) {
                     Err(e) => {
                         self.rs = e;
@@ -1161,11 +1172,12 @@ struct ProjectionColumnsVisitor {
     in_agg_calling: i32,
     projection_fields: ArenaVec<(ArenaStr, ArenaStr)>,
     arena: ArenaMut<Arena>,
+    arena_of_ast: ArenaMut<Arena>,
     rs: Status,
 }
 
 impl ProjectionColumnsVisitor {
-    fn new(schema: &ArenaBox<ColumnSet>, arena: &ArenaMut<Arena>) -> Self {
+    fn new(schema: &ArenaBox<ColumnSet>, arena_of_ast: &ArenaMut<Arena>, arena: &ArenaMut<Arena>) -> Self {
         Self {
             schema: schema.clone(),
             rewriting: ArenaVec::new(arena),
@@ -1173,6 +1185,7 @@ impl ProjectionColumnsVisitor {
             in_agg_calling: 0,
             projection_fields: ArenaVec::new(arena),
             arena: arena.clone(),
+            arena_of_ast: arena_of_ast.clone(),
             rs: Status::Ok,
         }
     }
@@ -1380,8 +1393,11 @@ impl Visitor for ProjectionColumnsVisitor {
                     }
                 }
                 self.exit_aggregator_calling();
+                let this_box = ArenaBox::from(this);
+                debug_assert!(self.arena_of_ast.contains_box(&this_box));
                 let hint = FastAccessHint::new(fast_access_hint,
-                                               ArenaBox::from(this).into(), &self.arena);
+                                               this_box.into(),
+                                               &self.arena_of_ast); // NOTICE: only for ast!
                 self.want_rewrite(hint.into());
             }
             None => {
@@ -1402,6 +1418,17 @@ impl Visitor for ProjectionColumnsVisitor {
     fn visit_null_literal(&mut self, _this: &mut Literal<()>) { self.dont_rewrite(); }
 
     fn visit_placeholder(&mut self, _this: &mut Placeholder) { self.dont_rewrite(); }
+
+    fn visit_fast_access_hint(&mut self, this: &mut FastAccessHint) {
+        let mut origin = this.origin.clone();
+        debug_assert!(!origin.as_any().is::<FastAccessHint>());
+        try_visit!(self, &mut origin);
+
+        match origin.as_mut_any().downcast_ref::<FastAccessHint>() {
+            Some(hint) => this.offset = hint.offset,
+            None => self.want_rewrite(origin),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1540,7 +1567,7 @@ mod tests {
         let arena = zone.get_mut();
         let mut ast = parse_sql_as_select("select a,b,c;", &arena)?;
         let cols = ArenaBox::new(ColumnSet::new("default", &arena), arena.get_mut());
-        let mut visitor = ProjectionColumnsVisitor::new(&cols, &arena);
+        let mut visitor = ProjectionColumnsVisitor::new(&cols, &arena, &arena);
         visitor.try_rewrite(&mut ast.columns)?;
         assert!(visitor.aggregators.is_empty());
         assert_eq!(3, visitor.projection_fields.len());
@@ -1560,7 +1587,7 @@ mod tests {
         cols.append("b", "", 2, ColumnType::Char(9));
         cols.append("c", "", 3, ColumnType::TinyInt(1));
         let mut visitor =
-            ProjectionColumnsVisitor::new(&ArenaBox::new(cols, arena.get_mut()), &arena);
+            ProjectionColumnsVisitor::new(&ArenaBox::new(cols, arena.get_mut()), &arena, &arena);
         visitor.try_rewrite(&mut ast.columns)?;
 
         assert_eq!(2, visitor.aggregators.len());
@@ -1606,7 +1633,7 @@ mod tests {
         cols.append("b", "", 2, ColumnType::Char(9));
         cols.append("c", "", 3, ColumnType::TinyInt(1));
         let mut visitor =
-            ProjectionColumnsVisitor::new(&ArenaBox::new(cols, arena.get_mut()), &arena);
+            ProjectionColumnsVisitor::new(&ArenaBox::new(cols, arena.get_mut()), &arena, &arena);
 
         assert_eq!(3, ast.columns.len());
         visitor.try_rewrite(&mut ast.columns)?;

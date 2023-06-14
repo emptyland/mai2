@@ -47,11 +47,8 @@ impl Executor {
     }
 
     pub fn execute_query(&mut self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<ResultSet> {
-        self.execute(reader, arena)?;
-        if self.result_set.is_none() {
-            return Err(Status::corrupted("No result set for query!"));
-        }
-        Ok(mem::replace(&mut self.result_set, None).unwrap())
+        let affected_rows = self.execute(reader, arena)?;
+        Ok(self.returning_result_set(affected_rows))
     }
 
     pub fn execute(&mut self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<u64> {
@@ -86,6 +83,12 @@ impl Executor {
         Ok(self.affected_rows)
     }
 
+    pub fn execute_query_prepared_statement(&mut self, prepared: &mut ArenaBox<PreparedStatement>,
+                                            arena: &ArenaMut<Arena>) -> Result<ResultSet> {
+        let affected_rows = self.execute_prepared_statement(prepared, arena)?;
+        Ok(self.returning_result_set(affected_rows))
+    }
+
     pub fn prepare(&mut self, reader: &mut dyn Read, arena: &ArenaMut<Arena>)
                    -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
         // clear latest result;
@@ -103,6 +106,14 @@ impl Executor {
                 ArenaBox::new(ps, arena.clone().deref_mut())
             }))?;
         Ok(stmts)
+    }
+
+    fn returning_result_set(&mut self, affected_rows: u64) -> ResultSet {
+        if self.result_set.is_none() {
+            ResultSet::from_affected_rows(affected_rows)
+        } else {
+            mem::replace(&mut self.result_set, None).unwrap()
+        }
     }
 
     fn convert_to_type(ast: &TypeDeclaration) -> Result<ColumnType> {
@@ -236,6 +247,8 @@ pub struct PreparedStatement {
 }
 
 impl PreparedStatement {
+    pub fn owns_arena(&self) -> &ArenaMut<Arena> { &self.parameters.owns }
+
     pub fn parameters_len(&self) -> usize { self.parameters.len() }
 
     pub fn all_bound(&self) -> bool {
@@ -602,7 +615,8 @@ impl Visitor for Executor {
                 let db = self.db.upgrade().unwrap();
                 let _locking = db.lock_tables();
                 let mut planner =
-                    PlanMaker::new(&db, self.prepared_stmts.back().cloned(), &self.arena);
+                    PlanMaker::new(&db, self.prepared_stmts.back().cloned(),
+                                   &self.arena);
                 match planner.make(this) {
                     Err(e) => self.rs = Err(e),
                     Ok(root) => {
@@ -720,6 +734,19 @@ impl Tuple {
             items,
             columns_set: columns.ptr(),
         }
+    }
+
+    pub fn dup(&self, arena: &ArenaMut<Arena>) -> Self {
+        let cols = ArenaBox::from_ptr(self.columns_set);
+        let mut this = if self.row_key().is_empty() {
+            Self::with(&cols, arena)
+        } else {
+            Self::with_row_key(&cols, self.row_key(), arena)
+        };
+        for i in 0..self.as_slice().len() {
+            this.set(i, self.get(i).dup(arena))
+        }
+        this
     }
 
     pub fn with(columns: &ArenaBox<ColumnSet>, arena: &ArenaMut<Arena>) -> Self {

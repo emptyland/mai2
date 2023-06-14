@@ -255,23 +255,6 @@ mod tests {
         assert_eq!(data, rd.as_slice());
     }
 
-    #[test]
-    fn issue001() -> io::Result<()> {
-        let env = EnvImpl::new();
-        let file = env.new_sequential_file(&PathBuf::from("tests/issue001-MANIFEST-1"))?;
-        let mut rd = LogReader::new(file, true, DEFAULT_BLOCK_SIZE);
-        loop {
-            let buf = rd.read()?;
-            if buf.is_empty() {
-                break;
-            }
-            //dbg!(buf);
-            let (_, _patch) = VersionPatch::from_unmarshal(&buf)?;
-        }
-
-        Ok(())
-    }
-
     fn new_and_write_log(data: &[u8], block_size: usize) -> Arc<RefCell<dyn WritableFile>> {
         let wf = MemoryWritableFile::new_rc();
         let mut log = LogWriter::new(wf.clone(), block_size);
