@@ -406,9 +406,9 @@ impl<'a> Parser<'a> {
             if self.test(Token::All)? {
                 Ok(Some(SetOp::UnionAll))
             } else if self.test(Token::Distinct)? {
-                Ok(Some(SetOp::UnionDistinct))
+                Ok(Some(SetOp::Union))
             } else {
-                Ok(Some(SetOp::UnionDistinct))
+                Ok(Some(SetOp::Union))
             }
         } else {
             Ok(None)

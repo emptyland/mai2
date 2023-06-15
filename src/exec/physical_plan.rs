@@ -6,12 +6,12 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaStr, ArenaVec};
 use crate::exec::executor::{ColumnSet, PreparedStatement, Tuple, UpstreamContext};
-use crate::{corrupted_err, Result, Status, Corrupting, storage};
+use crate::{corrupted_err, Result, Status, Corrupting, storage, arena_vec};
 use crate::exec::connection::FeedbackImpl;
 use crate::exec::db::{ColumnType, DB};
-use crate::exec::evaluator::Evaluator;
+use crate::exec::evaluator::{Evaluator, Value};
 use crate::exec::function::{Aggregator, Writable};
-use crate::sql::ast::Expression;
+use crate::sql::ast::{Expression, JoinOp};
 use crate::storage::{ColumnFamily, ColumnFamilyOptions, config, IteratorArc, ReadOptions, WriteOptions};
 
 pub trait PhysicalPlanOps {
@@ -268,6 +268,8 @@ impl PhysicalPlanOps for MergingOps {
         for child in self.children.iter_mut() {
             columns = Some(child.prepare()?)
         }
+        self.current = 0;
+        self.pulled_rows = 0;
         Ok(columns.unwrap())
     }
 
@@ -299,6 +301,103 @@ impl PhysicalPlanOps for MergingOps {
 
     fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
         self.children.clone()
+    }
+}
+
+pub struct DistinctOps {
+    child: ArenaBox<dyn PhysicalPlanOps>,
+    arena: ArenaMut<Arena>,
+    projected_columns: ArenaBox<ColumnSet>,
+    rd_opts: ReadOptions,
+    wr_opts: WriteOptions,
+
+    storage: Option<Arc<dyn storage::DB>>,
+    cf: Option<Arc<dyn ColumnFamily>>,
+}
+
+impl DistinctOps {
+    pub fn new(projected_columns: ArenaBox<ColumnSet>,
+               child: ArenaBox<dyn PhysicalPlanOps>,
+               arena: ArenaMut<Arena>,
+               storage: Arc<dyn storage::DB>) -> Self {
+        Self {
+            child,
+            arena,
+            projected_columns,
+            rd_opts: Default::default(),
+            wr_opts: Default::default(),
+            storage: Some(storage),
+            cf: None,
+        }
+    }
+
+    fn drop_column_family_if_needed(&mut self) {
+        match self.cf.as_ref() {
+            Some(cf) =>
+                self.storage.as_ref().unwrap().drop_column_family(cf.clone()).unwrap(),
+            None => ()
+        }
+    }
+}
+
+impl PhysicalPlanOps for DistinctOps {
+    fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
+        self.child.prepare()?;
+        self.drop_column_family_if_needed();
+        let opts = ColumnFamilyOptions::with()
+            .temporary(true)
+            .build();
+        let cf = self.storage.as_ref().unwrap()
+            .new_column_family("distinct", opts)?;
+
+        self.cf = Some(cf);
+        Ok(self.projected_columns.clone())
+    }
+
+    fn finalize(&mut self) {
+        self.drop_column_family_if_needed();
+        self.storage = None;
+        self.cf = None;
+        self.child.finalize();
+    }
+
+    fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        let arena = zone.get_mut();
+        let storage = self.storage.as_ref().unwrap();
+        let cf = self.cf.as_ref().unwrap();
+        let mut key = ArenaVec::new(&arena);
+        loop {
+            let rs = self.child.next(feedback, zone);
+            if rs.is_none() {
+                break None;
+            }
+            let tuple = rs.unwrap();
+            key.clear();
+            DB::encode_tuple(&tuple, &mut key);
+
+            let rs = storage.get_pinnable(&self.rd_opts, cf, &key);
+            if rs.is_ok() {
+                continue;
+            }
+            let status = rs.unwrap_err();
+            if status.is_not_found() {
+                match storage.insert(&self.wr_opts, cf, &key, &[]) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        feedback.catch_error(e);
+                        break None;
+                    }
+                }
+                break Some(tuple);
+            } else {
+                feedback.catch_error(status);
+                break None;
+            }
+        }
+    }
+
+    fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
+        arena_vec!(&self.arena, [self.child.clone()])
     }
 }
 
@@ -684,7 +783,7 @@ impl GroupingAggregatorOps {
         for i in self.aggregators.len()..self.projected_columns.len() {
             let dest_col = &self.projected_columns[i];
             let rs = input.columns().index_by_name(dest_col.desc.as_str(),
-                                                  dest_col.name.as_str());
+                                                   dest_col.name.as_str());
             match rs {
                 Some(col) => tuple.set(i, input.get(col).dup(&arena)),
                 None => return corrupted_err!("Column not found: {}", dest_col.name)
@@ -749,6 +848,7 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
         self.cf = None;
         self.iter = None;
         self.storage = None;
+        self.child.finalize();
     }
 
     fn next(&mut self, _feedback: &mut dyn Feedback, _zone: &ArenaRef<Arena>) -> Option<Tuple> {
@@ -849,8 +949,121 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
     }
 }
 
+pub struct SimpleNestedLoopJoinOps {
+    driver: ArenaBox<dyn PhysicalPlanOps>,
+    matcher: ArenaBox<dyn PhysicalPlanOps>,
+    matching: ArenaBox<dyn Expression>,
+    projected_columns: ArenaBox<ColumnSet>,
+    arena: ArenaMut<Arena>,
+    join_op: JoinOp,
+
+    context: Option<Arc<UpstreamContext>>,
+}
+
+impl SimpleNestedLoopJoinOps {
+    fn match_left_outer(&mut self, drive: Tuple, inner: bool, owns: &ArenaMut<Arena>) -> Result<Tuple> {
+        let mut zone = Arena::new_ref();
+        let mut feedback = FeedbackImpl { status: Status::Ok };
+        let env = self.context.as_ref().unwrap();
+
+        self.matcher.prepare()?;
+        loop {
+            if zone.rss_in_bytes >= 10 * config::MB {
+                let z = Arena::new_ref();
+                drop(zone);
+                zone = z;
+            }
+            let arena = zone.get_mut();
+
+            let rs = self.matcher.next(&mut feedback, &zone);
+            if feedback.status.is_not_ok() {
+                break Err(feedback.status)
+            }
+
+            let mut tuple = Tuple::new(&self.projected_columns, arena.get_mut());
+            for i in 0..drive.len() {
+                tuple.set(i, drive.get(i).clone());
+            }
+            if rs.is_none() {
+                if inner {
+                    break Err(Status::NotFound);
+                }
+                for i in drive.len()..tuple.len() {
+                    tuple.set(i, Value::Null);
+                }
+                break Ok(tuple.dup(owns));
+            }
+            let match_ = rs.unwrap();
+            debug_assert_eq!(tuple.len(), drive.len() + match_.len());
+            for i in drive.len()..tuple.len() {
+                tuple.set(i, match_.get(i - drive.len()).clone());
+            }
+
+            let mut evaluator = Evaluator::new(&arena);
+            let rv = evaluator.evaluate(self.matching.deref_mut(), env.clone())?;
+            if Evaluator::normalize_to_bool(&rv) {
+                break Ok(tuple.dup(owns))
+            }
+        }
+    }
+}
+
+impl PhysicalPlanOps for SimpleNestedLoopJoinOps {
+    fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
+        let mut env = UpstreamContext::new(None, &self.arena);
+        env.add(self.driver.prepare()?.deref());
+        env.add(self.matcher.prepare()?.deref());
+
+        self.context = Some(Arc::new(env));
+        Ok(self.projected_columns.clone())
+    }
+
+    fn finalize(&mut self) {
+        self.context = None;
+        self.driver.finalize();
+        self.matcher.finalize();
+    }
+
+    fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        let arena = zone.get_mut();
+        loop {
+            let rs = if matches!(self.join_op, JoinOp::RightOuterJoin) {
+                self.matcher.next(feedback, &zone)
+            } else {
+                self.driver.next(feedback, &zone)
+            };
+            if rs.is_none() {
+                break None;
+            }
+
+            let rs = match &self.join_op {
+                JoinOp::LeftOuterJoin =>
+                    self.match_left_outer(rs.unwrap(), false, &arena),
+                JoinOp::InnerJoin
+                | JoinOp::CrossJoin =>
+                    self.match_left_outer(rs.unwrap(), true, &arena),
+                _ => todo!()
+            };
+
+            match rs {
+                Err(e) => {
+                    if !e.is_not_found() {
+                        feedback.catch_error(e);
+                        break None;
+                    }
+                }
+                Ok(tuple) => break Some(tuple)
+            }
+        }
+    }
+
+    fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
+        arena_vec!(&self.arena, [self.driver.clone(), self.matcher.clone()])
+    }
+}
+
 pub struct EmptyOps {
-    arena: ArenaMut<Arena>
+    arena: ArenaMut<Arena>,
 }
 
 impl EmptyOps {

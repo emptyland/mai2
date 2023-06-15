@@ -180,7 +180,7 @@ insert into table t1(record, name) values
     drop(rs);
 
     let mut rs = conn.execute_query_str("select name, count(1)
-    from t1 where id > 0
+    from t1
     group by name
     having count(1) > 2
     ", &arena)?;

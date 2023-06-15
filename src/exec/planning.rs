@@ -4,14 +4,14 @@ use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::Arc;
 use crate::sql::ast::*;
-use crate::{break_visit, Corrupting, Result, Status, switch, try_visit, visit_fatal};
+use crate::{arena_vec, break_visit, corrupted, Corrupting, Result, Status, switch, try_visit, visit_fatal};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::{DB, TableHandle, TableRef};
 use crate::exec::evaluator::{Evaluator, TypingReducer, Value};
 use crate::exec::executor::{ColumnSet, PreparedStatement, TypingStubContext, UniversalContext};
 use crate::exec::function;
 use crate::exec::function::{Aggregator, ExecutionContext};
-use crate::exec::physical_plan::{AggregatorBundle, FilteringOps, GroupingAggregatorOps, MergingOps, PhysicalPlanOps, ProjectingOps, RangeScanOps};
+use crate::exec::physical_plan::{AggregatorBundle, DistinctOps, FilteringOps, GroupingAggregatorOps, MergingOps, PhysicalPlanOps, ProjectingOps, RangeScanOps};
 
 
 pub struct PlanMaker {
@@ -35,7 +35,7 @@ impl PlanMaker {
         }
     }
 
-    pub fn make(&mut self, stmt: &mut dyn Statement) -> Result<ArenaBox<dyn PhysicalPlanOps>> {
+    pub fn make(&mut self, stmt: &mut dyn Relation) -> Result<ArenaBox<dyn PhysicalPlanOps>> {
         self.schemas.clear();
         self.current.clear();
         self.rs = Status::Ok;
@@ -114,9 +114,9 @@ impl PlanMaker {
     fn make_scan_table(&self, table: &TableRef, columns: &ArenaBox<ColumnSet>,
                        limit: Option<u64>, offset: Option<u64>) -> Result<ArenaBox<dyn PhysicalPlanOps>> {
         let mut begin_key = ArenaVec::new(&self.arena);
-        DB::encode_idx_id(0, &mut begin_key);
+        DB::encode_idx_id(DB::PRIMARY_KEY_ID as u64, &mut begin_key);
         let mut end_key = ArenaVec::new(&self.arena);
-        DB::encode_idx_id(1, &mut end_key);
+        DB::encode_idx_id(DB::PRIMARY_KEY_ID as u64 + 1, &mut end_key);
 
         let ops = RangeScanOps::new(columns.clone(),
                                     begin_key, true,
@@ -340,6 +340,44 @@ impl PlanMaker {
 
 
 impl Visitor for PlanMaker {
+    fn visit_collection(&mut self, this: &mut Collection) {
+        try_visit!(self, this.lhs);
+        let (lhs_cols, lhs_plan) =
+            (self.schemas.pop().unwrap(), self.current.pop().unwrap());
+
+        try_visit!(self, this.rhs);
+        let (rhs_cols, rhs_plan) =
+            (self.schemas.pop().unwrap(), self.current.pop().unwrap());
+
+        if lhs_cols.len() != rhs_cols.len() {
+            visit_fatal!(self, "Different number of columns, left is {}, but right is {}",
+                lhs_cols.len(), rhs_cols.len());
+        }
+
+        for i in 0..lhs_cols.len() {
+            let lhs_col = &lhs_cols[i];
+            let rhs_col = &rhs_cols[i];
+            if lhs_col.ty.is_not_compatible_of(&rhs_col.ty) {
+                visit_fatal!(self, "Column not compatible in column[{i}], left is {:?}, but right is {:?}",
+                lhs_col.ty, rhs_col.ty);
+            }
+        }
+
+        let merging_plan = MergingOps::new(arena_vec!(&self.arena, [lhs_plan, rhs_plan]),
+                                           None, None);
+        let mut plan: ArenaBox<dyn PhysicalPlanOps> = ArenaBox::new(merging_plan, self.arena.get_mut()).into();
+        if matches!(this.op, SetOp::Union) {
+            let distinct_plan = DistinctOps::new(lhs_cols.clone(),
+                                                 plan.clone(),
+                                                 self.arena.clone(),
+                                                 self.db.storage.clone());
+            plan = ArenaBox::new(distinct_plan, self.arena.get_mut()).into();
+        }
+
+        self.schemas.push(lhs_cols);
+        self.current.push(plan);
+    }
+
     fn visit_select(&mut self, this: &mut Select) {
         let maybe_table = match &mut this.from_clause {
             Some(from) => self.visit_from_clause(from.deref_mut()),
@@ -379,8 +417,9 @@ impl Visitor for PlanMaker {
         }
 
         if let Some(table) = &maybe_table {
-            let low_columns = self.build_column_set(&table, &this.alias,
-                                                    &projection_col_visitor.projection_fields);
+            let low_columns =
+                self.build_column_set(&table, this.from_clause.as_ref().unwrap().alias(),
+                                      &projection_col_visitor.projection_fields);
 
             if let Some(selection) = &mut this.where_clause {
                 let mut analyzer =
@@ -401,8 +440,17 @@ impl Visitor for PlanMaker {
                     }
                 }
             } else {
-                // TODO: just scan all table
-                todo!()
+                // just scan all table
+                match self.make_scan_table(&table, &low_columns, limit, offset) {
+                    Err(e) => {
+                        self.rs = e;
+                        return;
+                    }
+                    Ok(plan) => {
+                        self.schemas.push(low_columns);
+                        self.current.push(plan);
+                    }
+                }
             }
         }
 
@@ -478,6 +526,10 @@ impl Visitor for PlanMaker {
                 return;
             }
             Ok(_) => ()
+        }
+
+        if this.distinct {
+            todo!()
         }
     }
 }

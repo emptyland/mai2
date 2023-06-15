@@ -1,6 +1,8 @@
 use std::cell::RefCell;
+use std::fs::File;
 use std::io::Read;
 use std::ops::Deref;
+use std::path::Path;
 use std::sync::Weak;
 use serde_yaml::Value;
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaVec};
@@ -8,7 +10,7 @@ use crate::exec::db::{ColumnType, DB};
 use crate::exec::executor::{ColumnSet, Executor, PreparedStatement, Tuple};
 use crate::exec::physical_plan::{EmptyOps, Feedback, PhysicalPlanOps};
 use crate::{Result, Status};
-use crate::storage::{config, MemorySequentialFile};
+use crate::storage::{config, from_io_result, MemorySequentialFile};
 
 pub struct Connection {
     pub id: u64,
@@ -26,6 +28,14 @@ impl Connection {
     pub fn execute_str(&self, sql: &str, arena: &ArenaMut<Arena>) -> Result<u64> {
         let mut rd = MemorySequentialFile::new(sql.to_string().into());
         self.execute(&mut rd, arena)
+    }
+
+    pub fn execute_file(&self, path: &Path, arena: &ArenaMut<Arena>) -> Result<u64> {
+        let mut f = from_io_result(File::options()
+            .read(true)
+            .create(false)
+            .open(path))?;
+        self.execute(&mut f, arena)
     }
 
     pub fn execute(&self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<u64> {
@@ -118,6 +128,8 @@ impl ResultSet {
     }
 
     pub fn affected_rows(&self) -> u64 { self.affected_rows }
+
+    pub fn fetched_rows(&self) -> u64 { self.fetched_rows }
 
     pub fn columns(&self) -> &ColumnSet { self.columns.deref() }
 

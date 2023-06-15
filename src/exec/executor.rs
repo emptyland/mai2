@@ -15,7 +15,7 @@ use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMet
 use crate::exec::{from_sql_result, function};
 use crate::sql::ast::*;
 use crate::sql::parser::Parser;
-use crate::{Corrupting, Result, Status};
+use crate::{corrupted, Corrupting, Result, Status, visit_fatal};
 use crate::exec::connection::ResultSet;
 use crate::exec::evaluator::{Context, Evaluator, expr_typing_reduce, Value};
 use crate::exec::function::{ExecutionContext, UDF};
@@ -30,7 +30,7 @@ pub struct Executor {
     prepared_stmts: ArenaVec<ArenaBox<PreparedStatement>>,
     affected_rows: u64,
     result_set: Option<ResultSet>,
-    rs: Result<()>,
+    rs: Status,
 }
 
 impl Executor {
@@ -42,7 +42,7 @@ impl Executor {
             prepared_stmts: ArenaVec::new(&zone.get_mut()),
             affected_rows: 0,
             result_set: None,
-            rs: Ok(()),
+            rs: Status::Ok,
         }
     }
 
@@ -53,7 +53,7 @@ impl Executor {
 
     pub fn execute(&mut self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<u64> {
         // clear latest result;
-        self.rs = Ok(());
+        self.rs = Status::Ok;
         self.arena = arena.clone();
 
         let factory = Factory::new(arena);
@@ -62,7 +62,9 @@ impl Executor {
         for i in 0..stmts.len() {
             let stmt = &mut stmts[i];
             stmt.accept(self);
-            self.rs.clone()?;
+            if self.rs.is_not_ok() {
+                return Err(self.rs.clone());
+            }
         }
         Ok(self.affected_rows)
     }
@@ -73,14 +75,17 @@ impl Executor {
             return Err(Status::corrupted("Not all value bound in PreparedStatement."));
         }
         // clear latest result;
-        self.rs = Ok(());
+        self.rs = Status::Ok;
         self.arena = arena.clone();
         self.prepared_stmts = ArenaVec::new(arena);
         self.prepared_stmts.push(prepared.clone());
         prepared.statement.accept(self);
         self.prepared_stmts.pop();
-        self.rs.clone()?;
-        Ok(self.affected_rows)
+        if self.rs.is_not_ok() {
+            Err(self.rs.clone())
+        } else {
+            Ok(self.affected_rows)
+        }
     }
 
     pub fn execute_query_prepared_statement(&mut self, prepared: &mut ArenaBox<PreparedStatement>,
@@ -92,7 +97,7 @@ impl Executor {
     pub fn prepare(&mut self, reader: &mut dyn Read, arena: &ArenaMut<Arena>)
                    -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
         // clear latest result;
-        self.rs = Ok(());
+        self.rs = Status::Ok;
         self.arena = arena.clone();
 
         let factory = Factory::new(arena);
@@ -239,6 +244,23 @@ impl Executor {
                                       self.prepared_stmts.back().cloned());
         ResultSet::from_dcl_stmt(ArenaBox::new(plan, self.arena.deref_mut()).into())
     }
+
+    fn process_dql(&mut self, this: &mut dyn Relation) {
+        let db = self.db.upgrade().unwrap();
+        let _locking = db.lock_tables();
+        let mut planner =
+            PlanMaker::new(&db, self.prepared_stmts.back().cloned(),
+                           &self.arena);
+        match planner.make(this) {
+            Err(e) => self.rs = e,
+            Ok(root) => {
+                match ResultSet::from_dcl_stmt(root) {
+                    Err(e) => self.rs = e,
+                    Ok(rs) => self.result_set = Some(rs)
+                }
+            }
+        }
+    }
 }
 
 pub struct PreparedStatement {
@@ -279,15 +301,15 @@ impl PreparedStatement {
     pub fn bind_null(&mut self, i: usize) { self.bind(i, Value::Null); }
 }
 
-macro_rules! visit_error {
-    ($self:ident, $($arg:tt)+) => {
-        {
-            let message = format!($($arg)+);
-            $self.rs = Err(Status::corrupted(message));
-            return;
-        }
-    }
-}
+// macro_rules! visit_error {
+//     ($self:ident, $($arg:tt)+) => {
+//         {
+//             let message = format!($($arg)+);
+//             $self.rs = Err(Status::corrupted(message));
+//             return;
+//         }
+//     }
+// }
 
 impl Visitor for Executor {
     fn visit_create_table(&mut self, this: &mut CreateTable) {
@@ -295,15 +317,14 @@ impl Visitor for Executor {
         let mut locking_tables = db.lock_tables_mut();
         if locking_tables.contains_key(&this.table_name.to_string()) {
             if !this.if_not_exists {
-                self.rs = Err(Status::corrupted(format!("Duplicated type name: {}",
-                                                        this.table_name.as_str())));
+                self.rs = corrupted!("Duplicated type name: {}", this.table_name);
             }
             return;
         }
 
         let rs = db.next_table_id();
         if rs.is_err() {
-            self.rs = Err(rs.err().unwrap());
+            self.rs = rs.err().unwrap();
             return;
         }
         let mut table = TableMetadata {
@@ -324,7 +345,7 @@ impl Visitor for Executor {
             let col_decl = &this.columns[i];
             let ty = Self::convert_to_type(&col_decl.type_decl);
             if ty.is_err() {
-                self.rs = Err(ty.err().unwrap());
+                self.rs = ty.err().unwrap();
                 return;
             }
             let col = ColumnMetadata {
@@ -355,20 +376,20 @@ impl Visitor for Executor {
                         .cloned()
                         .find(|x| { *x == *col_id });
                     if exists.is_some() {
-                        visit_error!(self, "Primary key: `{}` not found in declaration", key.as_str());
+                        visit_fatal!(self, "Primary key: `{}` not found in declaration", key.as_str());
                     }
                     table.primary_keys.push(*col_id);
                     key_part_set.insert(key.as_str());
                 }
                 None =>
-                    visit_error!(self, "Primary key: `{}` not found in declaration", key.as_str())
+                    visit_fatal!(self, "Primary key: `{}` not found in declaration", key.as_str())
             }
         }
 
         let mut idx_name_to_id = HashMap::new();
         for index_decl in &this.secondary_indices {
             if idx_name_to_id.contains_key(&index_decl.name.to_string()) {
-                visit_error!(self, "Duplicated index name: {}", index_decl.name.as_str());
+                visit_fatal!(self, "Duplicated index name: {}", index_decl.name.as_str());
             }
 
             let mut index = SecondaryIndexMetadata {
@@ -380,18 +401,18 @@ impl Visitor for Executor {
             };
             for key_part in &index_decl.key_parts {
                 if key_part_set.contains(key_part.as_str()) {
-                    visit_error!(self, "In index {}, duplicated column name: {}", index.name, key_part.as_str());
+                    visit_fatal!(self, "In index {}, duplicated column name: {}", index.name, key_part.as_str());
                 }
                 key_part_set.insert(key_part.as_str());
                 if !col_name_to_id.contains_key(&key_part.to_string()) {
-                    visit_error!(self, "In index {}, column name: {} not found", index.name, key_part.as_str());
+                    visit_fatal!(self, "In index {}, column name: {} not found", index.name, key_part.as_str());
                 }
                 index.key_parts.push(*col_name_to_id.get(&key_part.to_string()).unwrap());
             }
 
             let rs = db.next_index_id();
             if rs.is_err() {
-                self.rs = Err(rs.err().unwrap());
+                self.rs = rs.err().unwrap();
                 return;
             }
             index.id = rs.unwrap();
@@ -399,7 +420,7 @@ impl Visitor for Executor {
             table.secondary_indices.push(index);
         }
         match db.create_table(table, &mut locking_tables) {
-            Err(e) => self.rs = Err(e),
+            Err(e) => self.rs = e,
             Ok(_) => self.affected_rows = 0,
         }
     }
@@ -409,13 +430,12 @@ impl Visitor for Executor {
         let mut locking_tables = db.lock_tables_mut();
         if !locking_tables.contains_key(&this.table_name.to_string()) {
             if !this.if_exists {
-                self.rs = Err(Status::corrupted(format!("Table `{}` not found",
-                                                        this.table_name.as_str())));
+                self.rs = corrupted!("Table `{}` not found", this.table_name);
             }
             return;
         }
         match db.drop_table(&this.table_name.to_string(), &mut locking_tables) {
-            Err(e) => self.rs = Err(e),
+            Err(e) => self.rs = e,
             Ok(_) => self.affected_rows = 0,
         }
     }
@@ -425,24 +445,24 @@ impl Visitor for Executor {
         let mut locking_tables = db.lock_tables_mut();
         let may_table = locking_tables.get(&this.table_name.to_string()).cloned();
         if may_table.is_none() {
-            visit_error!(self, "Table {} not found", this.table_name);
+            visit_fatal!(self, "Table {} not found", this.table_name);
         }
         let table = may_table.unwrap();
         let ddl_mutex = table.mutex.clone();
         let _locking_ddl = ddl_mutex.lock().unwrap();
 
         if table.get_2rd_idx_by_name(&this.name.to_string()).is_some() {
-            visit_error!(self, "Duplicated index name: {} in table {}", this.name, this.table_name);
+            visit_fatal!(self, "Duplicated index name: {} in table {}", this.name, this.table_name);
         }
 
         for name_str in &this.key_parts {
             let name = name_str.to_string();
             if table.is_col_be_part_of_primary_key_by_name(&name) {
-                visit_error!(self, "Key part: {} has been part of primary key.", name_str);
+                visit_fatal!(self, "Key part: {} has been part of primary key.", name_str);
             }
 
             if let Some(idx) = table.get_col_be_part_of_2rd_idx_by_name(&name) {
-                visit_error!(self, "Key part: {} has been part of secondary index: {}.", name_str,
+                visit_fatal!(self, "Key part: {} has been part of secondary index: {}.", name_str,
                     idx.name);
             }
         }
@@ -473,7 +493,7 @@ impl Visitor for Executor {
                                           idx_id, this.unique, false).unwrap();
 
                 locking_tables.insert(table.metadata.name.clone(), table); // fall back
-                self.rs = Err(e)
+                self.rs = e;
             }
             Ok(affected_rows) => {
                 db.write_table_metadata(&shadow_table.metadata).unwrap();
@@ -488,7 +508,7 @@ impl Visitor for Executor {
         let mut locking_tables = db.lock_tables_mut();
         let may_table = locking_tables.get(&this.table_name.to_string()).cloned();
         if may_table.is_none() {
-            visit_error!(self, "Table {} not found", this.table_name);
+            visit_fatal!(self, "Table {} not found", this.table_name);
         }
         let table = may_table.unwrap();
         let ddl_mutex = table.mutex.clone();
@@ -496,7 +516,7 @@ impl Visitor for Executor {
 
         let idx = table.get_2rd_idx_by_name(&this.name.to_string());
         if idx.is_none() {
-            visit_error!(self, "Index {} not found in table: {}", this.name, this.table_name);
+            visit_fatal!(self, "Index {} not found in table: {}", this.name, this.table_name);
         }
         let secondary_index = idx.unwrap();
         let secondary_index_id = secondary_index.id;
@@ -533,7 +553,7 @@ impl Visitor for Executor {
         let db = self.db.upgrade().unwrap();
         let tables = db.lock_tables();
         if !tables.contains_key(&this.table_name.to_string()) {
-            visit_error!(self, "Table `{}` not found", this.table_name);
+            visit_fatal!(self, "Table `{}` not found", this.table_name);
         }
         let table = tables.get(&this.table_name.to_string()).unwrap().clone();
         drop(tables);
@@ -547,7 +567,7 @@ impl Visitor for Executor {
         for col_name in &this.columns_name {
             match table.get_col_by_name(&col_name.to_string()) {
                 Some(col) => insertion_cols.push(col.id),
-                None => visit_error!(self, "Column: `{}` not found in table: `{}`",
+                None => visit_fatal!(self, "Column: `{}` not found in table: `{}`",
                     col_name.as_str(), this.table_name)
             }
         }
@@ -560,7 +580,7 @@ impl Visitor for Executor {
 
         for row in &this.values {
             if row.len() < insertion_cols.len() {
-                visit_error!(self, "Not enough number of row values for insertion, need: {}",
+                visit_fatal!(self, "Not enough number of row values for insertion, need: {}",
                     insertion_cols.len());
             }
         }
@@ -588,7 +608,7 @@ impl Visitor for Executor {
                                              &mut anonymous_row_key_counter,
                                              &mut auto_increment_counter, &name_to_order);
         if let Err(e) = rs {
-            self.rs = Err(e);
+            self.rs = e;
             return;
         }
         let (tuples, secondary_indices) = rs.unwrap();
@@ -599,7 +619,7 @@ impl Visitor for Executor {
                              anonymous_row_key_value, auto_increment_value,
                              !use_anonymous_row_key) {
             Ok(affected_rows) => self.affected_rows = affected_rows,
-            Err(e) => self.rs = Err(e)
+            Err(e) => self.rs = e
         }
     }
 
@@ -607,27 +627,16 @@ impl Visitor for Executor {
         match &this.from_clause {
             None => { // fast path
                 match self.build_standalone_projecting(this) {
-                    Err(e) => self.rs = Err(e),
+                    Err(e) => self.rs = e,
                     Ok(rs) => self.result_set = Some(rs),
                 }
             }
-            Some(_) => {
-                let db = self.db.upgrade().unwrap();
-                let _locking = db.lock_tables();
-                let mut planner =
-                    PlanMaker::new(&db, self.prepared_stmts.back().cloned(),
-                                   &self.arena);
-                match planner.make(this) {
-                    Err(e) => self.rs = Err(e),
-                    Ok(root) => {
-                        match ResultSet::from_dcl_stmt(root) {
-                            Err(e) => self.rs = Err(e),
-                            Ok(rs) => self.result_set = Some(rs)
-                        }
-                    }
-                }
-            }
+            Some(_) => self.process_dql(this)
         }
+    }
+
+    fn visit_collection(&mut self, this: &mut Collection) {
+        self.process_dql(this);
     }
 }
 
@@ -918,7 +927,10 @@ impl UpstreamContext {
             let col = &column_set.columns[i];
             let name = self.dup_str(col.name.as_str());
             self.symbols.insert(name, i);
-            if !column_set.schema.is_empty() {
+            if !col.desc.is_empty() {
+                let prefix = self.dup_str(col.desc.as_str());
+                self.fully_qualified_symbols.insert((prefix, name), i);
+            } else if !column_set.schema.is_empty() {
                 self.fully_qualified_symbols.insert((schema, name), i);
             }
         }

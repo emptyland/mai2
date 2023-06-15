@@ -1,7 +1,9 @@
 use std::{io, iter};
 use std::any::Any;
+use std::fmt::{Debug, Formatter};
 use std::io::Write;
 use std::mem::size_of;
+use std::ops::Deref;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -354,6 +356,20 @@ impl PinnableValue {
 
     pub fn to_utf8_string(&self) -> String {
         String::from_utf8_lossy(self.value()).to_string()
+    }
+}
+
+impl Debug for PinnableValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.value())
+    }
+}
+
+impl Deref for PinnableValue {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.value()
     }
 }
 

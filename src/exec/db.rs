@@ -11,7 +11,7 @@ use rusty_pool::ThreadPool;
 use serde_yaml::to_string;
 
 use crate::exec::connection::Connection;
-use crate::{ArenaVec, Corrupting, log_debug, Status, storage};
+use crate::{ArenaVec, Corrupting, log_debug, Status, storage, visit_fatal};
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, Logger};
 use crate::exec::db::ColumnType::Varchar;
 use crate::exec::evaluator::Value;
@@ -1240,6 +1240,22 @@ impl ColumnType {
             _ => false
         }
     }
+
+    pub fn is_not_compatible_of(&self, other: &Self) -> bool {
+        !self.is_compatible_of(other)
+    }
+
+    pub fn is_compatible_of(&self, other: &Self) -> bool {
+        if self.is_integral() {
+            other.is_integral()
+        } else if self.is_floating() {
+            other.is_floating()
+        } else if self.is_string() {
+            other.is_string()
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1834,6 +1850,26 @@ mod tests {
         assert!(rs.next());
         assert_eq!("(2)", rs.current()?.to_string());
         assert!(!rs.next());
+        Ok(())
+    }
+
+    #[test]
+    fn execute_from_file() -> Result<()> {
+        let junk = JunkFilesCleaner::new("tests/db117");
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let db = DB::open(junk.ensure().path, junk.ensure().name)?;
+        let conn = db.connect();
+
+        assert_eq!(9, conn.execute_file(Path::new("testdata/t1_with_pk_and_data.sql"), &arena)?);
+        assert_eq!(9, conn.execute_file(Path::new("testdata/t2_with_pk_and_data.sql"), &arena)?);
+
+        let mut rs = conn.execute_query_str("select * from t1 union all select * from t2;", &arena)?;
+        while rs.next() {
+            let row = rs.current()?;
+            assert_eq!("xxx", row.get_str(2).unwrap());
+        }
+        assert_eq!(18, rs.fetched_rows());
         Ok(())
     }
 }

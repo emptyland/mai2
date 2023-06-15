@@ -65,8 +65,10 @@ ast_nodes_impl![
 #[macro_export]
 macro_rules! visit_fatal {
     ($self:ident, $($arg:tt)*) => {
-        $self.rs = Status::corrupted(format!($($arg)*));
-        return;
+        {
+            $self.rs = Status::corrupted(format!($($arg)*));
+            return;
+        }
     }
 }
 
@@ -292,7 +294,7 @@ pub trait Relation: Statement {
 // DCL
 #[derive(Debug)]
 pub enum SetOp {
-    UnionDistinct,
+    Union,
     UnionAll,
 }
 
