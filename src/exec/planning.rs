@@ -4,14 +4,14 @@ use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::Arc;
 use crate::sql::ast::*;
-use crate::{arena_vec, break_visit, corrupted, Corrupting, Result, Status, switch, try_visit, visit_fatal};
+use crate::{arena_vec, break_visit, corrupted, corrupted_err, Corrupting, Result, Status, switch, try_visit, visit_fatal};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::{DB, TableHandle, TableRef};
 use crate::exec::evaluator::{Evaluator, TypingReducer, Value};
 use crate::exec::executor::{ColumnSet, PreparedStatement, TypingStubContext, UniversalContext};
 use crate::exec::function;
 use crate::exec::function::{Aggregator, ExecutionContext};
-use crate::exec::physical_plan::{AggregatorBundle, DistinctOps, FilteringOps, GroupingAggregatorOps, MergingOps, PhysicalPlanOps, ProjectingOps, RangeScanOps};
+use crate::exec::physical_plan::{AggregatorBundle, DistinctOps, FilteringOps, GroupingAggregatorOps, MergingOps, PhysicalPlanOps, ProjectingOps, RangeScanOps, SimpleNestedLoopJoinOps};
 
 
 pub struct PlanMaker {
@@ -56,40 +56,49 @@ impl PlanMaker {
 
     fn visit_from_clause(&mut self, from: &mut dyn Relation) -> Option<Arc<TableHandle>> {
         if let Some(table_ref) = from.as_any().downcast_ref::<FromClause>() {
-            let tables = self.db.lock_tables();
-            let rs = tables.get(table_ref.name.as_str());
-            if rs.is_none() {
-                self.rs = Status::corrupted(format!("Table: {} not found", table_ref.name));
-                return None;
+            match self.resolve_physical_table(table_ref.name.as_str(), table_ref.alias.as_str()) {
+                Err(e) => {
+                    self.rs = e;
+                    None
+                }
+                Ok((table, cols)) => {
+                    self.schemas.push(cols);
+                    Some(table)
+                }
             }
-            let table = rs.unwrap().clone();
-            let schema = if table_ref.alias.is_empty() {
-                table_ref.name.as_str()
-            } else {
-                table_ref.alias.as_str()
-            };
-            let mut columns = ColumnSet::new(schema, &self.arena);
-            for col in &table.metadata.columns {
-                columns.append_with_name(col.name.as_str(), col.ty.clone());
-            }
-            self.schemas.push(ArenaBox::new(columns, self.arena.deref_mut()));
-            Some(table)
         } else {
             from.accept(self);
             None
         }
     }
 
+    fn resolve_physical_table(&self, name: &str, alias: &str) -> Result<(TableRef, ArenaBox<ColumnSet>)> {
+        let tables = self.db.lock_tables();
+        let rs = tables.get(name);
+        if rs.is_none() {
+            return corrupted_err!("Table: {} not found", name);
+        }
+        let table = rs.unwrap().clone();
+        let schema = if alias.is_empty() {
+            name
+        } else {
+            alias
+        };
+        let mut columns = ColumnSet::new(schema, &self.arena);
+        for col in &table.metadata.columns {
+            //columns.append_with_name(col.name.as_str(), col.ty.clone());
+            columns.append(col.name.as_str(), "", col.id, col.ty.clone());
+        }
+        Ok((table, ArenaBox::new(columns, self.arena.get_mut())))
+    }
+
     fn top_schema(&self) -> Option<&ArenaBox<ColumnSet>> {
         self.schemas.back()
     }
 
-    fn make_by_physical_selection_analyzed_val(&mut self,
-                                               analyzed: AnalyzedVal,
-                                               table: &TableRef,
-                                               columns: &ArenaBox<ColumnSet>,
-                                               limit: Option<u64>,
-                                               offset: Option<u64>) -> Result<()> {
+    fn make_by_physical_selection_analyzed_val(&mut self, analyzed: AnalyzedVal, table: &TableRef,
+                                               columns: &ArenaBox<ColumnSet>, limit: Option<u64>, offset: Option<u64>)
+                                               -> Result<()> {
         let ops = match analyzed {
             AnalyzedVal::And(sets, expr) => {
                 let ops = self.make_merging_by_sets(&sets, table, columns,
@@ -111,8 +120,8 @@ impl PlanMaker {
         Ok(())
     }
 
-    fn make_scan_table(&self, table: &TableRef, columns: &ArenaBox<ColumnSet>,
-                       limit: Option<u64>, offset: Option<u64>) -> Result<ArenaBox<dyn PhysicalPlanOps>> {
+    fn make_scan_table(&self, table: &TableRef, columns: &ArenaBox<ColumnSet>, limit: Option<u64>, offset: Option<u64>)
+                       -> Result<ArenaBox<dyn PhysicalPlanOps>> {
         let mut begin_key = ArenaVec::new(&self.arena);
         DB::encode_idx_id(DB::PRIMARY_KEY_ID as u64, &mut begin_key);
         let mut end_key = ArenaVec::new(&self.arena);
@@ -164,12 +173,8 @@ impl PlanMaker {
         }
     }
 
-    fn make_physical_ops_by_set(&self,
-                                set: &SelectionSet,
-                                table: &TableRef,
-                                columns: &ArenaBox<ColumnSet>,
-                                limit: Option<u64>,
-                                offset: Option<u64>,
+    fn make_physical_ops_by_set(&self, set: &SelectionSet, table: &TableRef, columns: &ArenaBox<ColumnSet>,
+                                limit: Option<u64>, offset: Option<u64>,
                                 receiver: &mut ArenaVec<ArenaBox<dyn PhysicalPlanOps>>) -> Result<()> {
         for range in set.segments.iter() {
             let mut begin_key = ArenaVec::new(&self.arena);
@@ -208,7 +213,8 @@ impl PlanMaker {
         Ok(())
     }
 
-    fn build_column_set(&self, table: &TableRef, alias: &ArenaStr, names: &[(ArenaStr, ArenaStr)]) -> ArenaBox<ColumnSet> {
+    fn build_column_set(&self, table: &TableRef, alias: &ArenaStr, names: &[(ArenaStr, ArenaStr)])
+                        -> ArenaBox<ColumnSet> {
         let mut columns =
             ColumnSet::new(switch!(alias.is_empty(), table.metadata.name.as_str(), alias.as_str()),
                            &self.arena);
@@ -217,6 +223,17 @@ impl PlanMaker {
             columns.append(name.as_str(), alias.as_str(), col.id, col.ty.clone());
         }
         ArenaBox::new(columns, self.arena.get_mut())
+    }
+
+    fn merge_joining_columns_set(&self, driver: &ColumnSet, matcher: &ColumnSet) -> ArenaBox<ColumnSet> {
+        let mut cols = ColumnSet::new("", &self.arena);
+        for col in &driver.columns {
+            cols.append(col.name.as_str(), driver.schema.as_str(), 0, col.ty.clone());
+        }
+        for col in &matcher.columns {
+            cols.append(col.name.as_str(), matcher.schema.as_str(), 0, col.ty.clone());
+        }
+        ArenaBox::new(cols, self.arena.get_mut())
     }
 
     fn merge_aggregators_columns_set(&self, aggregators: &[AggregatorBundle],
@@ -250,6 +267,18 @@ impl PlanMaker {
             params.clear();
         }
         Ok(())
+    }
+
+    fn make_simple_nested_loop_join(&mut self, lhs_cols: &ColumnSet, lhs_plan: ArenaBox<dyn PhysicalPlanOps>,
+                                    rhs_cols: &ColumnSet, rhs_plan: ArenaBox<dyn PhysicalPlanOps>, join_op: JoinOp,
+                                    on_clause: ArenaBox<dyn Expression>) {
+        let cols = self.merge_joining_columns_set(lhs_cols.deref(), rhs_cols.deref());
+        let join_plan = SimpleNestedLoopJoinOps::new(lhs_plan, rhs_plan,
+                                                     on_clause, cols.clone(),
+                                                     self.arena.clone(), join_op);
+        let plan = ArenaBox::new(join_plan, self.arena.get_mut());
+        self.schemas.push(cols);
+        self.current.push(plan.into());
     }
 
     fn make_projecting(&mut self, columns: &[SelectColumnItem], alias: &str) -> Result<()> {
@@ -288,15 +317,19 @@ impl PlanMaker {
                 reducer.reduce(expr.deref_mut(), context.clone())?
             };
             //let ty = reducer.reduce(expr.deref_mut(), context.clone())?;
+            let mut desc = ArenaStr::default();
             let name = if !col_item.alias.is_empty() {
                 col_item.alias.to_string()
-            } else if let Some((_, suffix)) = self.analyze_require_id_literal(expr.deref()) {
+            } else if let Some((prefix, suffix)) = self.analyze_require_id_literal(expr.deref()) {
+                if prefix != cols.schema {
+                    desc = prefix;
+                }
                 suffix.to_string()
             } else {
                 i += 1;
                 format!("_{i}")
             };
-            cols.append(name.as_str(), "", 0, ty);
+            cols.append(name.as_str(), desc.as_str(), 0, ty);
             exprs.push(expr);
         }
 
@@ -338,16 +371,20 @@ impl PlanMaker {
     }
 }
 
+macro_rules! try_make_plan {
+    ($self:ident, $node:expr) => {
+        {
+            try_visit!($self, $node);
+            ($self.schemas.pop().unwrap(), $self.current.pop().unwrap())
+        }
+    };
+}
+
 
 impl Visitor for PlanMaker {
     fn visit_collection(&mut self, this: &mut Collection) {
-        try_visit!(self, this.lhs);
-        let (lhs_cols, lhs_plan) =
-            (self.schemas.pop().unwrap(), self.current.pop().unwrap());
-
-        try_visit!(self, this.rhs);
-        let (rhs_cols, rhs_plan) =
-            (self.schemas.pop().unwrap(), self.current.pop().unwrap());
+        let (lhs_cols, lhs_plan) = try_make_plan!(self, this.lhs);
+        let (rhs_cols, rhs_plan) = try_make_plan!(self, this.rhs);
 
         if lhs_cols.len() != rhs_cols.len() {
             visit_fatal!(self, "Different number of columns, left is {}, but right is {}",
@@ -365,7 +402,8 @@ impl Visitor for PlanMaker {
 
         let merging_plan = MergingOps::new(arena_vec!(&self.arena, [lhs_plan, rhs_plan]),
                                            None, None);
-        let mut plan: ArenaBox<dyn PhysicalPlanOps> = ArenaBox::new(merging_plan, self.arena.get_mut()).into();
+        let mut plan: ArenaBox<dyn PhysicalPlanOps> = ArenaBox::new(merging_plan,
+                                                                    self.arena.get_mut()).into();
         if matches!(this.op, SetOp::Union) {
             let distinct_plan = DistinctOps::new(lhs_cols.clone(),
                                                  plan.clone(),
@@ -455,11 +493,14 @@ impl Visitor for PlanMaker {
         }
 
         if maybe_table.is_none() {
-            // match &mut this.where_clause {
-            //     Some(filter) => {}
-            //     None => ()
-            // }
-            todo!()
+            if let Some(filter) = &mut this.where_clause {
+                let up_cols = self.schemas.pop().unwrap();
+                let up_plan = self.current.pop().unwrap();
+                let filtering = FilteringOps::new(filter, &up_plan, &up_cols,
+                                                  self.prepared_stmt.clone(), &self.arena);
+                self.schemas.push(up_cols);
+                self.current.push(ArenaBox::new(filtering, self.arena.get_mut()).into());
+            }
         }
 
         if let Some(having) = &mut this.having_clause {
@@ -530,6 +571,54 @@ impl Visitor for PlanMaker {
 
         if this.distinct {
             todo!()
+        }
+    }
+
+    fn visit_from_clause(&mut self, this: &mut FromClause) {
+        let rs = self.resolve_physical_table(this.name.as_str(), this.alias.as_str());
+        if let Err(e) = rs {
+            self.rs = e;
+            return;
+        }
+
+        let (table, cols) = rs.unwrap();
+        match self.make_scan_table(&table, &cols, None, None) {
+            Err(e) => {
+                self.rs = e;
+                return;
+            }
+            Ok(plan) => {
+                self.schemas.push(cols);
+                self.current.push(plan);
+            }
+        }
+    }
+
+    fn visit_join_clause(&mut self, this: &mut JoinClause) {
+        let (lhs_cols, lhs_plan) = try_make_plan!(self, this.lhs);
+        let rhs = self.visit_from_clause(this.rhs.deref_mut());
+        if self.rs.is_not_ok() {
+            return;
+        }
+
+        if let Some(matcher_table) = rhs {
+            // TODO: analyzing
+            let rhs_cols = self.schemas.pop().unwrap();
+            let rs = self.make_scan_table(&matcher_table, &rhs_cols, None, None);
+            if let Err(e) = rs {
+                self.rs = e;
+                return;
+            }
+            let rhs_plan = rs.unwrap();
+            self.make_simple_nested_loop_join(lhs_cols.deref(), lhs_plan, rhs_cols.deref(), rhs_plan,
+                                              this.op.clone(), this.on_clause.clone());
+        } else {
+            let (rhs_cols, rhs_plan) = (
+                self.schemas.pop().unwrap(),
+                self.current.pop().unwrap()
+            );
+            self.make_simple_nested_loop_join(lhs_cols.deref(), lhs_plan, rhs_cols.deref(), rhs_plan,
+                                              this.op.clone(), this.on_clause.clone());
         }
     }
 }
@@ -1257,8 +1346,12 @@ impl ProjectionColumnsVisitor {
                     let mut incremental = ArenaVec::new(&arena);
                     self.install_all_schema_fields(schema.schema.as_str(),
                                                    schema.deref(),
-                                                   |_, name| {
-                                                       let id = Identifier::new(name, &arena);
+                                                   |prefix, name| {
+                                                       let id: ArenaBox<dyn Expression> = if prefix.is_empty() {
+                                                           Identifier::new(name, &arena).into()
+                                                       } else {
+                                                           FullyQualifiedName::new(prefix, name, &arena).into()
+                                                       };
                                                        incremental.push(SelectColumnItem {
                                                            expr: SelectColumn::Expr(id.into()),
                                                            alias: ArenaStr::default(),
@@ -1317,11 +1410,13 @@ impl ProjectionColumnsVisitor {
 
     fn install_all_schema_fields<F>(&mut self, schema: &str, columns: &ColumnSet, mut callback: F)
         where F: FnMut(&str, &str) {
+
         if schema == columns.schema.as_str() {
-            for col in &columns.columns {
-                self.add_projection_field(ArenaStr::default(), col.name.clone());
-                callback("", col.name.as_str());
-            }
+            columns.columns.iter()
+                .for_each(|x| {
+                    self.add_projection_field(x.desc.clone(), x.name.clone());
+                    callback(x.desc.as_str(), x.name.as_str());
+                })
         } else {
             columns.columns.iter()
                 .filter(|x| { x.desc.as_str() == schema })

@@ -310,7 +310,7 @@ impl Relation for Collection {
     fn alias_as(&mut self, name: ArenaStr) { self.alias = name; }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum JoinOp {
     LeftOuterJoin,
     RightOuterJoin,

@@ -214,7 +214,6 @@ impl DB {
                     self.prepare_table(cf.unwrap(), table)?;
                 }
             }
-            log_debug!(self.logger, "load table:\n {}", yaml);
         }
 
         let next_id = self.load_number(&self.default_column_family,

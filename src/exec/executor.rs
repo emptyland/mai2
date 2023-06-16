@@ -317,7 +317,7 @@ impl Visitor for Executor {
         let mut locking_tables = db.lock_tables_mut();
         if locking_tables.contains_key(&this.table_name.to_string()) {
             if !this.if_not_exists {
-                self.rs = corrupted!("Duplicated type name: {}", this.table_name);
+                self.rs = corrupted!("Duplicated table name: {}", this.table_name);
             }
             return;
         }
@@ -640,6 +640,7 @@ impl Visitor for Executor {
     }
 }
 
+#[derive(Debug)]
 pub struct ColumnSet {
     pub schema: ArenaStr,
     pub columns: ArenaVec<Column>,
@@ -704,6 +705,7 @@ impl Index<usize> for ColumnSet {
     fn index(&self, index: usize) -> &Self::Output { &self.columns[index] }
 }
 
+#[derive(Debug)]
 pub struct Column {
     pub name: ArenaStr,
     pub desc: ArenaStr,

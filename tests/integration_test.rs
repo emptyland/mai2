@@ -1,6 +1,7 @@
+use std::path::Path;
 use mai2::exec::db::DB;
 use mai2::storage::JunkFilesCleaner;
-use mai2::{Arena, Result};
+use mai2::{Arena, Result, Status};
 
 #[test]
 fn sql_create_table_and_insert() -> Result<()> {
@@ -189,5 +190,47 @@ insert into table t1(record, name) values
     assert!(rs.next());
     assert_eq!("(\"John\", 3)", rs.current()?.to_string());
     assert!(!rs.next());
+    Ok(())
+}
+
+#[test]
+fn sql_select_join_small_tables() -> Result<()> {
+    let junk = JunkFilesCleaner::new("tests/dbi-006");
+    let zone = Arena::new_val();
+    let db = DB::open(junk.ensure().path, junk.ensure().name)?;
+    let conn = db.connect();
+
+    let arena = zone.get_mut();
+    conn.execute_file(Path::new("testdata/t1_t2_small_data_for_join.sql"), &arena)?;
+
+    let mut rs = conn.execute_query_str("select * from t1 a left join t2 b on (a.id = b.id);", &arena)?;
+    assert!(rs.next());
+    assert_eq!("(1, 100, 1, \"hello\")", rs.current()?.to_string());
+    assert!(rs.next());
+    assert_eq!("(2, 200, 2, \"lol\")", rs.current()?.to_string());
+    assert!(rs.next());
+    assert_eq!("(3, 300, 3, \"world\")", rs.current()?.to_string());
+    assert!(!rs.next());
+
+    let mut rs = conn.execute_query_str("select * from t1 a right join t2 b on (a.id = b.id);", &arena)?;
+    assert!(rs.next());
+    assert_eq!("(NULL, NULL, 0, \"none\")", rs.current()?.to_string());
+    assert!(rs.next());
+    assert_eq!("(1, 100, 1, \"hello\")", rs.current()?.to_string());
+    assert!(rs.next());
+    assert_eq!("(2, 200, 2, \"lol\")", rs.current()?.to_string());
+    assert!(rs.next());
+    assert_eq!("(3, 300, 3, \"world\")", rs.current()?.to_string());
+    assert!(!rs.next());
+
+    let mut rs = conn.execute_query_str("select * from t1 a inner join t2 b on (a.id = b.id);", &arena)?;
+    assert!(rs.next());
+    assert_eq!("(1, 100, 1, \"hello\")", rs.current()?.to_string());
+    assert!(rs.next());
+    assert_eq!("(2, 200, 2, \"lol\")", rs.current()?.to_string());
+    assert!(rs.next());
+    assert_eq!("(3, 300, 3, \"world\")", rs.current()?.to_string());
+    assert!(!rs.next());
+
     Ok(())
 }

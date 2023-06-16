@@ -90,6 +90,7 @@ impl <T> Drop for ArenaRef<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct ArenaMut<T> {
     shadow: NonNull<T>
 }

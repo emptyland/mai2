@@ -3,12 +3,11 @@ use std::fmt::{Display, Formatter};
 use std::ops::{Add, DerefMut, Sub, Mul};
 use std::str::FromStr;
 use std::sync::Arc;
-use crate::{Corrupting, Result, Status, try_eval, try_visit};
+use crate::{Corrupting, Result, Status, try_eval};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::ColumnType;
 use crate::exec::function::{AnyFn, ExecutionContext, new_any_fn, Signature, UDF};
 use crate::sql::ast::*;
-use crate::sql::lexer::Token::Or;
 
 pub struct Reducer<T> {
     arena: ArenaMut<Arena>,

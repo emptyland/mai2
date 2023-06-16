@@ -67,6 +67,7 @@ impl RangeScanOps {
             let col = &projected_columns.columns[i];
             col_id_to_order.insert(col.id, i);
         }
+        debug_assert_eq!(projected_columns.len(), col_id_to_order.len());
         let key_id = DB::parse_key_id(&range_begin);
         Self {
             projected_columns,
@@ -230,6 +231,10 @@ impl PhysicalPlanOps for RangeScanOps {
             }
             None
         } else {
+            #[cfg(test)]
+            for i in 0..tuple.len() {
+                debug_assert!(!tuple[i].is_undefined());
+            }
             self.pulled_rows += 1;
             Some(tuple)
         }
@@ -1105,8 +1110,7 @@ impl PhysicalPlanOps for SimpleNestedLoopJoinOps {
                     self.match_left_outer(rs.unwrap(), false, &arena),
                 JoinOp::RightOuterJoin =>
                     self.match_right_outer(rs.unwrap(), &arena),
-                JoinOp::InnerJoin
-                | JoinOp::CrossJoin =>
+                JoinOp::InnerJoin | JoinOp::CrossJoin =>
                     self.match_left_outer(rs.unwrap(), true, &arena)
             };
 
