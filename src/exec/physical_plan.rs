@@ -961,6 +961,23 @@ pub struct SimpleNestedLoopJoinOps {
 }
 
 impl SimpleNestedLoopJoinOps {
+    pub fn new(driver: ArenaBox<dyn PhysicalPlanOps>,
+               matcher: ArenaBox<dyn PhysicalPlanOps>,
+               matching: ArenaBox<dyn Expression>,
+               projected_columns: ArenaBox<ColumnSet>,
+               arena: ArenaMut<Arena>,
+               join_op: JoinOp) -> Self {
+        Self {
+            driver,
+            matcher,
+            matching,
+            projected_columns,
+            arena,
+            join_op,
+            context: None,
+        }
+    }
+
     fn match_left_outer(&mut self, drive: Tuple, inner: bool, owns: &ArenaMut<Arena>) -> Result<Tuple> {
         let mut zone = Arena::new_ref();
         let mut feedback = FeedbackImpl { status: Status::Ok };
@@ -977,12 +994,12 @@ impl SimpleNestedLoopJoinOps {
 
             let rs = self.matcher.next(&mut feedback, &zone);
             if feedback.status.is_not_ok() {
-                break Err(feedback.status)
+                break Err(feedback.status);
             }
 
             let mut tuple = Tuple::new(&self.projected_columns, arena.get_mut());
             for i in 0..drive.len() {
-                tuple.set(i, drive.get(i).clone());
+                tuple.set(i, drive[i].clone());
             }
             if rs.is_none() {
                 if inner {
@@ -996,13 +1013,59 @@ impl SimpleNestedLoopJoinOps {
             let match_ = rs.unwrap();
             debug_assert_eq!(tuple.len(), drive.len() + match_.len());
             for i in drive.len()..tuple.len() {
-                tuple.set(i, match_.get(i - drive.len()).clone());
+                tuple.set(i, match_[i - drive.len()].clone());
             }
 
             let mut evaluator = Evaluator::new(&arena);
+            env.attach(&tuple);
             let rv = evaluator.evaluate(self.matching.deref_mut(), env.clone())?;
             if Evaluator::normalize_to_bool(&rv) {
-                break Ok(tuple.dup(owns))
+                break Ok(tuple.dup(owns));
+            }
+        }
+    }
+
+    fn match_right_outer(&mut self, match_: Tuple, owns: &ArenaMut<Arena>) -> Result<Tuple> {
+        let mut zone = Arena::new_ref();
+        let mut feedback = FeedbackImpl { status: Status::Ok };
+        let env = self.context.as_ref().unwrap();
+
+        self.driver.prepare()?;
+        loop {
+            if zone.rss_in_bytes >= 10 * config::MB {
+                let z = Arena::new_ref();
+                drop(zone);
+                zone = z;
+            }
+            let arena = zone.get_mut();
+
+            let rs = self.driver.next(&mut feedback, &zone);
+            if feedback.status.is_not_ok() {
+                break Err(feedback.status);
+            }
+
+            let mut tuple = Tuple::new(&self.projected_columns, arena.get_mut());
+            for i in tuple.len() - match_.len()..tuple.len() {
+                let d = tuple.len() - match_.len();
+                tuple.set(i, match_.get(i - d).clone());
+            }
+            if rs.is_none() {
+                for i in 0..tuple.len() - match_.len() {
+                    tuple.set(i, Value::Null);
+                }
+                break Ok(tuple.dup(owns));
+            }
+            let drive = rs.unwrap();
+            debug_assert_eq!(tuple.len(), drive.len() + match_.len());
+            for i in 0..drive.len() {
+                tuple.set(i, drive[i].clone());
+            }
+
+            let mut evaluator = Evaluator::new(&arena);
+            env.attach(&tuple);
+            let rv = evaluator.evaluate(self.matching.deref_mut(), env.clone())?;
+            if Evaluator::normalize_to_bool(&rv) {
+                break Ok(tuple.dup(owns));
             }
         }
     }
@@ -1011,8 +1074,9 @@ impl SimpleNestedLoopJoinOps {
 impl PhysicalPlanOps for SimpleNestedLoopJoinOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
         let mut env = UpstreamContext::new(None, &self.arena);
-        env.add(self.driver.prepare()?.deref());
-        env.add(self.matcher.prepare()?.deref());
+        self.driver.prepare()?;
+        self.matcher.prepare()?;
+        env.add(self.projected_columns.deref());
 
         self.context = Some(Arc::new(env));
         Ok(self.projected_columns.clone())
@@ -1039,10 +1103,11 @@ impl PhysicalPlanOps for SimpleNestedLoopJoinOps {
             let rs = match &self.join_op {
                 JoinOp::LeftOuterJoin =>
                     self.match_left_outer(rs.unwrap(), false, &arena),
+                JoinOp::RightOuterJoin =>
+                    self.match_right_outer(rs.unwrap(), &arena),
                 JoinOp::InnerJoin
                 | JoinOp::CrossJoin =>
-                    self.match_left_outer(rs.unwrap(), true, &arena),
-                _ => todo!()
+                    self.match_left_outer(rs.unwrap(), true, &arena)
             };
 
             match rs {
@@ -1059,6 +1124,43 @@ impl PhysicalPlanOps for SimpleNestedLoopJoinOps {
 
     fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
         arena_vec!(&self.arena, [self.driver.clone(), self.matcher.clone()])
+    }
+}
+
+pub struct MockingProducerOps {
+    data: ArenaVec<Tuple>,
+    current: usize,
+    projected_columns: ArenaBox<ColumnSet>,
+}
+
+impl MockingProducerOps {
+    pub fn new(data: ArenaVec<Tuple>, projected_columns: ArenaBox<ColumnSet>) -> Self {
+        Self {
+            data,
+            current: 0,
+            projected_columns,
+        }
+    }
+}
+
+impl PhysicalPlanOps for MockingProducerOps {
+    fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
+        self.current = 0;
+        Ok(self.projected_columns.clone())
+    }
+
+    fn next(&mut self, _feedback: &mut dyn Feedback, _zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        if self.current >= self.data.len() {
+            None
+        } else {
+            let tuple = self.data[self.current].dup(&self.data.owns);
+            self.current += 1;
+            Some(tuple)
+        }
+    }
+
+    fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
+        arena_vec!(&self.data.owns)
     }
 }
 
@@ -1101,6 +1203,7 @@ mod tests {
     use crate::exec::connection::FeedbackImpl;
     use crate::exec::db::ColumnType;
     use crate::exec::evaluator::Value;
+    use crate::sql::parse_sql_expr_from_content;
     use crate::storage;
     use crate::storage::{JunkFilesCleaner, open_kv_storage, Options, ReadOptions, WriteOptions};
 
@@ -1148,6 +1251,105 @@ mod tests {
         }
         plan.finalize();
         assert_eq!(N, i);
+        Ok(())
+    }
+
+    #[test]
+    fn simple_nested_loop_join() -> Result<()> {
+        let zone = Arena::new_ref();
+        let arena = zone.get_mut();
+        let mut t1_cols = ColumnSet::new("t1", &arena);
+        t1_cols.append("a", "", 0, ColumnType::Int(11));
+        t1_cols.append("b", "", 2, ColumnType::Int(11));
+        t1_cols.append("c", "", 3, ColumnType::Int(11));
+        let t1 = ArenaBox::new(t1_cols, arena.get_mut());
+        let mut data = arena_vec!(&arena);
+        for i in 0..3 {
+            let mut tuple = Tuple::new(&t1, arena.get_mut());
+            tuple.set(0, Value::Int(i));
+            tuple.set(1, Value::Int((i + 1) * 10));
+            tuple.set(2, Value::Int((i + 1) * 100));
+            data.push(tuple);
+        }
+        let plan_t1 =
+            ArenaBox::new(MockingProducerOps::new(data, t1.clone()),arena.get_mut());
+
+        let mut t2_cols = ColumnSet::new("t2", &arena);
+        t2_cols.append("d", "", 0, ColumnType::Int(11));
+        t2_cols.append("e", "", 2, ColumnType::Int(11));
+        t2_cols.append("f", "", 3, ColumnType::Int(11));
+        let t2 = ArenaBox::new(t2_cols, arena.get_mut());
+        let mut data = arena_vec!(&arena);
+        for i in 0..3 {
+            let mut tuple = Tuple::new(&t2, arena.get_mut());
+            tuple.set(0, Value::Int(i + 1));
+            tuple.set(1, Value::Int((i + 1) * 10));
+            tuple.set(2, Value::Int((i + 1) * 100));
+            data.push(tuple)
+        }
+        let plan_t2 =
+            ArenaBox::new(MockingProducerOps::new(data, t2.clone()), arena.get_mut());
+
+        let mut tt_cols = ColumnSet::new("", &arena);
+        for t in &[t1, t2] {
+            for i in 0..t.len() {
+                let col = &t[i];
+                tt_cols.append(col.name.as_str(), t.schema.as_str(), 0, col.ty.clone());
+            }
+        }
+        let tt = ArenaBox::new(tt_cols, arena.get_mut());
+
+        let expr = parse_sql_expr_from_content("t1.a = t2.d", &arena)?;
+        let mut plan = SimpleNestedLoopJoinOps::new(plan_t1.into(),
+                                                    plan_t2.into(), expr,
+                                                    tt, arena.clone(),
+                                                    JoinOp::LeftOuterJoin);
+        let data = [
+            "(0, 10, 100, NULL, NULL, NULL)",
+            "(1, 20, 200, 1, 10, 100)",
+            "(2, 30, 300, 2, 20, 200)"
+        ];
+        check_plan_rows(&mut plan, &data, &zone)?;
+
+        plan.join_op = JoinOp::InnerJoin;
+        let data = [
+            "(1, 20, 200, 1, 10, 100)",
+            "(2, 30, 300, 2, 20, 200)"
+        ];
+        check_plan_rows(&mut plan, &data, &zone)?;
+
+        plan.join_op = JoinOp::CrossJoin;
+        let data = [
+            "(1, 20, 200, 1, 10, 100)",
+            "(2, 30, 300, 2, 20, 200)"
+        ];
+        check_plan_rows(&mut plan, &data, &zone)?;
+
+        plan.join_op = JoinOp::RightOuterJoin;
+        let data = [
+            "(1, 20, 200, 1, 10, 100)",
+            "(2, 30, 300, 2, 20, 200)",
+            "(NULL, NULL, NULL, 3, 30, 300)"
+        ];
+        check_plan_rows(&mut plan, &data, &zone)?;
+        Ok(())
+    }
+
+    fn check_plan_rows<P: PhysicalPlanOps + ?Sized>(plan: &mut P, rows: &[&str], zone: &ArenaRef<Arena>) -> Result<()> {
+        plan.prepare()?;
+        let mut i = 0;
+        loop {
+            let mut feedback = FeedbackImpl { status: Status::Ok };
+            let rs = plan.next(&mut feedback, &zone);
+            assert_eq!(Status::Ok, feedback.status);
+            if rs.is_none() {
+                break;
+            }
+            assert_eq!(rows[i], rs.unwrap().to_string());
+            //println!("{}", rs.unwrap());
+            i += 1;
+        }
+        plan.finalize();
         Ok(())
     }
 

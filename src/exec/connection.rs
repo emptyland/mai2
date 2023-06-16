@@ -4,13 +4,12 @@ use std::io::Read;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Weak;
-use serde_yaml::Value;
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaVec};
 use crate::exec::db::{ColumnType, DB};
 use crate::exec::executor::{ColumnSet, Executor, PreparedStatement, Tuple};
 use crate::exec::physical_plan::{EmptyOps, Feedback, PhysicalPlanOps};
-use crate::{Result, Status};
-use crate::storage::{config, from_io_result, MemorySequentialFile};
+use crate::{Result, Status, utils};
+use crate::storage::{config, from_io_result};
 
 pub struct Connection {
     pub id: u64,
@@ -26,7 +25,7 @@ impl Connection {
     }
 
     pub fn execute_str(&self, sql: &str, arena: &ArenaMut<Arena>) -> Result<u64> {
-        let mut rd = MemorySequentialFile::new(sql.to_string().into());
+        let mut rd = utils::SliceReadWrapper::from(sql);
         self.execute(&mut rd, arena)
     }
 
@@ -38,7 +37,7 @@ impl Connection {
         self.execute(&mut f, arena)
     }
 
-    pub fn execute(&self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<u64> {
+    pub fn execute<R: Read + ?Sized>(&self, reader: &mut R, arena: &ArenaMut<Arena>) -> Result<u64> {
         self.executor.borrow_mut().execute(reader, arena)
     }
 
@@ -47,17 +46,19 @@ impl Connection {
         self.executor.borrow_mut().execute_prepared_statement(prepared, &arena.get_mut())
     }
 
-    pub fn prepare_str(&self, sql: &str, arena: &ArenaMut<Arena>) -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
-        let mut rd = MemorySequentialFile::new(sql.to_string().into());
+    pub fn prepare_str(&self, sql: &str, arena: &ArenaMut<Arena>)
+        -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
+        let mut rd = utils::SliceReadWrapper::from(sql);
         self.prepare(&mut rd, arena)
     }
 
-    pub fn prepare(&self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
+    pub fn prepare<R: Read + ?Sized>(&self, reader: &mut R, arena: &ArenaMut<Arena>)
+        -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
         self.executor.borrow_mut().prepare(reader, arena)
     }
 
     pub fn execute_query_str(&self, sql: &str, arena: &ArenaMut<Arena>) -> Result<ResultSet> {
-        let mut rd = MemorySequentialFile::new(sql.to_string().into());
+        let mut rd = utils::SliceReadWrapper::from(sql);
         self.execute_query(&mut rd, arena)
     }
 

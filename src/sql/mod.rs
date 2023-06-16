@@ -1,12 +1,19 @@
 use std::io;
-use crate::Status;
+use crate::{Arena, ArenaBox, ArenaMut, Corrupting, SliceReadWrapper, Status, utils};
+use crate::sql::ast::Expression;
+use crate::sql::parser::parse_sql_expr;
 
 pub mod lexer;
 pub mod parser;
 pub mod ast;
 pub mod serialize;
 
-use lexer::Token;
+
+pub fn parse_sql_expr_from_content(sql: &str, arena: &ArenaMut<Arena>)
+    -> crate::Result<ArenaBox<dyn Expression>> {
+    let mut rd = utils::SliceReadWrapper::from(sql);
+    parse_sql_expr(&mut rd, arena)
+}
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -41,6 +48,14 @@ fn from_io_result<T>(rs: io::Result<T>) -> Result<T> {
     match rs {
         Ok(v) => Ok(v),
         Err(e) => Err(ParseError::IOError(e.to_string()))
+    }
+}
+
+#[inline]
+fn from_parsing_result<T>(rs: Result<T>) -> std::result::Result<T, Status> {
+    match rs {
+        Ok(v) => Ok(v),
+        Err(e) => Err(Status::corrupted(e.to_string()))
     }
 }
 

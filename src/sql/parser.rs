@@ -1,19 +1,26 @@
 use std::io::Read;
-use serde_yaml::to_string;
+use crate::{Arena, ArenaMut, Status};
 use crate::base::{ArenaVec, ArenaBox, ArenaStr};
-use crate::sql::{ParseError, Result, SourceLocation, SourcePosition};
-use crate::sql::ast::{ColumnDeclaration, CreateIndex, CreateTable, DropIndex, DropTable, Expression, Factory, Identifier, InsertIntoTable, JoinOp, Operator, Placeholder, Relation, SelectColumn, SelectColumnItem, SetOp, Statement, TypeDeclaration};
+use crate::sql::{from_parsing_result, ParseError, Result, SourceLocation, SourcePosition};
+use crate::sql::ast::*;
 use crate::sql::lexer::{Lexer, Token, TokenPart};
 
-pub struct Parser<'a> {
+pub struct Parser<'a, R: ?Sized> {
     factory: Factory,
-    lexer: Lexer<'a>,
+    lexer: Lexer<'a, R>,
     lookahead: TokenPart,
     placeholder_order: usize,
 }
 
-impl<'a> Parser<'a> {
-    pub fn new(reader: &'a mut dyn Read, factory: Factory) -> Result<Self> {
+pub fn parse_sql_expr<R: Read + ?Sized>(reader: &mut R, arena: &ArenaMut<Arena>)
+    -> crate::Result<ArenaBox<dyn Expression>> {
+    let factory = Factory::new(arena);
+    let mut parser = from_parsing_result(Parser::new(reader, factory))?;
+    from_parsing_result(parser.parse_expr())
+}
+
+impl<'a, R: Read + ?Sized> Parser<'a, R> {
+    pub fn new(reader: &'a mut R, factory: Factory) -> Result<Self> {
         let mut lexer = Lexer::new(reader, factory.arena.clone());
         let lookahead = lexer.next()?;
         Ok(Self {

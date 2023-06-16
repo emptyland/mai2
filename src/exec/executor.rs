@@ -46,12 +46,12 @@ impl Executor {
         }
     }
 
-    pub fn execute_query(&mut self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<ResultSet> {
+    pub fn execute_query<R: Read + ?Sized>(&mut self, reader: &mut R, arena: &ArenaMut<Arena>) -> Result<ResultSet> {
         let affected_rows = self.execute(reader, arena)?;
         Ok(self.returning_result_set(affected_rows))
     }
 
-    pub fn execute(&mut self, reader: &mut dyn Read, arena: &ArenaMut<Arena>) -> Result<u64> {
+    pub fn execute<R: Read + ?Sized>(&mut self, reader: &mut R, arena: &ArenaMut<Arena>) -> Result<u64> {
         // clear latest result;
         self.rs = Status::Ok;
         self.arena = arena.clone();
@@ -94,8 +94,8 @@ impl Executor {
         Ok(self.returning_result_set(affected_rows))
     }
 
-    pub fn prepare(&mut self, reader: &mut dyn Read, arena: &ArenaMut<Arena>)
-                   -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
+    pub fn prepare<R: Read + ?Sized>(&mut self, reader: &mut R, arena: &ArenaMut<Arena>)
+        -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
         // clear latest result;
         self.rs = Status::Ok;
         self.arena = arena.clone();

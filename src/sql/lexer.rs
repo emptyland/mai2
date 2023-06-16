@@ -207,16 +207,16 @@ impl Keywords {
 
 unsafe impl Sync for Keywords {}
 
-pub struct Lexer<'a> {
+pub struct Lexer<'a, R: ?Sized> {
     lookahead: char,
-    reader: &'a mut dyn Read,
+    reader: &'a mut R,
     arena: ArenaMut<Arena>,
     line: u32,
     column: u32,
 }
 
-impl<'a> Lexer<'a> {
-    pub fn new(reader: &'a mut dyn Read, arena: ArenaMut<Arena>) -> Self {
+impl<'a, R: Read + ?Sized> Lexer<'a, R> {
+    pub fn new(reader: &'a mut R, arena: ArenaMut<Arena>) -> Self {
         let mut this = Self {
             arena,
             lookahead: '\0',

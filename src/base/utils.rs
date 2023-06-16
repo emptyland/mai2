@@ -1,3 +1,5 @@
+use std::cmp::min;
+use std::io::{Read, Write};
 use std::num::Wrapping;
 use std::ptr;
 use std::ptr::{addr_of, addr_of_mut};
@@ -80,4 +82,42 @@ pub fn to_ascii_lowercase<const N: usize>(input: &str) -> [u8;N] {
     }
     buf[..input.len()].make_ascii_lowercase();
     buf
+}
+
+pub struct SliceReadWrapper<'a> {
+    buf: &'a [u8],
+    position: usize
+}
+
+impl <'a> SliceReadWrapper<'a> {
+    fn readable_in_bytes(&self) -> usize {
+        self.buf.len() - self.position
+    }
+}
+
+impl <'a> From<&'a str> for SliceReadWrapper<'a> {
+    fn from(value: &'a str) -> Self {
+        Self {
+            buf: value.as_bytes(),
+            position: 0,
+        }
+    }
+}
+
+impl <'a> From<&'a String> for SliceReadWrapper<'a> {
+    fn from(value: &'a String) -> Self {
+        Self {
+            buf: value.as_bytes(),
+            position: 0
+        }
+    }
+}
+
+impl <'a> Read for SliceReadWrapper<'a> {
+    fn read(&mut self, mut buf: &mut [u8]) -> std::io::Result<usize> {
+        let len = min(buf.len(), self.readable_in_bytes());
+        buf.write(&self.buf[self.position..self.position + len])?;
+        self.position += len;
+        Ok(len)
+    }
 }
