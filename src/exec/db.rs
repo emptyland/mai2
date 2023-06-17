@@ -668,6 +668,8 @@ impl DB {
         Ok(tuples.len() as u64)
     }
 
+    pub fn is_primary_key(key_id: u64) -> bool { key_id == DB::PRIMARY_KEY_ID as u64 }
+
     pub fn encode_anonymous_row_key<W: Write>(counter: u64, wr: &mut W) {
         wr.write(&Self::PRIMARY_KEY_ID_BYTES).unwrap(); // primary key id always is 0
         wr.write(&counter.to_be_bytes()).unwrap();
@@ -961,7 +963,7 @@ impl DB {
         }
     }
 
-    pub fn parse_key(key: &[u8]) -> (u64, u32) {
+    pub fn parse_row_key(key: &[u8]) -> (u64, u32) {
         debug_assert!(key.len() > Self::KEY_ID_LEN + Self::COL_ID_LEN);
         let key_id = u32::from_be_bytes((&key[..Self::KEY_ID_LEN]).try_into().unwrap()) as u64;
         let col_id = u32::from_be_bytes((&key[key.len() - Self::COL_ID_LEN..]).try_into().unwrap());

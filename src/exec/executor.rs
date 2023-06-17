@@ -95,7 +95,7 @@ impl Executor {
     }
 
     pub fn prepare<R: Read + ?Sized>(&mut self, reader: &mut R, arena: &ArenaMut<Arena>)
-        -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
+                                     -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
         // clear latest result;
         self.rs = Status::Ok;
         self.arena = arena.clone();
@@ -672,6 +672,22 @@ impl ColumnSet {
         });
     }
 
+    pub fn find_by_id(&self, col_id: u32) -> Option<&Column> {
+        self.index_by_id(col_id).map(|x| {
+            &self.columns[x]
+        })
+    }
+
+    pub fn index_by_id(&self, col_id: u32) -> Option<usize> {
+        for i in 0..self.columns.len() {
+            let col = &self.columns[i];
+            if col.id == col_id {
+                return Some(i)
+            }
+        }
+        None
+    }
+
     pub fn find_by_name(&self, prefix: &str, suffix: &str) -> Option<&Column> {
         self.index_by_name(prefix, suffix).map(|x| {
             &self.columns[x]
@@ -682,14 +698,14 @@ impl ColumnSet {
         if prefix == self.schema.as_str() {
             for i in 0..self.columns.len() {
                 if self.columns[i].name.as_str() == suffix {
-                    return Some(i)
+                    return Some(i);
                 }
             }
         } else {
             for i in 0..self.columns.len() {
                 let col = &self.columns[i];
                 if col.name.as_str() == suffix && col.desc.as_str() == prefix {
-                    return Some(i)
+                    return Some(i);
                 }
             }
         }
@@ -724,6 +740,11 @@ static EMPTY_ARRAY_DUMMY: [u8; 0] = [0; 0];
 
 impl Tuple {
     pub fn new<A: Allocator + ?Sized>(columns: &ArenaBox<ColumnSet>, arena: &mut A) -> Self {
+        Self::with_filling(columns, |_|{Value::Undefined}, arena)
+    }
+
+    pub fn with_filling<A: Allocator + ?Sized, F>(columns: &ArenaBox<ColumnSet>, callback: F, arena: &mut A) -> Self
+        where F: Fn(usize) -> Value {
         let len = columns.columns.len();
         let value_layout = Layout::new::<Value>();
         let layout = Layout::from_size_align(value_layout.size() * len, value_layout.align()).unwrap();
@@ -735,7 +756,7 @@ impl Tuple {
         };
         let row_key = unsafe {
             for i in 0..len {
-                items.as_mut()[i] = Value::Undefined;
+                items.as_mut()[i] = callback(i);
             }
             let ptr = addr_of!(EMPTY_ARRAY_DUMMY) as *mut u8;
             NonNull::new(slice_from_raw_parts_mut(ptr, 0)).unwrap()

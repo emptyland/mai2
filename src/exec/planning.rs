@@ -3,10 +3,11 @@ use std::mem::replace;
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::task::ready;
 use crate::sql::ast::*;
 use crate::{arena_vec, break_visit, corrupted, corrupted_err, Corrupting, Result, Status, switch, try_visit, visit_fatal};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
-use crate::exec::db::{DB, TableHandle, TableRef};
+use crate::exec::db::{ColumnType, DB, TableHandle, TableRef};
 use crate::exec::evaluator::{Evaluator, TypingReducer, Value};
 use crate::exec::executor::{ColumnSet, PreparedStatement, TypingStubContext, UniversalContext};
 use crate::exec::function;
@@ -868,9 +869,11 @@ impl Display for SelectionRange {
     }
 }
 
+type AnalyzedVal = GenericAnalyzedVal<SelectionSet>;
+
 //#[derive(Debug, PartialEq)]
-enum AnalyzedVal {
-    Set(ArenaVec<SelectionSet>),
+enum GenericAnalyzedVal<T> {
+    Set(ArenaVec<T>),
     PrimaryKey,
     PartOfPrimaryKey(usize),
     Index(u64),
@@ -879,13 +882,13 @@ enum AnalyzedVal {
     Integral(i64),
     Floating(f64),
     String(ArenaStr),
-    And(ArenaVec<SelectionSet>, ArenaBox<dyn Expression>),
-    Or(ArenaVec<SelectionSet>, ArenaBox<dyn Expression>),
+    And(ArenaVec<T>, ArenaBox<dyn Expression>),
+    Or(ArenaVec<T>, ArenaBox<dyn Expression>),
     Null,
 }
 
-impl AnalyzedVal {
-    fn unwrap_set(self) -> ArenaVec<SelectionSet> {
+impl <T> GenericAnalyzedVal<T> {
+    fn unwrap_set(self) -> ArenaVec<T> {
         if let Self::Set(set) = self {
             set
         } else {
@@ -893,7 +896,7 @@ impl AnalyzedVal {
         }
     }
 
-    fn unwrap_and(self) -> (ArenaVec<SelectionSet>, ArenaBox<dyn Expression>) {
+    fn unwrap_and(self) -> (ArenaVec<T>, ArenaBox<dyn Expression>) {
         if let Self::And(set, expr) = self {
             (set, expr)
         } else {
@@ -901,7 +904,15 @@ impl AnalyzedVal {
         }
     }
 
-    fn need_eval<T: Expression + 'static>(expr: &mut T) -> Self {
+    fn unwrap_need_eval(self) -> ArenaBox<dyn Expression> {
+        if let Self::NeedEval(expr) = self {
+            expr
+        } else {
+            panic!("called `AnalyzedVal::unwrap_need_eval()` on a non-`NeedEval` value")
+        }
+    }
+
+    fn need_eval<U: Expression + 'static>(expr: &mut U) -> Self {
         Self::NeedEval(ArenaBox::from(expr).into())
     }
 
@@ -1306,6 +1317,250 @@ impl Visitor for PhysicalSelectionAnalyzer {
     }
 }
 
+struct PhysicalJoinConditionAnalyzer {
+    analyzed_vals: ArenaVec<JoinConditionVal>,
+    driver_cols: ArenaBox<ColumnSet>,
+    matcher_cols: ArenaBox<ColumnSet>,
+    matcher: TableRef,
+    arena: ArenaMut<Arena>,
+    rs: Status,
+}
+
+#[derive(Clone)]
+struct JoinConditionKeyPart {
+    key_id: u64,
+    part_of: usize,
+    total: usize,
+    matching: ArenaBox<dyn Expression>,
+    ty: ColumnType,
+}
+
+impl JoinConditionKeyPart {
+    fn with_primary_key(table: &TableRef, part_of: usize, matching: &ArenaBox<dyn Expression>) -> Self {
+        let col_id = table.metadata.primary_keys[part_of];
+        let col = table.get_col_by_id(col_id).unwrap();
+        Self {
+            key_id: 0,
+            part_of,
+            total: table.metadata.primary_keys.len(),
+            matching: matching.clone(),
+            ty: col.ty.clone(),
+        }
+    }
+
+    fn with_2rd_index(table: &TableRef, key_id: u64, part_of: usize, matching: &ArenaBox<dyn Expression>) -> Self {
+        let idx = table.get_2rd_idx_by_id(key_id).unwrap();
+        let col_id = idx.key_parts[part_of];
+        let col = table.get_col_by_id(col_id).unwrap();
+        Self {
+            key_id,
+            part_of,
+            total: idx.key_parts.len(),
+            matching: matching.clone(),
+            ty: col.ty.clone(),
+        }
+    }
+}
+
+type JoinConditionVal = GenericAnalyzedVal<JoinConditionKeyPart>;
+
+impl PhysicalJoinConditionAnalyzer {
+    fn new(driver_cols: &ArenaBox<ColumnSet>,
+           matcher_cols: &ArenaBox<ColumnSet>,
+           matcher: &TableRef,
+           arena: &ArenaMut<Arena>) -> Self {
+        Self {
+            analyzed_vals: arena_vec!(arena),
+            driver_cols: driver_cols.clone(),
+            matcher_cols: matcher_cols.clone(),
+            matcher: matcher.clone(),
+            arena: arena.clone(),
+            rs: Status::Ok,
+        }
+    }
+
+    fn visit(&mut self, expr: &mut dyn Expression) -> Result<JoinConditionVal> {
+        self.analyzed_vals.clear();
+        expr.accept(self);
+        if self.rs.is_not_ok() {
+            Err(self.rs.clone())
+        } else {
+            Ok(self.analyzed_vals.pop().unwrap())
+        }
+    }
+
+    fn ret(&mut self, value: JoinConditionVal) {
+        self.analyzed_vals.push(value);
+    }
+
+    fn try_merge_key_parts(&mut self, a: ArenaVec<JoinConditionKeyPart>, other: JoinConditionVal, origin: &mut BinaryExpression) {
+        match other {
+            JoinConditionVal::Set(b) => {
+                if let Some(parts) = Self::merge_key_parts(a, b) {
+                    self.ret(JoinConditionVal::Set(parts));
+                } else {
+                    self.ret(JoinConditionVal::need_eval(origin));
+                }
+            }
+            JoinConditionVal::NeedEval(expr) =>
+                self.ret(JoinConditionVal::And(a, expr)),
+            _ => self.ret(JoinConditionVal::need_eval(origin))
+        }
+    }
+
+    fn merge_key_parts(mut a: ArenaVec<JoinConditionKeyPart>, b: ArenaVec<JoinConditionKeyPart>)
+        -> Option<ArenaVec<JoinConditionKeyPart>> {
+        let mut rv = arena_vec!(&a.owns);
+        for part in &b {
+            for dest in &a {
+                if part.key_id == dest.key_id && part.part_of == dest.part_of {
+                    return None;
+                }
+            }
+            rv.push(part.clone());
+        }
+        rv.append(&mut a);
+        rv.sort_by(|a,b|{
+            if a.key_id == b.key_id {
+                a.part_of.cmp(&b.part_of)
+            } else {
+                a.key_id.cmp(&b.key_id)
+            }
+        });
+        Some(rv)
+    }
+}
+
+impl Visitor for PhysicalJoinConditionAnalyzer {
+    fn visit_identifier(&mut self, this: &mut Identifier) {
+        self.ret(JoinConditionVal::need_eval(this));
+    }
+
+    fn visit_full_qualified_name(&mut self, this: &mut FullyQualifiedName) {
+        if this.prefix.as_str() != self.matcher_cols.schema.as_str() {
+            self.ret(JoinConditionVal::need_eval(this));
+            return;
+        }
+        let rs = self.matcher.get_col_by_name(&this.suffix.to_string());
+        if rs.is_none() {
+            visit_fatal!(self, "Column not found by name: {}.{}", this.prefix, this.suffix);
+        }
+        let col = rs.unwrap();
+        if self.matcher.is_col_be_part_of_primary_key_by_name(&this.suffix.to_string()) {
+            if self.matcher.metadata.primary_keys.len() == 1 {
+                self.ret(JoinConditionVal::PrimaryKey);
+            } else {
+                for i in 0..self.matcher.metadata.primary_keys.len() {
+                    if self.matcher.metadata.primary_keys[i] == col.id {
+                        self.ret(JoinConditionVal::PartOfPrimaryKey(i));
+                        return;
+                    }
+                }
+                unreachable!();
+            }
+        } else {
+            match self.matcher.get_col_be_part_of_2rd_idx_by_name(&this.suffix.to_string()) {
+                Some(idx) => {
+                    if idx.key_parts.len() == 1 {
+                        self.ret(JoinConditionVal::Index(idx.id));
+                    } else {
+                        for i in 0..idx.key_parts.len() {
+                            if idx.key_parts[i] == col.id {
+                                self.ret(JoinConditionVal::PartOfIndex(idx.id, i));
+                                return;
+                            }
+                        }
+                        unreachable!()
+                    }
+                }
+                None => self.ret(JoinConditionVal::need_eval(this))
+            }
+        }
+    }
+
+    fn visit_unary_expression(&mut self, this: &mut UnaryExpression) {
+        self.ret(JoinConditionVal::need_eval(this));
+    }
+
+    fn visit_binary_expression(&mut self, this: &mut BinaryExpression) {
+        try_visit!(self, this.lhs_mut());
+        let lhs = self.analyzed_vals.pop().unwrap();
+        try_visit!(self, this.rhs_mut());
+        let rhs = self.analyzed_vals.pop().unwrap();
+
+        match this.op() {
+            Operator::Eq => {
+                let matching;
+                let expr;
+                if lhs.is_key() && !rhs.is_key() {
+                    matching = lhs;
+                    expr = rhs.unwrap_need_eval();
+                } else if !lhs.is_key() && rhs.is_key() {
+                    matching = rhs;
+                    expr = lhs.unwrap_need_eval();
+                } else {
+                    return self.ret(JoinConditionVal::need_eval(this));
+                }
+
+                let key_part = match matching {
+                    JoinConditionVal::PrimaryKey =>
+                        JoinConditionKeyPart::with_primary_key(&self.matcher, 0, &expr),
+                    JoinConditionVal::PartOfPrimaryKey(order) =>
+                        JoinConditionKeyPart::with_primary_key(&self.matcher, order, &expr),
+                    JoinConditionVal::Index(key_id) =>
+                        JoinConditionKeyPart::with_2rd_index(&self.matcher, key_id, 0, &expr),
+                    JoinConditionVal::PartOfIndex(key_id, order) =>
+                        JoinConditionKeyPart::with_2rd_index(&self.matcher, key_id, order, &expr),
+                    _ => unreachable!()
+                };
+                self.ret(JoinConditionVal::Set(arena_vec!(&self.arena, [key_part])));
+            }
+            Operator::And => {
+                if let JoinConditionVal::Set(a) = lhs {
+                    self.try_merge_key_parts(a, rhs, this);
+                } else if let JoinConditionVal::Set(a) = rhs {
+                    self.try_merge_key_parts(a, lhs, this);
+                } else {
+                    self.ret(JoinConditionVal::need_eval(this));
+                }
+            }
+            _ => self.ret(JoinConditionVal::need_eval(this))
+        }
+    }
+
+    fn visit_in_literal_set(&mut self, this: &mut InLiteralSet) {
+        self.ret(JoinConditionVal::need_eval(this));
+    }
+
+    fn visit_in_relation(&mut self, this: &mut InRelation) {
+        self.ret(JoinConditionVal::need_eval(this));
+    }
+
+    fn visit_call_function(&mut self, this: &mut CallFunction) {
+        self.ret(JoinConditionVal::need_eval(this));
+    }
+
+    fn visit_int_literal(&mut self, this: &mut Literal<i64>) {
+        self.ret(JoinConditionVal::need_eval(this));
+    }
+
+    fn visit_float_literal(&mut self, this: &mut Literal<f64>) {
+        self.ret(JoinConditionVal::need_eval(this));
+    }
+
+    fn visit_str_literal(&mut self, this: &mut Literal<ArenaStr>) {
+        self.ret(JoinConditionVal::need_eval(this));
+    }
+
+    fn visit_null_literal(&mut self, this: &mut Literal<()>) {
+        self.ret(JoinConditionVal::need_eval(this));
+    }
+
+    fn visit_fast_access_hint(&mut self, this: &mut FastAccessHint) {
+        self.ret(JoinConditionVal::need_eval(this));
+    }
+}
+
 struct ProjectionColumnsVisitor {
     schema: ArenaBox<ColumnSet>,
     rewriting: ArenaVec<Option<ArenaBox<dyn Expression>>>,
@@ -1410,7 +1665,6 @@ impl ProjectionColumnsVisitor {
 
     fn install_all_schema_fields<F>(&mut self, schema: &str, columns: &ColumnSet, mut callback: F)
         where F: FnMut(&str, &str) {
-
         if schema == columns.schema.as_str() {
             columns.columns.iter()
                 .for_each(|x| {

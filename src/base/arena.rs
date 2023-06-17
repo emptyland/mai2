@@ -431,7 +431,7 @@ impl <T: ?Sized> From<NonNull<T>> for ArenaBox<T> {
     }
 }
 
-impl <T> From<&mut T> for ArenaBox<T> {
+impl <T: ?Sized> From<&mut T> for ArenaBox<T> {
     fn from(value: &mut T) -> Self {
         Self {
             naked: NonNull::new(value as *mut T).unwrap()

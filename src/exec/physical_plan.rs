@@ -1,18 +1,20 @@
-use std::cell::Cell;
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
+use std::env::args;
+use std::hash::Hasher;
 use std::io::Write;
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaStr, ArenaVec};
-use crate::exec::executor::{ColumnSet, PreparedStatement, Tuple, UpstreamContext};
+use crate::exec::executor::{Column, ColumnSet, PreparedStatement, Tuple, UpstreamContext};
 use crate::{corrupted_err, Result, Status, Corrupting, storage, arena_vec};
 use crate::exec::connection::FeedbackImpl;
 use crate::exec::db::{ColumnType, DB};
 use crate::exec::evaluator::{Evaluator, Value};
 use crate::exec::function::{Aggregator, Writable};
 use crate::sql::ast::{Expression, JoinOp};
-use crate::storage::{ColumnFamily, ColumnFamilyOptions, config, IteratorArc, ReadOptions, WriteOptions};
+use crate::storage::{ColumnFamily, ColumnFamilyOptions, config, IteratorArc, ReadOptions, Snapshot, WriteOptions};
 
 pub trait PhysicalPlanOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>>;
@@ -218,7 +220,7 @@ impl PhysicalPlanOps for RangeScanOps {
         let arena = zone.get_mut();
         let mut tuple = Tuple::with(&self.projected_columns, &arena);
         let rs = self.next_row(iter.deref_mut(), |key, v| {
-            let (_, col_id) = DB::parse_key(key);
+            let (_, col_id) = DB::parse_row_key(key);
             if let Some(index) = self.col_id_to_order.get(&col_id) {
                 let ty = &tuple.columns().columns[*index].ty;
                 let value = DB::decode_column_value(ty, v, arena.get_mut());
@@ -1131,6 +1133,299 @@ impl PhysicalPlanOps for SimpleNestedLoopJoinOps {
     }
 }
 
+pub struct IndexNestedLoopJoinOps {
+    driver: ArenaBox<dyn PhysicalPlanOps>,
+    projected_columns: ArenaBox<ColumnSet>,
+    arena: ArenaMut<Arena>,
+    join_op: JoinOp,
+    driving_vals: ArenaVec<u8>,
+    driving_columns: ArenaBox<ColumnSet>,
+    // expr -> ty
+    matching_key_bundle: ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>,
+    matching_columns: ArenaBox<ColumnSet>,
+    matching_key_id: u64,
+    matching_key: RefCell<ArenaVec<u8>>,
+
+    storage: Option<Arc<dyn storage::DB>>,
+    iter: Option<IteratorArc>,
+    snapshot: Option<Arc<dyn Snapshot>>,
+    cf: Option<Arc<dyn ColumnFamily>>,
+    context: Option<Arc<UpstreamContext>>,
+}
+
+impl IndexNestedLoopJoinOps {
+    pub fn new(driver: ArenaBox<dyn PhysicalPlanOps>,
+               projected_columns: ArenaBox<ColumnSet>,
+               join_op: JoinOp,
+               driving_columns: ArenaBox<ColumnSet>,
+               matching_key_bundle: ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>,
+               matching_columns: ArenaBox<ColumnSet>,
+               matching_key_id: u64,
+               prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+               arena: ArenaMut<Arena>,
+               storage: Arc<dyn storage::DB>,
+               cf: Arc<dyn ColumnFamily>) -> Self {
+        let snapshot = storage.get_snapshot();
+        let mut env = UpstreamContext::new(prepared_stmt, &arena);
+        env.add(projected_columns.deref());
+        Self {
+            driver,
+            projected_columns,
+            join_op,
+            driving_vals: arena_vec!(&arena),
+            driving_columns,
+            matching_key_bundle,
+            matching_columns,
+            matching_key_id,
+            matching_key: RefCell::new(arena_vec!(&arena)),
+            arena,
+            storage: Some(storage),
+            iter: None,
+            snapshot: Some(snapshot),
+            cf: Some(cf),
+            context: Some(Arc::new(env)),
+        }
+    }
+
+    fn next_driving_tuple(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        if self.driving_vals.is_empty() || self.matching_key.borrow().is_empty() {
+            self.next_driving_tuple_directly(feedback, zone)
+        } else {
+            let iter_box = self.iter.as_ref().unwrap().clone();
+            let iter = iter_box.borrow();
+            let arena = zone.get_mut();
+            if iter.valid() && iter.key().starts_with(&self.matching_key.borrow()) {
+                Some(DB::decode_tuple(&self.driving_columns, &self.driving_vals, &arena))
+            } else {
+                self.next_driving_tuple_directly(feedback, zone)
+            }
+        }
+    }
+
+    fn next_driving_tuple_directly(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        let rs = self.driver.next(feedback, zone);
+        if rs.is_none() {
+            return None;
+        }
+        let drive = rs.unwrap();
+        self.driving_vals.clear();
+        DB::encode_tuple(&drive, &mut self.driving_vals);
+        Some(drive)
+    }
+
+    fn match_tuple(&mut self, drive: &Tuple, arena: &ArenaMut<Arena>) -> Result<Tuple> {
+        if DB::is_primary_key(self.matching_key_id) {
+            self.match_tuple_from_pk(drive, arena)
+        } else {
+            self.match_tuple_from_k(drive, arena)
+        }
+    }
+
+    fn match_tuple_from_pk(&mut self, drive: &Tuple, arena: &ArenaMut<Arena>) -> Result<Tuple> {
+        let iter_box = self.iter.as_ref().unwrap();
+        let mut iter = iter_box.borrow_mut(); // iter in primary key
+        let key_prefix = self.matching_key.borrow();
+        match self.next_matching_tuple_directly(&key_prefix, &self.matching_columns, iter.deref_mut(), arena) {
+            Err(e) => {
+                if !e.is_not_found() {
+                    return Err(e);
+                }
+            }
+            Ok(tuple) => return Ok(tuple)
+        }
+        drop(key_prefix);
+
+        let key_prefix = self.build_matching_key(drive, arena)?;
+        debug_assert!(!key_prefix.is_empty());
+
+        iter.seek(&key_prefix);
+        if iter.status().is_not_ok() {
+            return Err(iter.status().clone());
+        }
+        if !iter.valid() {
+            return Err(Status::NotFound);
+        }
+        self.next_matching_tuple_directly(&key_prefix, &self.matching_columns, iter.deref_mut(), arena)
+    }
+
+    fn match_tuple_from_k(&mut self, drive: &Tuple, arena: &ArenaMut<Arena>) -> Result<Tuple> {
+        let iter_box = self.iter.as_ref().unwrap();
+        let mut iter = iter_box.borrow_mut(); // iter in secondary key
+        let key_prefix = self.matching_key.borrow();
+        match self.next_matching_tuple_indirectly(&key_prefix, &self.matching_columns, iter.deref_mut(), arena) {
+            Err(e) => {
+                if !e.is_not_found() {
+                    return Err(e);
+                }
+            }
+            Ok(tuple) => return Ok(tuple)
+        }
+        drop(key_prefix);
+
+        let key_prefix = self.build_matching_key(drive, arena)?;
+        debug_assert!(!key_prefix.is_empty());
+
+        iter.seek(&key_prefix);
+        if iter.status().is_not_ok() {
+            return Err(iter.status().clone());
+        }
+        if !iter.valid() {
+            return Err(Status::NotFound);
+        }
+        self.next_matching_tuple_indirectly(&key_prefix, &self.matching_columns, iter.deref_mut(), arena)
+    }
+
+    fn build_matching_key(&self, drive: &Tuple, arena: &ArenaMut<Arena>) -> Result<Ref<ArenaVec<u8>>> {
+        let mut key_buf = self.matching_key.borrow_mut();
+        key_buf.clear();
+
+        DB::encode_idx_id(self.matching_key_id, key_buf.deref_mut());
+
+        let env = self.context.as_ref().unwrap();
+        env.attach(drive);
+        let mut evaluator = Evaluator::new(arena);
+        for (expr, ty) in &self.matching_key_bundle {
+            let e = unsafe { &mut *expr.ptr().as_ptr() };
+            let rv = evaluator.evaluate(e, env.clone())?;
+
+            if DB::is_primary_key(self.matching_key_id) {
+                DB::encode_row_key(&rv, ty, key_buf.deref_mut())?;
+            } else {
+                DB::encode_secondary_index(&rv, ty, key_buf.deref_mut());
+            }
+        }
+        drop(key_buf);
+        Ok(self.matching_key.borrow())
+    }
+
+    fn next_matching_tuple_indirectly(&self, key_prefix: &[u8], columns: &ArenaBox<ColumnSet>,
+                                      iter: &mut dyn storage::Iterator, arena: &ArenaMut<Arena>) -> Result<Tuple> {
+        let storage = self.storage.as_ref().unwrap();
+        let cf = self.cf.as_ref().unwrap();
+        let mut rd_opts = ReadOptions::default();
+        rd_opts.snapshot = self.snapshot.clone();
+
+        if iter.valid() && iter.key().starts_with(&key_prefix) {
+            let iter_pk_box = storage.new_iterator(&rd_opts, cf)?;
+            let mut iter_pk = iter_pk_box.borrow_mut();
+            return match self.next_matching_tuple_directly(iter.value(), columns, iter_pk.deref_mut(), arena) {
+                Err(e) => Err(e),
+                Ok(tuple) => {
+                    iter.move_next();
+                    Ok(tuple)
+                }
+            };
+        }
+        Err(Status::NotFound)
+    }
+
+    fn next_matching_tuple_directly(&self, key_prefix: &[u8], columns: &ArenaBox<ColumnSet>,
+                                    iter: &mut dyn storage::Iterator, arena: &ArenaMut<Arena>) -> Result<Tuple> {
+        let mut tuple = Tuple::with_filling(&columns, |_| { Value::Null }, arena.get_mut());
+
+        let mut prev_row_key = arena_vec!(arena);
+        while iter.valid() && iter.key().starts_with(&key_prefix) {
+            let row_key = &iter.key()[..iter.key().len() - DB::COL_ID_LEN];
+            if prev_row_key.is_empty() {
+                (&mut prev_row_key).write(row_key).unwrap();
+            }
+            let (_, col_id) = DB::parse_row_key(iter.key());
+
+            let i = columns.index_by_id(col_id).unwrap();
+            let value = DB::decode_column_value(&columns[i].ty, iter.value(), arena.get_mut());
+            tuple.set(i, value);
+
+            if prev_row_key.as_slice() != row_key {
+                prev_row_key.clear();
+                (&mut prev_row_key).write(row_key).unwrap();
+                tuple.associate_row_key(&prev_row_key);
+                return Ok(tuple);
+            }
+            iter.move_next();
+            if iter.status().is_not_ok() {
+                return Err(iter.status().clone());
+            }
+        }
+
+        Err(Status::NotFound)
+    }
+
+    fn merge_tuples(&self, drive: Tuple, match_: Tuple, arena: &ArenaMut<Arena>) -> Tuple {
+        let mut tuple = Tuple::new(&self.projected_columns, arena.get_mut());
+        for i in 0..drive.len() {
+            tuple.set(i, drive[i].dup(arena));
+        }
+        for i in drive.len()..tuple.len() {
+            tuple.set(i, match_[i - drive.len()].dup(arena));
+        }
+        tuple
+    }
+
+    fn merge_left_half(&self, drive: Tuple, arena: &ArenaMut<Arena>) -> Tuple {
+        todo!()
+    }
+
+    fn merge_right_half(&self, drive: Tuple, arena: &ArenaMut<Arena>) -> Tuple {
+        todo!()
+    }
+}
+
+impl PhysicalPlanOps for IndexNestedLoopJoinOps {
+    fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
+        self.driver.prepare()?;
+
+        self.driving_vals.clear();
+        self.matching_key.borrow_mut().clear();
+
+        let storage = self.storage.as_ref().unwrap();
+        let snapshot = self.snapshot.as_ref().unwrap();
+        let cf = self.cf.as_ref().unwrap();
+        let mut rd_opts = ReadOptions::default();
+        rd_opts.snapshot = Some(snapshot.clone());
+        let iter = storage.new_iterator(&rd_opts, cf)?;
+        iter.borrow_mut().seek_to_first();
+
+        self.iter = Some(iter);
+        Ok(self.projected_columns.clone())
+    }
+
+    fn finalize(&mut self) {
+        self.storage = None;
+        self.iter = None;
+        self.snapshot = None;
+        self.cf = None;
+    }
+
+    fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        let arena = zone.get_mut();
+        loop {
+            let rs = self.next_driving_tuple(feedback, zone);
+            if rs.is_none() {
+                break None;
+            }
+            let drive = rs.unwrap();
+            match self.match_tuple(&drive, &arena) {
+                Ok(match_) => break Some(self.merge_tuples(drive, match_, &arena)),
+                Err(e) => {
+                    if !e.is_not_found() {
+                        feedback.catch_error(e);
+                        break None;
+                    }
+                    match &self.join_op {
+                        JoinOp::LeftOuterJoin => break Some(self.merge_left_half(drive, &arena)),
+                        JoinOp::RightOuterJoin => break Some(self.merge_right_half(drive, &arena)),
+                        JoinOp::InnerJoin | JoinOp::CrossJoin => ()
+                    }
+                }
+            }
+        }
+    }
+
+    fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
+        arena_vec!(&self.arena, [self.driver.clone()])
+    }
+}
+
 pub struct MockingProducerOps {
     data: ArenaVec<Tuple>,
     current: usize,
@@ -1276,7 +1571,7 @@ mod tests {
             data.push(tuple);
         }
         let plan_t1 =
-            ArenaBox::new(MockingProducerOps::new(data, t1.clone()),arena.get_mut());
+            ArenaBox::new(MockingProducerOps::new(data, t1.clone()), arena.get_mut());
 
         let mut t2_cols = ColumnSet::new("t2", &arena);
         t2_cols.append("d", "", 0, ColumnType::Int(11));
