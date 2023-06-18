@@ -11,7 +11,7 @@ use crate::exec::evaluator::{Evaluator, TypingReducer, Value};
 use crate::exec::executor::{ColumnSet, PreparedStatement, TypingStubContext, UniversalContext};
 use crate::exec::function;
 use crate::exec::function::{Aggregator, ExecutionContext};
-use crate::exec::physical_plan::{AggregatorBundle, DistinctOps, FilteringOps, GroupingAggregatorOps, MergingOps, PhysicalPlanOps, ProjectingOps, RangeScanOps, SimpleNestedLoopJoinOps};
+use crate::exec::physical_plan::{AggregatorBundle, DistinctOps, FilteringOps, GroupingAggregatorOps, IndexNestedLoopJoinOps, MergingOps, PhysicalPlanOps, ProjectingOps, RangeScanOps, SimpleNestedLoopJoinOps};
 use crate::sql::ast::*;
 
 pub struct PlanMaker {
@@ -269,13 +269,83 @@ impl PlanMaker {
         Ok(())
     }
 
+    fn choose_join_plan(&mut self, driver_cols: ArenaBox<ColumnSet>,
+                        driver_plan: ArenaBox<dyn PhysicalPlanOps>,
+                        physical_table: Option<TableRef>,
+                        op: JoinOp,
+                        on_clause: &mut ArenaBox<dyn Expression>) {
+        if let Some(table) = physical_table {
+            let matcher_cols = self.schemas.pop().unwrap();
+            let rs = self.choose_join_plan_with_physical_table(driver_cols, driver_plan, matcher_cols,
+                                                               table, op, on_clause);
+            if let Err(e) = rs {
+                self.rs = e;
+                return;
+            }
+        } else {
+            let (
+                lhs_cols,
+                lhs_plan,
+                rhs_cols,
+                rhs_plan,
+            ) = if op == JoinOp::RightOuterJoin {
+                (self.schemas.pop().unwrap(), self.current.pop().unwrap(), driver_cols, driver_plan)
+            } else {
+                (driver_cols, driver_plan, self.schemas.pop().unwrap(), self.current.pop().unwrap())
+            };
+            self.make_simple_nested_loop_join(lhs_cols.deref(), lhs_plan, rhs_cols.deref(), rhs_plan,
+                                              op, on_clause.clone());
+        }
+    }
+
+    fn choose_join_plan_with_physical_table(&mut self, driver_cols: ArenaBox<ColumnSet>,
+                                            driver_plan: ArenaBox<dyn PhysicalPlanOps>,
+                                            matcher_cols: ArenaBox<ColumnSet>,
+                                            matcher_table: TableRef,
+                                            op: JoinOp,
+                                            on_clause: &mut ArenaBox<dyn Expression>) -> Result<()> {
+        let mut analyzer =
+            PhysicalJoinConditionAnalyzer::new(&driver_cols, &matcher_cols, &matcher_table,
+                                               &self.arena);
+        let jcv = analyzer.visit(on_clause.deref_mut())?;
+        if let Some(JoinExplainedVal {
+                        matching_key_id,
+                        matching_key_bundle,
+                        filtering
+                    }) = analyzer.explain(jcv) {
+            self.make_index_nested_loop_join(driver_cols, driver_plan, matcher_cols,
+                                             &matcher_table, matching_key_id, matching_key_bundle, op);
+            return Ok(());
+        }
+
+        let rhs_plan = self.make_scan_table(&matcher_table, &matcher_cols, None, None)?;
+        self.make_simple_nested_loop_join(driver_cols.deref(), driver_plan, matcher_cols.deref(), rhs_plan,
+                                          op, on_clause.clone());
+        Ok(())
+    }
+
     fn make_simple_nested_loop_join(&mut self, lhs_cols: &ColumnSet, lhs_plan: ArenaBox<dyn PhysicalPlanOps>,
                                     rhs_cols: &ColumnSet, rhs_plan: ArenaBox<dyn PhysicalPlanOps>, join_op: JoinOp,
                                     on_clause: ArenaBox<dyn Expression>) {
-        let cols = self.merge_joining_columns_set(lhs_cols.deref(), rhs_cols.deref());
+        let cols = self.merge_joining_columns_set(lhs_cols, rhs_cols);
         let join_plan = SimpleNestedLoopJoinOps::new(lhs_plan, rhs_plan,
                                                      on_clause, cols.clone(),
                                                      self.arena.clone(), join_op);
+        let plan = ArenaBox::new(join_plan, self.arena.get_mut());
+        self.schemas.push(cols);
+        self.current.push(plan.into());
+    }
+
+    fn make_index_nested_loop_join(&mut self, lhs_cols: ArenaBox<ColumnSet>, lhs_plan: ArenaBox<dyn PhysicalPlanOps>,
+                                   rhs_cols: ArenaBox<ColumnSet>, matcher: &TableRef, matching_key_id: u64,
+                                   matching_key_bundle: ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>,
+                                   join_op: JoinOp) {
+        let cols = self.merge_joining_columns_set(lhs_cols.deref(), rhs_cols.deref());
+        let join_plan = IndexNestedLoopJoinOps::new(lhs_plan, cols.clone(),
+                                                    join_op, lhs_cols, matching_key_bundle,
+                                                    rhs_cols, matching_key_id,
+                                                    self.prepared_stmt.clone(), self.arena.clone(),
+                                                    self.db.storage.clone(), matcher.column_family.clone());
         let plan = ArenaBox::new(join_plan, self.arena.get_mut());
         self.schemas.push(cols);
         self.current.push(plan.into());
@@ -595,32 +665,73 @@ impl Visitor for PlanMaker {
     }
 
     fn visit_join_clause(&mut self, this: &mut JoinClause) {
-        let (lhs_cols, lhs_plan) = try_make_plan!(self, this.lhs);
-        let rhs = self.visit_from_clause(this.rhs.deref_mut());
-        if self.rs.is_not_ok() {
-            return;
-        }
-
-        if let Some(matcher_table) = rhs {
-            // TODO: analyzing
-            let rhs_cols = self.schemas.pop().unwrap();
-            let rs = self.make_scan_table(&matcher_table, &rhs_cols, None, None);
-            if let Err(e) = rs {
-                self.rs = e;
+        if matches!(this.op, JoinOp::RightOuterJoin) {
+            let lhs = self.visit_from_clause(this.lhs.deref_mut());
+            if self.rs.is_not_ok() {
                 return;
             }
-            let rhs_plan = rs.unwrap();
-            self.make_simple_nested_loop_join(lhs_cols.deref(), lhs_plan, rhs_cols.deref(), rhs_plan,
-                                              this.op.clone(), this.on_clause.clone());
+            let (rhs_cols, rhs_plan) = try_make_plan!(self, this.rhs);
+            self.choose_join_plan(rhs_cols, rhs_plan, lhs, this.op.clone(),
+                                  &mut this.on_clause);
         } else {
-            let (rhs_cols, rhs_plan) = (
-                self.schemas.pop().unwrap(),
-                self.current.pop().unwrap()
-            );
-            self.make_simple_nested_loop_join(lhs_cols.deref(), lhs_plan, rhs_cols.deref(), rhs_plan,
-                                              this.op.clone(), this.on_clause.clone());
+            let (lhs_cols, lhs_plan) = try_make_plan!(self, this.lhs);
+            let rhs = self.visit_from_clause(this.rhs.deref_mut());
+            if self.rs.is_not_ok() {
+                return;
+            }
+            self.choose_join_plan(lhs_cols, lhs_plan, rhs, this.op.clone(),
+                                  &mut this.on_clause);
         }
     }
+
+    // fn visit_join_clause(&mut self, this: &mut JoinClause) {
+    //     if matches!(this.op, JoinOp::RightOuterJoin) {
+    //         let lhs = self.visit_from_clause(this.lhs.deref_mut());
+    //         if self.rs.is_not_ok() {
+    //             return;
+    //         }
+    //         let (rhs_cols, rhs_plan) = try_make_plan!(self, this.rhs);
+    //         if let Some(table) = lhs {
+    //             let lhs_cols = self.schemas.pop().unwrap();
+    //             let rs = self.choose_join_plan_with_physical_table(rhs_cols, rhs_plan, lhs_cols,
+    //                                                                table, this.op.clone(), &mut this.on_clause);
+    //             if let Err(e) = rs {
+    //                 self.rs = e;
+    //                 return;
+    //             }
+    //         } else {
+    //             let (lhs_cols, lhs_plan) = (
+    //                 self.schemas.pop().unwrap(),
+    //                 self.current.pop().unwrap()
+    //             );
+    //             self.make_simple_nested_loop_join(lhs_cols.deref(), lhs_plan, rhs_cols.deref(), rhs_plan,
+    //                                               this.op.clone(), this.on_clause.clone());
+    //         }
+    //     }
+    //
+    //     let (lhs_cols, lhs_plan) = try_make_plan!(self, this.lhs);
+    //     let rhs = self.visit_from_clause(this.rhs.deref_mut());
+    //     if self.rs.is_not_ok() {
+    //         return;
+    //     }
+    //
+    //     if let Some(matcher_table) = rhs {
+    //         let rhs_cols = self.schemas.pop().unwrap();
+    //         let rs = self.choose_join_plan_with_physical_table(lhs_cols, lhs_plan, rhs_cols,
+    //                                                            matcher_table, this.op.clone(), &mut this.on_clause);
+    //         if let Err(e) = rs {
+    //             self.rs = e;
+    //             return;
+    //         }
+    //     } else {
+    //         let (rhs_cols, rhs_plan) = (
+    //             self.schemas.pop().unwrap(),
+    //             self.current.pop().unwrap()
+    //         );
+    //         self.make_simple_nested_loop_join(lhs_cols.deref(), lhs_plan, rhs_cols.deref(), rhs_plan,
+    //                                           this.op.clone(), this.on_clause.clone());
+    //     }
+    // }
 }
 
 
@@ -886,7 +997,7 @@ enum GenericAnalyzedVal<T> {
     Null,
 }
 
-impl <T> GenericAnalyzedVal<T> {
+impl<T> GenericAnalyzedVal<T> {
     fn unwrap_set(self) -> ArenaVec<T> {
         if let Self::Set(set) = self {
             set
@@ -1326,16 +1437,19 @@ struct PhysicalJoinConditionAnalyzer {
 }
 
 struct JoinExplainedVal {
+    matching_key_id: u64,
     matching_key_bundle: ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>,
     filtering: Option<ArenaBox<dyn Expression>>,
 }
 
 impl JoinExplainedVal {
-    fn new(matching_key_bundle: ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>,
+    fn new(matching_key_id: u64,
+           matching_key_bundle: ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>,
            filtering: Option<ArenaBox<dyn Expression>>) -> Self {
         Self {
+            matching_key_id,
             matching_key_bundle,
-            filtering
+            filtering,
         }
     }
 }
@@ -1410,16 +1524,16 @@ impl PhysicalJoinConditionAnalyzer {
         match val {
             JoinConditionVal::Set(set) => {
                 let mut bundle = arena_vec!(&self.arena);
-                if self.explain_key_parts(set, &mut bundle) {
-                    Some(JoinExplainedVal::new(bundle, None))
+                if let Some(key_id) = self.explain_key_parts(set, &mut bundle) {
+                    Some(JoinExplainedVal::new(key_id, bundle, None))
                 } else {
                     None
                 }
             }
             JoinConditionVal::And(set, filtering) => {
                 let mut bundle = arena_vec!(&self.arena);
-                if self.explain_key_parts(set, &mut bundle) {
-                    Some(JoinExplainedVal::new(bundle, Some(filtering)))
+                if let Some(key_id) = self.explain_key_parts(set, &mut bundle) {
+                    Some(JoinExplainedVal::new(key_id, bundle, Some(filtering)))
                 } else {
                     None
                 }
@@ -1429,22 +1543,22 @@ impl PhysicalJoinConditionAnalyzer {
     }
 
     fn explain_key_parts(&self, parts: ArenaVec<JoinConditionKeyPart>,
-                         bundle: &mut ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>) -> bool {
+                         bundle: &mut ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>) -> Option<u64> {
         debug_assert!(!parts.is_empty());
         debug_assert!(bundle.is_empty());
         let key_id = parts.first().unwrap().key_id;
         let mut order = 0;
         for part in &parts {
             if part.key_id != key_id { // different key id
-                return false;
+                return None;
             }
             if part.part_of != order { // hole in key parts
-                return false;
+                return None;
             }
             bundle.push((part.matching.clone(), part.ty.clone()));
             order += 1;
         }
-        true
+        Some(key_id)
     }
 
     fn ret(&mut self, value: JoinConditionVal) {
@@ -1467,7 +1581,7 @@ impl PhysicalJoinConditionAnalyzer {
     }
 
     fn merge_key_parts(mut a: ArenaVec<JoinConditionKeyPart>, b: ArenaVec<JoinConditionKeyPart>)
-        -> Option<ArenaVec<JoinConditionKeyPart>> {
+                       -> Option<ArenaVec<JoinConditionKeyPart>> {
         let mut rv = arena_vec!(&a.owns);
         for part in &b {
             for dest in &a {
@@ -1478,7 +1592,7 @@ impl PhysicalJoinConditionAnalyzer {
             rv.push(part.clone());
         }
         rv.append(&mut a);
-        rv.sort_by(|a,b|{
+        rv.sort_by(|a, b| {
             if a.key_id == b.key_id {
                 a.part_of.cmp(&b.part_of)
             } else {

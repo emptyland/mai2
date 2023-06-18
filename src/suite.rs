@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #[cfg(test)]
 pub mod testing {
     use std::ops::Deref;
@@ -5,7 +6,7 @@ pub mod testing {
 
     use crate::{Arena, ArenaBox, ArenaMut, ArenaRef, Result};
     use crate::exec::ColumnSet;
-    use crate::exec::connection::Connection;
+    use crate::exec::connection::{Connection, ResultSet};
     use crate::exec::db::DB;
     use crate::sql::ast::Expression;
     use crate::sql::parse_sql_expr_from_content;
@@ -51,6 +52,31 @@ pub mod testing {
 
         pub fn parse_expr(&self, sql: &str) -> Result<ArenaBox<dyn Expression>> {
             parse_sql_expr_from_content(sql, &self.arena)
+        }
+
+        pub fn assert_rows(data: &[&str], mut rs: ResultSet) -> Result<() >{
+            let mut i = 0;
+            while rs.next() {
+                assert_eq!(data[i], rs.current()?.to_string());
+                i += 1;
+            }
+            assert_eq!(i, data.len());
+            if rs.status.is_ok() {
+                Ok(())
+            } else {
+                Err(rs.status.clone())
+            }
+        }
+
+        pub fn print_rows(mut rs: ResultSet) -> Result<()> {
+            while rs.next() {
+                println!("{}", rs.current()?.to_string());
+            }
+            if rs.status.is_ok() {
+                Ok(())
+            } else {
+                Err(rs.status.clone())
+            }
         }
     }
 

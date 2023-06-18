@@ -527,7 +527,7 @@ impl DB {
             let cf = column_family.clone();
             self.worker_pool.execute(move || {
                 let rs = Self::remove_secondary_index_impl(lock_inst, db, cf,
-                                                                       secondary_index_id, unique);
+                                                           secondary_index_id, unique);
                 match rs {
                     Ok(affected_rows) => dbg!(affected_rows),
                     _ => 0
@@ -777,8 +777,8 @@ impl DB {
             ColumnType::Char(_)
             | ColumnType::Varchar(_) => {
                 let len = u32::from_le_bytes((&buf[1..5]).try_into().unwrap()) as usize;
-                let str = std::str::from_utf8(&buf[5..5+len]).unwrap();
-                (Value::Str(ArenaStr::new(str, arena.get_mut())), 5+len)
+                let str = std::str::from_utf8(&buf[5..5 + len]).unwrap();
+                (Value::Str(ArenaStr::new(str, arena.get_mut())), 5 + len)
             }
         }
     }
@@ -821,7 +821,7 @@ impl DB {
                     Value::Str(s) => {
                         wr.write(&(s.len() as u32).to_le_bytes()).unwrap();
                         wr.write(s.as_bytes()).unwrap();
-                    },
+                    }
                     _ => unreachable!()
                 };
             }
@@ -1280,6 +1280,7 @@ mod tests {
     use crate::ArenaVec;
     use crate::base::Arena;
     use crate::storage::JunkFilesCleaner;
+    use crate::suite::testing::SqlSuite;
 
     use super::*;
 
@@ -1873,6 +1874,65 @@ mod tests {
             assert_eq!("xxx", row.get_str(2).unwrap());
         }
         assert_eq!(18, rs.fetched_rows());
+        Ok(())
+    }
+
+    #[test]
+    fn simple_nested_loop_join() -> Result<()> {
+        let suite = SqlSuite::new("tests/db118")?;
+        suite.execute_file(Path::new("testdata/t3_t4_small_data_for_join.sql"), &suite.arena)?;
+
+        let data = [
+            "(1, 100, \"Js\", 1, 101, \"Js\")",
+            "(2, 101, \"Jc\", 2, 101, \"Jc\")",
+            "(3, 102, \"Jk\", 3, 102, \"Jk\")",
+        ];
+        let rs = suite.execute_query_str("select * from t3 inner join t4 on(t3.name = t4.name)", &suite.arena)?;
+        SqlSuite::assert_rows(&data, rs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn inner_join_with_index_nested_loop_join() -> Result<()> {
+        let suite = SqlSuite::new("tests/db119")?;
+        suite.execute_file(Path::new("testdata/t3_t4_small_data_for_join.sql"), &suite.arena)?;
+
+        let data = [
+            "(1, 100, \"Js\", 1, 101, \"Js\")",
+            "(2, 101, \"Jc\", 2, 101, \"Jc\")",
+            "(3, 102, \"Jk\", 3, 102, \"Jk\")",
+        ];
+        let rs = suite.execute_query_str("select * from t3 inner join t4 on(t3.id = t4.id)", &suite.arena)?;
+        SqlSuite::assert_rows(&data, rs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn left_outer_join_use_pk() -> Result<()> {
+        let suite = SqlSuite::new("tests/db120")?;
+        suite.execute_file(Path::new("testdata/t3_t4_small_data_for_join.sql"), &suite.arena)?;
+
+        let data = [
+            "(1, 100, \"Js\", 1, 101, \"Js\")",
+            "(2, 101, \"Jc\", 2, 101, \"Jc\")",
+            "(3, 102, \"Jk\", 3, 102, \"Jk\")",
+            "(4, 102, \"Ol\", NULL, NULL, NULL)",
+        ];
+        let rs = suite.execute_query_str("select * from t3 left join t4 on(t3.id = t4.id)", &suite.arena)?;
+        SqlSuite::assert_rows(&data, rs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn inner_join_use_key() -> Result<()> {
+        let suite = SqlSuite::new("tests/db121")?;
+        suite.execute_file(Path::new("testdata/t3_t4_small_data_for_join.sql"), &suite.arena)?;
+
+        let rs = suite.execute_query_str("select * from t4", &suite.arena)?;
+        SqlSuite::print_rows(rs)?;
+
+        let rs = suite.execute_query_str("select * from t3 inner join t4 on(t3.dd = t4.df)", &suite.arena)?;
+        SqlSuite::print_rows(rs)?;
         Ok(())
     }
 }

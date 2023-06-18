@@ -1194,6 +1194,10 @@ impl IndexNestedLoopJoinOps {
             let iter_box = self.iter.as_ref().unwrap().clone();
             let iter = iter_box.borrow();
             let arena = zone.get_mut();
+            // if iter.valid() {
+            //     dbg!(iter.key());
+            //     dbg!(&self.matching_key.borrow());
+            // }
             if iter.valid() && iter.key().starts_with(&self.matching_key.borrow()) {
                 Some(DB::decode_tuple(&self.driving_columns, &self.driving_vals, &arena))
             } else {
@@ -1300,14 +1304,28 @@ impl IndexNestedLoopJoinOps {
 
     fn next_matching_tuple_indirectly(&self, key_prefix: &[u8], columns: &ArenaBox<ColumnSet>,
                                       iter: &mut dyn storage::Iterator, arena: &ArenaMut<Arena>) -> Result<Tuple> {
+        if key_prefix.is_empty() {
+            return Err(Status::NotFound);
+        }
+        if iter.valid() && !iter.key().starts_with(key_prefix) {
+            return Err(Status::NotFound);
+        }
+
         let storage = self.storage.as_ref().unwrap();
         let cf = self.cf.as_ref().unwrap();
         let mut rd_opts = ReadOptions::default();
         rd_opts.snapshot = self.snapshot.clone();
 
-        if iter.valid() && iter.key().starts_with(&key_prefix) {
+        if iter.valid() && iter.key().starts_with(key_prefix) {
             let iter_pk_box = storage.new_iterator(&rd_opts, cf)?;
             let mut iter_pk = iter_pk_box.borrow_mut();
+            iter_pk.seek(iter.value());
+            if !iter.valid() {
+                return Err(Status::NotFound);
+            }
+            if iter.status().is_not_ok() {
+                return Err(iter.status().clone());
+            }
             return match self.next_matching_tuple_directly(iter.value(), columns, iter_pk.deref_mut(), arena) {
                 Err(e) => Err(e),
                 Ok(tuple) => {
@@ -1321,10 +1339,16 @@ impl IndexNestedLoopJoinOps {
 
     fn next_matching_tuple_directly(&self, key_prefix: &[u8], columns: &ArenaBox<ColumnSet>,
                                     iter: &mut dyn storage::Iterator, arena: &ArenaMut<Arena>) -> Result<Tuple> {
+        if key_prefix.is_empty() {
+            return Err(Status::NotFound);
+        }
+        if iter.valid() && !iter.key().starts_with(key_prefix) {
+            return Err(Status::NotFound);
+        }
         let mut tuple = Tuple::with_filling(&columns, |_| { Value::Null }, arena.get_mut());
 
         let mut prev_row_key = arena_vec!(arena);
-        while iter.valid() && iter.key().starts_with(&key_prefix) {
+        while iter.valid() && iter.key().starts_with(key_prefix) {
             let row_key = &iter.key()[..iter.key().len() - DB::COL_ID_LEN];
             if prev_row_key.is_empty() {
                 (&mut prev_row_key).write(row_key).unwrap();
@@ -1342,12 +1366,12 @@ impl IndexNestedLoopJoinOps {
                 return Ok(tuple);
             }
             iter.move_next();
-            if iter.status().is_not_ok() {
-                return Err(iter.status().clone());
-            }
         }
-
-        Err(Status::NotFound)
+        if iter.status().is_not_ok() && !iter.status().is_not_found() {
+            Err(iter.status().clone())
+        } else {
+            Ok(tuple)
+        }
     }
 
     fn merge_tuples(&self, drive: Tuple, match_: Tuple, arena: &ArenaMut<Arena>) -> Tuple {
@@ -1362,7 +1386,15 @@ impl IndexNestedLoopJoinOps {
     }
 
     fn merge_left_half(&self, drive: Tuple, arena: &ArenaMut<Arena>) -> Tuple {
-        todo!()
+        let mut tuple = Tuple::new(&self.projected_columns, arena.get_mut());
+        debug_assert!(drive.len() < tuple.len());
+        for i in 0..drive.len() {
+            tuple.set(i, drive[i].dup(arena));
+        }
+        for i in drive.len()..tuple.len() {
+            tuple.set(i, Value::Null);
+        }
+        tuple
     }
 
     fn merge_right_half(&self, drive: Tuple, arena: &ArenaMut<Arena>) -> Tuple {
