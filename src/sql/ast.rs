@@ -2,8 +2,10 @@ use std::any::Any;
 use std::fmt::{Display, Formatter};
 use std::ptr::{addr_of, addr_of_mut, NonNull};
 use std::slice;
+
 use num_enum::TryFromPrimitive;
-use crate::base::{Arena, ArenaStr, ArenaVec, ArenaBox, ArenaMut};
+
+use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::sql::lexer::Token;
 
 macro_rules! ast_nodes_impl {
@@ -772,6 +774,7 @@ impl From<ArenaBox<dyn Statement>> for ArenaBox<dyn Relation> {
 
 pub mod utils {
     use std::ptr;
+
     use crate::ArenaBox;
     use crate::sql::ast::Expression;
 
@@ -785,13 +788,12 @@ pub mod utils {
 #[cfg(test)]
 mod tests {
     use std::ops::DerefMut;
-    use std::ptr::NonNull;
     use crate::sql::serialize::serialize_expr_to_string;
     use super::*;
 
     #[test]
     fn sanity() {
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_ref();
         let factory = Factory::new(&arena.get_mut());
         let name = factory.str("a");
         let mut node = factory.new_create_table(name, false);

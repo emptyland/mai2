@@ -1,11 +1,8 @@
-use std::{cmp, slice};
-use std::alloc::{alloc, Layout};
-use std::cell::RefCell;
-use std::io::Write;
+use std::cmp;
+use std::alloc::Layout;
 use std::mem::{align_of, size_of};
 use std::ops::DerefMut;
 use std::ptr::{NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use rand::prelude::*;
@@ -342,7 +339,7 @@ mod tests {
 
     #[test]
     fn sanity() {
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_ref();
         let key = KeyBundle::from_key_value(arena.get_mut().deref_mut(), 1,
                                             "111".as_bytes(), "a".as_bytes());
         let cmp = KeyComparator {};
@@ -352,7 +349,7 @@ mod tests {
 
     #[test]
     fn insert_keys() {
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_ref();
         let cmp = KeyComparator {};
         let mut map = SkipList::new(arena.get_mut(), cmp);
 
@@ -386,7 +383,7 @@ mod tests {
 
     #[test]
     fn iterate() {
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_ref();
         let cmp = IntComparator {};
         let map = SkipList::new(arena.get_mut(), cmp);
         map.insert(&1);
@@ -404,7 +401,7 @@ mod tests {
 
     #[test]
     fn iterate_more() {
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_ref();
         let cmp = IntComparator {};
         let map = SkipList::new(arena.get_mut(), cmp);
         for i in 0..100 {
@@ -424,7 +421,7 @@ mod tests {
 
     #[test]
     fn rust_iter() {
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_ref();
         let cmp = IntComparator {};
         let mut map = SkipList::new(arena.get_mut(), cmp);
         for i in 0..100 {

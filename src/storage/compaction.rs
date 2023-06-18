@@ -1,16 +1,15 @@
-use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::storage::{config, key};
+use crate::base::Logger;
+use crate::storage::config;
+use crate::storage::{Iterator, IteratorRc, MergingIterator};
 use crate::storage::cache::TableCache;
 use crate::storage::column_family::ColumnFamilyImpl;
 use crate::storage::Comparator;
-use crate::storage::{Iterator, IteratorRc, MergingIterator};
 use crate::storage::key::{InternalKey, InternalKeyComparator, MAX_SEQUENCE_NUMBER, Tag};
-use crate::base::Logger;
 use crate::storage::memory_table::MemoryTable;
 use crate::storage::sst_builder::SSTBuilder;
 use crate::storage::version::{FileMetadata, Version, VersionPatch};

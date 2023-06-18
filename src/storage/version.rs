@@ -2,8 +2,6 @@ use std::{array, io};
 use std::cell::RefCell;
 use std::cmp::{max, Ordering};
 use std::collections::{BTreeSet, HashMap};
-use std::fs::{File, read};
-use std::io::Read;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
@@ -13,19 +11,19 @@ use num_enum::TryFromPrimitive;
 use patch::CFCreation;
 use patch::FileCreation;
 
+use crate::{log_warn, Result};
+use crate::base::{Decoder, Logger, VarintDecode, VarintEncode};
 use crate::storage::{config, files, wal};
+use crate::storage::{Env, WritableFile};
+use crate::storage::{ColumnFamilyOptions, Options, PinnableValue, ReadOptions};
 use crate::storage::cache::TableCache;
 use crate::storage::column_family::{ColumnFamilyImpl, ColumnFamilySet};
 use crate::storage::Comparator;
 use crate::storage::config::max_size_for_level;
-use crate::storage::{Env, WritableFile};
 use crate::storage::key::{InternalKey, InternalKeyComparator, Tag};
-use crate::storage::{ColumnFamilyOptions, Options, PinnableValue, ReadOptions};
-use crate::base::{Logger, Decoder, VarintDecode, VarintEncode};
 use crate::storage::Status;
 use crate::storage::Status::NotFound;
 use crate::storage::wal::{LogReader, LogWriter};
-use crate::{log_warn, Result};
 
 pub struct VersionSet {
     env: Arc<dyn Env>,
@@ -390,9 +388,7 @@ pub struct FileMetadata {
 }
 
 mod patch {
-    use std::io::Write;
     use std::mem::size_of;
-    use std::slice;
     use std::sync::Arc;
 
     use num_enum::TryFromPrimitive;
@@ -1016,8 +1012,6 @@ impl VersionBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use super::*;
 
     #[test]

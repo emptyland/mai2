@@ -43,13 +43,13 @@ pub fn rs_hash(input: &[u8]) -> u32 {
 
 pub fn elf_hash(input: &[u8]) -> u32 {
     let mut hash = Wrapping(0);
-    let mut x = Wrapping(0);
+    let mut _x = Wrapping(0);
     for c in input {
         hash = (hash << 4) + Wrapping(*c as u32);
-        x = hash & Wrapping(0xF0000000);
-        if x != Wrapping(0) {
-            hash ^= x >> 24;
-            hash &= !x;
+        _x = hash & Wrapping(0xF0000000);
+        if _x != Wrapping(0) {
+            hash ^= _x >> 24;
+            hash &= !_x;
         }
     }
     hash.0

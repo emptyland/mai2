@@ -14,26 +14,26 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 
-use crate::storage::{config, storage, wal, files};
 use crate::{corrupted_err, log_debug, log_error, log_info};
+use crate::base::Logger;
+use crate::Result;
+use crate::storage::{config, files, wal};
+use crate::storage::{Env, WritableFile};
+use crate::storage::{DBIterator, Iterator as MaiIterator, IteratorArc, IteratorRc, MergingIterator};
+use crate::storage::{Corrupting, Status};
 use crate::storage::cache::TableCache;
 use crate::storage::column_family::{ColumnFamilyHandle, ColumnFamilyImpl, ColumnFamilySet};
 use crate::storage::compaction::{Compact, Compaction};
 use crate::storage::comparator::Comparator;
-use crate::storage::{Env, WritableFile};
 use crate::storage::files::{Kind, paths};
-use crate::storage::{DBIterator, Iterator as MaiIterator, IteratorArc, IteratorRc, MergingIterator};
 use crate::storage::key::Tag;
-use crate::base::Logger;
-use crate::storage::storage::*;
 use crate::storage::memory_table::MemoryTable;
 use crate::storage::snapshot::{SnapshotImpl, SnapshotSet};
 use crate::storage::sst_builder::SSTBuilder;
 use crate::storage::sst_reader::SSTReader;
-use crate::storage::{Corrupting, Status};
+use crate::storage::storage::*;
 use crate::storage::version::{FileMetadata, Version, VersionPatch, VersionSet};
 use crate::storage::wal::{LogReader, LogWriter};
-use crate::Result;
 
 pub struct DBImpl {
     pub db_name: String,
@@ -129,8 +129,7 @@ impl DBImpl {
         let cfi = column_families.borrow().default_column_family();
         db.default_column_family = Some(ColumnFamilyHandle::new(&cfi, &versions));
 
-        #[cfg(test)]
-        {
+        if cfg!(test) {
             log_debug!(logger, "----------");
             let borrowed_cfs = column_families.borrow();
             for cfi in borrowed_cfs.column_family_impls() {
@@ -360,7 +359,7 @@ impl DBImpl {
         let mut update_sequence_number = 0;
         let mut reader = LogReader::new(file, true, wal::DEFAULT_BLOCK_SIZE);
         loop {
-            let mut record = from_io_result(reader.read())?;
+            let record = from_io_result(reader.read())?;
             if record.is_empty() {
                 break;
             }

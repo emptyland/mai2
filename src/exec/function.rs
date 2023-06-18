@@ -1,7 +1,6 @@
 use std::any::Any;
 use std::collections::HashMap;
-use std::ptr;
-use std::ptr::{addr_of, addr_of_mut};
+
 use crate::{Corrupting, Result, Status, utils};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaVec};
 use crate::exec::db::ColumnType;
@@ -121,6 +120,7 @@ macro_rules! pure_udaf_def {
 
 mod udf {
     use crate::base::ArenaStr;
+
     use super::*;
 
     pure_udf_impl!(Version, ["()->str"], _args, arena, {
@@ -151,8 +151,10 @@ mod udf {
 
 mod udaf {
     use std::ops::Deref;
+
     use crate::corrupted_err;
     use crate::exec::evaluator::Evaluator;
+
     use super::*;
 
     pure_udaf_def!(Count);

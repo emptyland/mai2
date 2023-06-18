@@ -1,15 +1,14 @@
 use std::cell::RefCell;
 use std::io;
-use std::io::ErrorKind::UnexpectedEof;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crc::{Crc, CRC_32_ISCSI};
 use num_enum::TryFromPrimitive;
-use crate::base;
 
-use crate::storage::{SequentialFile, WritableFile};
+use crate::base;
 use crate::base::FileReader;
+use crate::storage::{SequentialFile, WritableFile};
 
 #[repr(u32)]
 #[derive(PartialEq, Debug, Clone, Copy, TryFromPrimitive)]
@@ -218,11 +217,7 @@ impl LogReader {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::path::PathBuf;
-
-    use crate::storage::{Env, EnvImpl, MemorySequentialFile, MemoryWritableFile, WritableFile};
-    use crate::storage::version::VersionPatch;
-
+    use crate::storage::{MemorySequentialFile, MemoryWritableFile, WritableFile};
     use super::*;
 
     #[test]

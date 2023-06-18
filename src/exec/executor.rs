@@ -5,23 +5,23 @@ use std::fmt::{Display, Formatter};
 use std::intrinsics::copy_nonoverlapping;
 use std::io::{Read, Write};
 use std::iter::repeat;
-use std::ops::{AddAssign, DerefMut, Index};
 use std::mem;
+use std::ops::{AddAssign, DerefMut, Index};
 use std::ptr::{addr_of, NonNull, slice_from_raw_parts_mut};
 use std::sync::{Arc, MutexGuard, Weak};
 
-use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
-use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata};
-use crate::exec::{from_sql_result, function};
-use crate::sql::ast::*;
-use crate::sql::parser::Parser;
 use crate::{corrupted, Corrupting, Result, Status, visit_fatal};
+use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
+use crate::exec::{from_sql_result, function};
 use crate::exec::connection::ResultSet;
+use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata};
 use crate::exec::evaluator::{Context, Evaluator, expr_typing_reduce, Value};
 use crate::exec::function::{ExecutionContext, UDF};
 use crate::exec::physical_plan::{ProjectingOps, ReturningOneDummyOps};
 use crate::exec::planning::PlanMaker;
+use crate::sql::ast::*;
 use crate::sql::lexer::Token;
+use crate::sql::parser::Parser;
 use crate::sql::serialize::serialize_yaml_to_string;
 
 pub struct Executor {

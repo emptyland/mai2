@@ -1,3 +1,17 @@
+#![allow(unused_variables)]
+#![allow(dead_code)]
+
+use std::sync::Arc;
+
+pub use comparator::*;
+pub use env::*;
+pub use iterator::*;
+
+pub use crate::status::*;
+use crate::storage::db::DBImpl;
+
+pub use self::storage::*;
+
 mod key;
 mod skip_list;
 mod db;
@@ -18,14 +32,6 @@ pub mod storage;
 pub mod comparator;
 pub mod iterator;
 pub mod config;
-
-use std::sync::Arc;
-pub use env::*;
-pub use self::storage::*;
-pub use crate::status::*;
-pub use comparator::*;
-pub use iterator::*;
-use crate::storage::db::DBImpl;
 
 pub type Result<T> = std::result::Result<T, Status>;
 

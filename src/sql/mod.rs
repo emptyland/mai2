@@ -1,5 +1,9 @@
+#![allow(unused_variables)]
+#![allow(dead_code)]
+
 use std::io;
-use crate::{Arena, ArenaBox, ArenaMut, Corrupting, SliceReadWrapper, Status, utils};
+
+use crate::{Arena, ArenaBox, ArenaMut, Corrupting, Status, utils};
 use crate::sql::ast::Expression;
 use crate::sql::parser::parse_sql_expr;
 

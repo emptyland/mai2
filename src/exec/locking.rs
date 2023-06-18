@@ -5,9 +5,10 @@ use std::num::Wrapping;
 use std::ops::DerefMut;
 use std::ptr;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicI16, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::thread::yield_now;
+
 use crate::base::{Allocator, Arena, utils};
 
 pub struct LockingManagement {

@@ -4,8 +4,8 @@ use std::io::Write;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::storage::{RandomAccessFile, SequentialFile, WritableFile};
 use crate::base::varint::{Varint, zig_zag32_encode};
+use crate::storage::{RandomAccessFile, SequentialFile, WritableFile};
 
 pub trait VarintEncode<T: Sized> {
     fn write_to(&self, buf: &mut Vec<u8>) -> usize;

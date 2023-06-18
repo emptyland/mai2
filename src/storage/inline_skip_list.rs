@@ -1,17 +1,14 @@
 use std::{cmp, slice};
 use std::alloc::Layout;
-use std::cell::RefCell;
 use std::io::Write;
 use std::mem::size_of;
-use std::ops::DerefMut;
 use std::ptr::NonNull;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use rand::random;
 
 use crate::base::{Allocator, Arena, ArenaMut};
-use crate::storage::key::{InternalKey, Tag, TAG_SIZE};
+use crate::storage::key::{Tag, TAG_SIZE};
 use crate::storage::skip_list::{BRANCHING, Comparing, MAX_HEIGHT};
 
 pub struct InlineSkipList<'a, Cmp> {
@@ -362,7 +359,7 @@ impl<'a, Cmp: for<'b> Comparing<&'b [u8]>> Iterator for IteratorImpl<'a, Cmp> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.node {
-            Some(node_ptr) => unsafe {
+            Some(node_ptr) => {
                 IteratorImpl::next(self);
                 Some(InlineNode::key(node_ptr.as_ptr()).to_vec())
             }
@@ -373,6 +370,7 @@ impl<'a, Cmp: for<'b> Comparing<&'b [u8]>> Iterator for IteratorImpl<'a, Cmp> {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
     use crate::storage::{BitwiseComparator, Comparator};
     use crate::storage::key::{InternalKey, InternalKeyComparator};
 
@@ -390,7 +388,7 @@ mod tests {
 
     #[test]
     fn sanity() {
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_ref();
         let map = InlineSkipList::new(arena.get_mut(), new_key_cmp());
         map.insert_key_value(1, "111".as_bytes(), "aaaaa".as_bytes());
         map.insert_key_value(2, "111".as_bytes(), "bbbbb".as_bytes());

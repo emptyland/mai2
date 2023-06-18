@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::ops::DerefMut;
+
 use crate::base::ArenaStr;
 use crate::sql::ast::*;
 
@@ -173,7 +174,7 @@ impl Visitor for YamlWriter<'_> {
         }
     }
 
-    fn visit_collection(&mut self, this: &mut Collection) {
+    fn visit_collection(&mut self, _this: &mut Collection) {
         todo!()
     }
 
@@ -302,11 +303,11 @@ impl Visitor for YamlWriter<'_> {
         }
     }
 
-    fn visit_in_literal_set(&mut self, this: &mut InLiteralSet) {
+    fn visit_in_literal_set(&mut self, _this: &mut InLiteralSet) {
         todo!()
     }
 
-    fn visit_in_relation(&mut self, this: &mut InRelation) {
+    fn visit_in_relation(&mut self, _this: &mut InRelation) {
         todo!()
     }
 
@@ -355,8 +356,9 @@ impl Visitor for YamlWriter<'_> {
 #[cfg(test)]
 mod tests {
     use crate::base::Arena;
-    use super::*;
     use crate::storage::MemoryWritableFile;
+
+    use super::*;
 
     #[test]
     fn sanity() {

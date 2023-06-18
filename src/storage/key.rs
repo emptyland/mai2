@@ -7,8 +7,8 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::slice;
 
-use crate::base::{Allocator};
-use crate::storage::{BitwiseComparator, Comparator};
+use crate::base::Allocator;
+use crate::storage::Comparator;
 
 #[derive(Copy)]
 pub struct KeyBundle {
@@ -315,6 +315,7 @@ impl Comparator for InternalKeyComparator {
 #[cfg(test)]
 mod tests {
     use crate::base::Arena;
+    use crate::storage::BitwiseComparator;
     use super::*;
 
     #[test]

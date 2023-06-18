@@ -21,7 +21,7 @@ pub trait Comparator {
 
     fn name(&self) -> String;
 
-    fn find_shortest_separator(&self, limit: &[u8]) -> Vec<u8> {
+    fn find_shortest_separator(&self, _limit: &[u8]) -> Vec<u8> {
         todo!()
     }
 

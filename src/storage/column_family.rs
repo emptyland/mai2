@@ -1,29 +1,28 @@
-use std::{array, io, iter};
+use std::{array, io};
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::cmp::max;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::storage::{config, files, storage};
+use crate::base::queue::NonBlockingQueue;
+use crate::Result;
+use crate::storage::{config, files};
+use crate::storage::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, ReadOptions};
 use crate::storage::cache::TableCache;
 use crate::storage::compaction::Compact;
 use crate::storage::comparator::Comparator;
 use crate::storage::Env;
 use crate::storage::IteratorRc;
 use crate::storage::key::InternalKeyComparator;
-use crate::storage::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, ReadOptions};
 use crate::storage::memory_table::MemoryTable;
-use crate::base::queue::NonBlockingQueue;
 use crate::storage::sst_reader::SSTReader;
 use crate::storage::Status;
 use crate::storage::version::{FileMetadata, Version, VersionSet};
-use crate::Result;
 
 pub struct ColumnFamilyImpl {
     name: String,
@@ -110,7 +109,7 @@ impl ColumnFamilyImpl {
         assert!(self.dropped());
 
         let work_path = self.get_work_path(env);
-        let owns = self.owns.upgrade().unwrap();
+        //let owns = self.owns.upgrade().unwrap();
         env.delete_file(work_path.as_path(), true)?;
         self.initialized.set(false);
         Ok(())

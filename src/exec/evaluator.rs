@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
-use std::ops::{Add, DerefMut, Sub, Mul};
+use std::ops::{Add, DerefMut, Mul, Sub};
 use std::str::FromStr;
 use std::sync::Arc;
+
 use crate::{Corrupting, Result, Status, try_eval};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::ColumnType;
@@ -412,11 +413,11 @@ impl Visitor for Evaluator {
         }
     }
 
-    fn visit_in_literal_set(&mut self, this: &mut InLiteralSet) {
+    fn visit_in_literal_set(&mut self, _this: &mut InLiteralSet) {
         todo!()
     }
 
-    fn visit_in_relation(&mut self, this: &mut InRelation) {
+    fn visit_in_relation(&mut self, _this: &mut InRelation) {
         todo!()
     }
 
@@ -458,7 +459,7 @@ impl Visitor for Evaluator {
         self.ret(Value::Str(this.data.clone()))
     }
 
-    fn visit_null_literal(&mut self, this: &mut Literal<()>) {
+    fn visit_null_literal(&mut self, _this: &mut Literal<()>) {
         self.ret(Value::Null);
     }
 
@@ -609,19 +610,19 @@ impl Visitor for TypingReducer {
         }
     }
 
-    fn visit_int_literal(&mut self, this: &mut Literal<i64>) {
+    fn visit_int_literal(&mut self, _this: &mut Literal<i64>) {
         self.ret(ColumnType::BigInt(11));
     }
 
-    fn visit_float_literal(&mut self, this: &mut Literal<f64>) {
+    fn visit_float_literal(&mut self, _this: &mut Literal<f64>) {
         self.ret(ColumnType::Double(0, 0));
     }
 
-    fn visit_str_literal(&mut self, this: &mut Literal<ArenaStr>) {
+    fn visit_str_literal(&mut self, _this: &mut Literal<ArenaStr>) {
         self.ret(ColumnType::Varchar(255));
     }
 
-    fn visit_null_literal(&mut self, this: &mut Literal<()>) {
+    fn visit_null_literal(&mut self, _this: &mut Literal<()>) {
         self.ret(ColumnType::Varchar(255));
     }
 

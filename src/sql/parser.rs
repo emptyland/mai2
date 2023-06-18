@@ -1,6 +1,7 @@
 use std::io::Read;
-use crate::{Arena, ArenaMut, Status};
-use crate::base::{ArenaVec, ArenaBox, ArenaStr};
+
+use crate::{Arena, ArenaMut};
+use crate::base::{ArenaBox, ArenaStr, ArenaVec};
 use crate::sql::{from_parsing_result, ParseError, Result, SourceLocation, SourcePosition};
 use crate::sql::ast::*;
 use crate::sql::lexer::{Lexer, Token, TokenPart};
@@ -122,7 +123,8 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
         }
 
         // primary key (id, id, ...)
-        if self.test(Token::Primary)? {
+        if self.test(Token::Constraint)? {
+            self.match_expected(Token::Primary)?;
             self.match_expected(Token::Key)?;
             self.match_expected(Token::LParent)?;
             loop {
@@ -198,12 +200,14 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
         }
 
         let default_val = if self.test(Token::Default)? {
+            // default <expr>
             Some(self.parse_expr()?)
         } else {
             None
         };
 
         let is_primary_key = if self.test(Token::Primary)? {
+            // primary key
             self.match_expected(Token::Key)?;
             true
         } else {
@@ -681,14 +685,14 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::ops::DerefMut;
-    use std::rc::Rc;
+
     use crate::base::{Arena, ArenaMut};
-    use crate::storage::MemorySequentialFile;
-    use super::*;
     use crate::sql::ast::Factory;
     use crate::sql::serialize::serialize_yaml_to_string;
+    use crate::storage::MemorySequentialFile;
+
+    use super::*;
 
     #[test]
     fn sanity() -> Result<()> {

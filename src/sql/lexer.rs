@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::ops::DerefMut;
 use std::str::FromStr;
+
 use crate::base::{Arena, ArenaMut, ArenaStr};
 use crate::sql::{from_io_result, ParseError, Result};
 use crate::sql::{SourceLocation, SourcePosition};
@@ -12,7 +13,7 @@ pub struct TokenPart {
     pub location: SourceLocation,
 }
 
-#[warn(non_camel_case_types)]
+#[allow(non_camel_case_types)]
 #[derive(Debug, Default, PartialEq, Clone)]
 pub enum Token {
     #[default]
@@ -31,6 +32,7 @@ pub enum Token {
     Not,
     Exists,
     Null,
+    Constraint,
     Primary,
     Key,
     Default,
@@ -90,23 +92,17 @@ pub enum Token {
     Le,
     Gt,
     Ge,
-    LBrace,
-    RBrace,
-    LBracket,
-    // [
-    RBracket,
-    // ]
-    LParent,
-    // (
-    RParent,
-    // )
-    Comma,
-    // ;
-    Semi,
-    // .
-    Dot,
-    // ?
-    Question,
+    LBrace, // {
+    RBrace, // }
+    LBracket, // [
+    RBracket, // ]
+    LParent, // (
+    RParent, // )
+    Comma, // ,
+    Semi, // ;
+    Dot, // .
+
+    Question, // ?
 }
 
 unsafe impl Sync for Token {}
@@ -138,6 +134,7 @@ impl Keywords {
                 Not,
                 Exists,
                 Null,
+                Constraint,
                 Primary,
                 Key,
                 Default,
@@ -457,11 +454,12 @@ impl<'a, R: Read + ?Sized> Lexer<'a, R> {
 #[cfg(test)]
 mod tests {
     use crate::storage::MemorySequentialFile;
+
     use super::*;
 
     #[test]
     fn sanity() -> Result<()> {
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_ref();
         let txt = Vec::from("id");
         let mut file = MemorySequentialFile::new(txt);
         let mut lexer = Lexer::new(&mut file, arena.get_mut());
@@ -474,7 +472,7 @@ mod tests {
 
     #[test]
     fn numbers() -> Result<()> {
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_ref();
         let txt = Vec::from("0 1 1000 0.111");
         let mut file = MemorySequentialFile::new(txt);
         let mut lexer = Lexer::new(&mut file, arena.get_mut());
@@ -494,7 +492,7 @@ mod tests {
 
     #[test]
     fn strings() -> Result<()> {
-        let mut arena = Arena::new_ref();
+        let arena = Arena::new_ref();
         let txt = Vec::from("\"\" \'\' \'a\'");
         let mut file = MemorySequentialFile::new(txt);
         let mut lexer = Lexer::new(&mut file, arena.get_mut());

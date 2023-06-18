@@ -8,14 +8,14 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::storage::cache::Block;
+use crate::{Corrupting, Result, Status};
+use crate::base::{Decoder, Logger, VarintDecode, VarintEncode, WriterLogger};
 use crate::storage::{BitwiseComparator, Comparator};
 use crate::storage::{Env, EnvImpl};
+use crate::storage::cache::Block;
 use crate::storage::IteratorArc;
 use crate::storage::key::Tag;
-use crate::base::{Logger, WriterLogger, Decoder, VarintDecode, VarintEncode};
 use crate::storage::memory_table::MemoryTable;
-use crate::{Result, Corrupting, Status};
 
 pub const DEFAULT_COLUMN_FAMILY_NAME: &str = "default";
 

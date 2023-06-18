@@ -3,17 +3,17 @@ use std::cell::RefCell;
 use std::cmp::min;
 use std::io::Write;
 use std::mem::{replace, size_of, size_of_val};
-use std::ptr::{addr_of, slice_from_raw_parts};
+use std::ptr::addr_of;
 use std::sync::Arc;
 
 use crc::{Crc, CRC_32_ISCSI};
 
 use crate::base;
-use crate::storage::config;
-use crate::storage::Comparator;
-use crate::storage::WritableFile;
-use crate::storage::key::{InternalKey, InternalKeyComparator};
 use crate::base::{Decoder, FileWriter, FixedEncode, VarintDecode, VarintEncode};
+use crate::storage::Comparator;
+use crate::storage::config;
+use crate::storage::key::{InternalKey, InternalKeyComparator};
+use crate::storage::WritableFile;
 
 pub const SST_MAGIC_NUMBER: u32 = 0x74737300;
 
@@ -427,11 +427,11 @@ impl FilterBlockBuilder {
 pub mod tests {
     use std::rc::Rc;
 
+    use crate::base::*;
     use crate::base::Arena;
     use crate::storage::BitwiseComparator;
-    use crate::storage::MemoryWritableFile;
     use crate::storage::key::KeyBundle;
-    use crate::base::*;
+    use crate::storage::MemoryWritableFile;
 
     use super::*;
 

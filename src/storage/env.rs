@@ -476,7 +476,6 @@ impl Drop for JunkFilesCleaner {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::env;
 
     use super::*;

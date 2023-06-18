@@ -4,11 +4,12 @@ use std::io::Read;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Weak;
+
+use crate::{Result, Status, utils};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaVec};
 use crate::exec::db::{ColumnType, DB};
 use crate::exec::executor::{ColumnSet, Executor, PreparedStatement, Tuple};
 use crate::exec::physical_plan::{EmptyOps, Feedback, PhysicalPlanOps};
-use crate::{Result, Status, utils};
 use crate::storage::{config, from_io_result};
 
 pub struct Connection {

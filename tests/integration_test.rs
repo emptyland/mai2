@@ -1,7 +1,8 @@
 use std::path::Path;
+
+use mai2::{Arena, Result};
 use mai2::exec::db::DB;
 use mai2::storage::JunkFilesCleaner;
-use mai2::{Arena, Result, Status};
 
 #[test]
 fn sql_create_table_and_insert() -> Result<()> {

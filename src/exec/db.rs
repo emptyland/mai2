@@ -7,18 +7,18 @@ use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
-use rusty_pool::ThreadPool;
-use serde_yaml::to_string;
 
-use crate::exec::connection::Connection;
-use crate::{ArenaVec, Corrupting, log_debug, Status, storage, visit_fatal};
+use rusty_pool::ThreadPool;
+
+use crate::{Corrupting, log_debug, Status, storage};
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, Logger};
-use crate::exec::db::ColumnType::Varchar;
+use crate::exec::connection::Connection;
 use crate::exec::evaluator::Value;
 use crate::exec::executor::{ColumnSet, SecondaryIndexBundle, Tuple};
 use crate::exec::locking::{LockingInstance, LockingManagement};
-use crate::storage::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME, Env, from_io_result, Options, ReadOptions, WriteBatch, WriteOptions};
 use crate::Result;
+use crate::storage::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME, Env,
+                     from_io_result, Options, ReadOptions, WriteBatch, WriteOptions};
 use crate::storage::config::MB;
 
 pub struct DB {
@@ -1201,7 +1201,7 @@ pub struct ColumnMetadata {
     pub default_value: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ColumnType {
     TinyInt(u32),
     SmallInt(u32),
@@ -1277,9 +1277,11 @@ pub struct SecondaryIndexMetadata {
 
 #[cfg(test)]
 mod tests {
+    use crate::ArenaVec;
     use crate::base::Arena;
-    use super::*;
     use crate::storage::JunkFilesCleaner;
+
+    use super::*;
 
     #[test]
     fn sanity() -> Result<()> {

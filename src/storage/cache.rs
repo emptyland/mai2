@@ -1,30 +1,28 @@
 use std::{io, iter, slice};
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
-use std::fmt::Error;
 use std::hash::Hash;
 use std::io::Write;
 use std::mem::{size_of, size_of_val};
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::ptr::{addr_of, addr_of_mut, NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};
+use std::ptr::{addr_of, NonNull, slice_from_raw_parts_mut};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crc::{Crc, CRC_32_ISCSI};
 use lru::LruCache;
 
-use crate::storage::column_family::ColumnFamilyImpl;
+use crate::base::{Decoder, FixedDecode, VarintDecode};
+use crate::base::varint::MAX_VARINT32_LEN;
 use crate::storage::{Env, RandomAccessFile};
-use crate::storage::key::Tag;
 use crate::storage;
 use crate::storage::{from_io_result, PinnableValue, ReadOptions};
-use crate::base::{Decoder, FixedDecode, VarintDecode};
-use crate::storage::sst_builder::{BlockHandle, TableProperties};
-use crate::storage::sst_reader::{KeyBloomFilter, SSTReader};
-use crate::base::varint::MAX_VARINT32_LEN;
+use crate::storage::column_family::ColumnFamilyImpl;
+use crate::storage::key::Tag;
+use crate::storage::sst_reader::SSTReader;
 
 pub struct TableCache {
     abs_db_path: PathBuf,

@@ -1,3 +1,8 @@
+#![allow(unused_variables)]
+#![allow(dead_code)]
+
+pub use executor::ColumnSet;
+
 use crate::{Corrupting, sql, Status};
 
 pub mod db;

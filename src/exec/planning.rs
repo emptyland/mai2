@@ -3,9 +3,8 @@ use std::mem::replace;
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::task::ready;
-use crate::sql::ast::*;
-use crate::{arena_vec, break_visit, corrupted, corrupted_err, Corrupting, Result, Status, switch, try_visit, visit_fatal};
+
+use crate::{arena_vec, break_visit, corrupted_err, Corrupting, Result, Status, switch, try_visit, visit_fatal};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::{ColumnType, DB, TableHandle, TableRef};
 use crate::exec::evaluator::{Evaluator, TypingReducer, Value};
@@ -13,7 +12,7 @@ use crate::exec::executor::{ColumnSet, PreparedStatement, TypingStubContext, Uni
 use crate::exec::function;
 use crate::exec::function::{Aggregator, ExecutionContext};
 use crate::exec::physical_plan::{AggregatorBundle, DistinctOps, FilteringOps, GroupingAggregatorOps, MergingOps, PhysicalPlanOps, ProjectingOps, RangeScanOps, SimpleNestedLoopJoinOps};
-
+use crate::sql::ast::*;
 
 pub struct PlanMaker {
     db: Arc<DB>,
@@ -1326,6 +1325,21 @@ struct PhysicalJoinConditionAnalyzer {
     rs: Status,
 }
 
+struct JoinExplainedVal {
+    matching_key_bundle: ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>,
+    filtering: Option<ArenaBox<dyn Expression>>,
+}
+
+impl JoinExplainedVal {
+    fn new(matching_key_bundle: ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>,
+           filtering: Option<ArenaBox<dyn Expression>>) -> Self {
+        Self {
+            matching_key_bundle,
+            filtering
+        }
+    }
+}
+
 #[derive(Clone)]
 struct JoinConditionKeyPart {
     key_id: u64,
@@ -1381,12 +1395,56 @@ impl PhysicalJoinConditionAnalyzer {
 
     fn visit(&mut self, expr: &mut dyn Expression) -> Result<JoinConditionVal> {
         self.analyzed_vals.clear();
+        self.rs = Status::Ok;
         expr.accept(self);
         if self.rs.is_not_ok() {
             Err(self.rs.clone())
         } else {
             Ok(self.analyzed_vals.pop().unwrap())
         }
+    }
+
+    fn explain(&self, val: JoinConditionVal) -> Option<JoinExplainedVal> {
+        // ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>
+        // expr
+        match val {
+            JoinConditionVal::Set(set) => {
+                let mut bundle = arena_vec!(&self.arena);
+                if self.explain_key_parts(set, &mut bundle) {
+                    Some(JoinExplainedVal::new(bundle, None))
+                } else {
+                    None
+                }
+            }
+            JoinConditionVal::And(set, filtering) => {
+                let mut bundle = arena_vec!(&self.arena);
+                if self.explain_key_parts(set, &mut bundle) {
+                    Some(JoinExplainedVal::new(bundle, Some(filtering)))
+                } else {
+                    None
+                }
+            }
+            _ => None
+        }
+    }
+
+    fn explain_key_parts(&self, parts: ArenaVec<JoinConditionKeyPart>,
+                         bundle: &mut ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>) -> bool {
+        debug_assert!(!parts.is_empty());
+        debug_assert!(bundle.is_empty());
+        let key_id = parts.first().unwrap().key_id;
+        let mut order = 0;
+        for part in &parts {
+            if part.key_id != key_id { // different key id
+                return false;
+            }
+            if part.part_of != order { // hole in key parts
+                return false;
+            }
+            bundle.push((part.matching.clone(), part.ty.clone()));
+            order += 1;
+        }
+        true
     }
 
     fn ret(&mut self, value: JoinConditionVal) {
@@ -1834,12 +1892,16 @@ impl Visitor for ProjectionColumnsVisitor {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use crate::exec::db::ColumnType;
     use crate::exec::from_sql_result;
     use crate::sql::ast::*;
     use crate::sql::parser::Parser;
     use crate::sql::serialize::serialize_expr_to_string;
     use crate::storage::{JunkFilesCleaner, MemorySequentialFile};
+    use crate::suite::testing::*;
+
     use super::*;
 
     #[test]
@@ -2093,10 +2155,10 @@ mod tests {
 
     #[test]
     fn physical_selection_analyzing_issue_0() -> Result<()> {
-        let _junk = JunkFilesCleaner::new("tests/db301");
+        let junk = JunkFilesCleaner::new("tests/db301");
         let zone = Arena::new_val();
         let arena = zone.get_mut();
-        let db = DB::open("tests".to_string(), "db301".to_string())?;
+        let db = DB::open(junk.ensure().path, junk.ensure().name)?;
         let conn = db.connect();
         let sql = " create table t1 {\n\
                 a int primary key auto_increment,\n\
@@ -2141,6 +2203,101 @@ mod tests {
         assert_eq!(2, rs[0].segments.len());
         assert_eq!("(-∞,-100]", rs[0].segments[0].to_string());
         assert_eq!("(200,+∞)", rs[0].segments[1].to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn physical_join_analyzing() -> Result<()> {
+        let suite = SqlSuite::new("tests/db302")?;
+        suite.execute_file(Path::new("testdata/t1_t2_t3_small_table_without_data_for_join.sql"), &suite.arena)?;
+        let t1_cols = suite.get_table_cols_set("t1", "");
+        let t2_cols = suite.get_table_cols_set("t2", "");
+        let t2 = suite.db._test_get_table_ref("t2").unwrap();
+
+        let mut join = PhysicalJoinConditionAnalyzer::new(&t1_cols, &t2_cols, &t2, &suite.arena);
+        let mut expr = suite.parse_expr("t1.id = t2.id")?;
+        let rv = join.visit(expr.deref_mut())?;
+        assert!(matches!(rv, JoinConditionVal::Set(_)));
+        let mut set = rv.unwrap_set();
+        assert_eq!(1, set.len());
+        assert_eq!(0, set[0].key_id);
+        assert_eq!(0, set[0].part_of);
+        assert_eq!(1, set[0].total);
+        assert_eq!("FullQualifiedName: t1.id\n", serialize_expr_to_string(set[0].matching.deref_mut()));
+        assert_eq!(ColumnType::BigInt(11), set[0].ty);
+
+        let mut expr = suite.parse_expr("t1.dc = t2.df")?;
+        let rv = join.visit(expr.deref_mut())?;
+        assert!(matches!(rv, JoinConditionVal::Set(_)));
+        let mut set = rv.unwrap_set();
+        assert_eq!(1, set.len());
+        assert_eq!(3, set[0].key_id);
+        assert_eq!(0, set[0].part_of);
+        assert_eq!(1, set[0].total);
+        assert_eq!("FullQualifiedName: t1.dc\n", serialize_expr_to_string(set[0].matching.deref_mut()));
+        assert_eq!(ColumnType::Int(11), set[0].ty);
+
+        let mut expr = suite.parse_expr("t1.dc = t2.df and t1.dd = t2.de")?;
+        let rv = join.visit(expr.deref_mut())?;
+        assert!(matches!(rv, JoinConditionVal::And(_, _)));
+        let (mut set, mut filter) = rv.unwrap_and();
+        assert_eq!(1, set.len());
+        assert_eq!(3, set[0].key_id);
+        assert_eq!(0, set[0].part_of);
+        assert_eq!(1, set[0].total);
+        assert_eq!("FullQualifiedName: t1.dc\n", serialize_expr_to_string(set[0].matching.deref_mut()));
+        //println!("{}", serialize_expr_to_string(filter.deref_mut()));
+        assert_eq!("BinaryExpression:
+  op: Eq(=)
+  lhs:
+    FullQualifiedName: t1.dd
+  rhs:
+    FullQualifiedName: t2.de
+", serialize_expr_to_string(filter.deref_mut()));
+        assert_eq!(ColumnType::Int(11), set[0].ty);
+        Ok(())
+    }
+
+    #[test]
+    fn physical_join_multiple_cols_index_analyzing() -> Result<()> {
+        let suite = SqlSuite::new("tests/db303")?;
+        suite.execute_file(Path::new("testdata/t1_t2_t3_small_table_without_data_for_join.sql"), &suite.arena)?;
+        let t1_cols = suite.get_table_cols_set("t1", "");
+        let t3_cols = suite.get_table_cols_set("t3", "");
+        let t3 = suite.db._test_get_table_ref("t3").unwrap();
+
+        let mut join = PhysicalJoinConditionAnalyzer::new(&t1_cols, &t3_cols, &t3, &suite.arena);
+        let mut expr = suite.parse_expr("t1.id = t3.part1")?;
+        let rv = join.visit(expr.deref_mut())?;
+        assert!(matches!(rv, JoinConditionVal::Set(_)));
+        let mut set = rv.unwrap_set();
+        assert_eq!(1, set.len());
+        assert_eq!(0, set[0].key_id);
+        assert_eq!(0, set[0].part_of);
+        assert_eq!(3, set[0].total);
+        assert_eq!("FullQualifiedName: t1.id\n", serialize_expr_to_string(set[0].matching.deref_mut()));
+        assert_eq!(ColumnType::BigInt(11), set[0].ty);
+
+        let mut expr = suite.parse_expr("t1.id = t3.part1 and t1.dd = t3.part2")?;
+        let rv = join.visit(expr.deref_mut())?;
+        assert!(matches!(rv, JoinConditionVal::Set(_)));
+        let mut set = rv.unwrap_set();
+        assert_eq!(2, set.len());
+        assert_eq!(0, set[0].key_id);
+        assert_eq!(0, set[0].part_of); // key part 1
+        assert_eq!(3, set[0].total);
+        assert_eq!("FullQualifiedName: t1.id\n", serialize_expr_to_string(set[0].matching.deref_mut()));
+        assert_eq!(ColumnType::BigInt(11), set[0].ty);
+        assert_eq!(0, set[1].key_id);
+        assert_eq!(1, set[1].part_of); // key part 2
+        assert_eq!(3, set[1].total);
+        assert_eq!("FullQualifiedName: t1.dd\n", serialize_expr_to_string(set[1].matching.deref_mut()));
+        assert_eq!(ColumnType::Int(11), set[1].ty);
+
+        let rv = join.visit(expr.deref_mut())?;
+        let explained = join.explain(rv).unwrap();
+        assert!(explained.filtering.is_none());
+        assert_eq!(2, explained.matching_key_bundle.len());
         Ok(())
     }
 

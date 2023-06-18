@@ -1,17 +1,16 @@
-use std::cell::{Cell, Ref, RefCell, RefMut};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
-use std::env::args;
-use std::hash::Hasher;
 use std::io::Write;
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+
+use crate::{arena_vec, corrupted_err, Corrupting, Result, Status, storage};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaStr, ArenaVec};
-use crate::exec::executor::{Column, ColumnSet, PreparedStatement, Tuple, UpstreamContext};
-use crate::{corrupted_err, Result, Status, Corrupting, storage, arena_vec};
 use crate::exec::connection::FeedbackImpl;
 use crate::exec::db::{ColumnType, DB};
 use crate::exec::evaluator::{Evaluator, Value};
+use crate::exec::executor::{ColumnSet, PreparedStatement, Tuple, UpstreamContext};
 use crate::exec::function::{Aggregator, Writable};
 use crate::sql::ast::{Expression, JoinOp};
 use crate::storage::{ColumnFamily, ColumnFamilyOptions, config, IteratorArc, ReadOptions, Snapshot, WriteOptions};
@@ -858,6 +857,7 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
         self.child.finalize();
     }
 
+    #[allow(unused_assignments)]
     fn next(&mut self, _feedback: &mut dyn Feedback, _zone: &ArenaRef<Arena>) -> Option<Tuple> {
         let context = self.context.as_ref().cloned().unwrap();
 
@@ -1497,14 +1497,15 @@ impl<T: PhysicalPlanOps + 'static> From<ArenaBox<T>> for ArenaBox<dyn PhysicalPl
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::base::Arena;
     use crate::exec::connection::FeedbackImpl;
     use crate::exec::db::ColumnType;
     use crate::exec::evaluator::Value;
     use crate::sql::parse_sql_expr_from_content;
     use crate::storage;
-    use crate::storage::{JunkFilesCleaner, open_kv_storage, Options, ReadOptions, WriteOptions};
+    use crate::storage::{JunkFilesCleaner, open_kv_storage, Options, WriteOptions};
+
+    use super::*;
 
     #[test]
     fn range_scan_plan() -> Result<()> {
