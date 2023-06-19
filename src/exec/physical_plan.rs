@@ -1398,7 +1398,18 @@ impl IndexNestedLoopJoinOps {
     }
 
     fn merge_right_half(&self, drive: Tuple, arena: &ArenaMut<Arena>) -> Tuple {
-        todo!()
+        let mut tuple = Tuple::new(&self.projected_columns, arena.get_mut());
+        debug_assert!(drive.len() < tuple.len());
+
+        let match_len = tuple.len() - drive.len();
+        for i in 0..match_len {
+            tuple.set(i, Value::Null);
+        }
+        for i in match_len..tuple.len() {
+            tuple.set(i, drive[i - match_len].dup(arena));
+        }
+
+        tuple
     }
 }
 
@@ -1437,7 +1448,13 @@ impl PhysicalPlanOps for IndexNestedLoopJoinOps {
             }
             let drive = rs.unwrap();
             match self.match_tuple(&drive, &arena) {
-                Ok(match_) => break Some(self.merge_tuples(drive, match_, &arena)),
+                Ok(match_) => {
+                    if matches!(self.join_op, JoinOp::RightOuterJoin) {
+                        break Some(self.merge_tuples(match_, drive, &arena));
+                    } else {
+                        break Some(self.merge_tuples(drive, match_, &arena));
+                    }
+                },
                 Err(e) => {
                     if !e.is_not_found() {
                         feedback.catch_error(e);

@@ -1944,4 +1944,28 @@ mod tests {
         SqlSuite::assert_rows(&data, rs)?;
         Ok(())
     }
+
+    #[test]
+    fn right_outer_join_use_pk() -> Result<()> {
+        let suite = SqlSuite::new("tests/db122")?;
+        suite.execute_file(Path::new("testdata/t3_t4_small_data_for_join.sql"), &suite.arena)?;
+
+        let data = [
+            "(1, 100, \"Js\", 1, 101, \"Js\")",
+            "(2, 101, \"Jc\", 2, 101, \"Jc\")",
+            "(3, 102, \"Jk\", 3, 102, \"Jk\")",
+        ];
+        let rs = suite.execute_query_str("select * from t3 right join t4 on(t3.id = t4.id)", &suite.arena)?;
+        SqlSuite::assert_rows(&data, rs)?;
+
+        let data = [
+            "(1, 101, \"Js\", 1, 100, \"Js\")",
+            "(2, 101, \"Jc\", 2, 101, \"Jc\")",
+            "(3, 102, \"Jk\", 3, 102, \"Jk\")",
+            "(NULL, NULL, NULL, 4, 102, \"Ol\")",
+        ];
+        let rs = suite.execute_query_str("select * from t4 right join t3 on(t3.id = t4.id)", &suite.arena)?;
+        SqlSuite::assert_rows(&data, rs)?;
+        Ok(())
+    }
 }
