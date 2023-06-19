@@ -10,7 +10,7 @@ use std::ops::{AddAssign, DerefMut, Index};
 use std::ptr::{addr_of, NonNull, slice_from_raw_parts_mut};
 use std::sync::{Arc, MutexGuard, Weak};
 
-use crate::{corrupted, Corrupting, Result, Status, visit_fatal};
+use crate::{corrupted, corrupted_err, Corrupting, Result, Status, visit_fatal};
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::{from_sql_result, function};
 use crate::exec::connection::ResultSet;
@@ -179,7 +179,7 @@ impl Executor {
                     DB::encode_row_key(tuple.get(col.order), &col.ty, &mut row_key)?;
                 }
                 tuple.associate_row_key(&row_key);
-                if !unique_row_keys.insert(row_key) { // already exists
+                if !unique_row_keys.insert(row_key.clone()) { // already exists
                     Err(Status::corrupted("Duplicated primary key, must be unique."))?;
                 }
             } else {
@@ -188,20 +188,22 @@ impl Executor {
 
             if !table.metadata.secondary_indices.is_empty() {
                 let mut bundle = SecondaryIndexBundle::new(&tuple, &self.arena);
-                //for index in &table.metadata.secondary_indices {
+                // The secondary index format:
+                // [key_id, (NULL-byte, key-part)+, row-key]
                 for i in 0..table.metadata.secondary_indices.len() {
                     let index = &table.metadata.secondary_indices[i];
                     let mut key = ArenaVec::<u8>::new(&self.arena);
-                    key.write(&(index.id as u32).to_be_bytes()).unwrap();
+                    //key.write(&(index.id as u32).to_be_bytes()).unwrap();
+                    DB::encode_idx_id(index.id, &mut key);
                     for id in &index.key_parts {
                         let col = table.get_col_by_id(*id).unwrap();
                         DB::encode_secondary_index(tuple.get(col.order), &col.ty, &mut key);
                     }
                     if index.unique && !unique_keys[i].insert(key.to_vec()) {
-                        let message = format!("Duplicated secondary key, index {} is unique.",
-                                              table.metadata.secondary_indices[i].name);
-                        Err(Status::corrupted(message))?;
+                        corrupted_err!("Duplicated secondary key, index {} is unique.",
+                            table.metadata.secondary_indices[i].name)?
                     }
+                    key.write(&row_key).unwrap(); // tail row key
                     bundle.index_keys.push(key);
                 }
                 secondary_indices.push(bundle);
@@ -682,7 +684,7 @@ impl ColumnSet {
         for i in 0..self.columns.len() {
             let col = &self.columns[i];
             if col.id == col_id {
-                return Some(i)
+                return Some(i);
             }
         }
         None
@@ -740,7 +742,7 @@ static EMPTY_ARRAY_DUMMY: [u8; 0] = [0; 0];
 
 impl Tuple {
     pub fn new<A: Allocator + ?Sized>(columns: &ArenaBox<ColumnSet>, arena: &mut A) -> Self {
-        Self::with_filling(columns, |_|{Value::Undefined}, arena)
+        Self::with_filling(columns, |_| { Value::Undefined }, arena)
     }
 
     pub fn with_filling<A: Allocator + ?Sized, F>(columns: &ArenaBox<ColumnSet>, callback: F, arena: &mut A) -> Self

@@ -46,6 +46,7 @@ ast_nodes_impl![
     (DropIndex, visit_drop_index),
     (InsertIntoTable, visit_insert_into_table),
     (Collection, visit_collection),
+    (CommonTableExpressions, visit_common_table_expressions),
     (Select, visit_select),
     (FromClause, visit_from_clause),
     (JoinClause, visit_join_clause),
@@ -344,6 +345,25 @@ impl Relation for JoinClause {
     fn alias_as(&mut self, name: ArenaStr) { self.alias = name; }
 }
 
+// with
+//     [name [(columns)]] as reference
+// select ...
+pub struct CommonTableExpressions {
+    pub with_clause: ArenaVec<CteWithItem>,
+    pub query: ArenaBox<dyn Relation>,
+}
+
+pub struct CteWithItem {
+    pub name: ArenaStr,
+    pub columns: ArenaVec<ArenaStr>,
+    pub reference: ArenaBox<dyn Relation>,
+}
+
+impl Relation for CommonTableExpressions {
+    fn alias(&self) -> &ArenaStr { self.query.alias() }
+    fn alias_as(&mut self, name: ArenaStr) { self.query.alias_as(name); }
+}
+
 // select * from b t1
 // left join b t2 on (t1.id = t2.id)
 // left join c t3 on (t2.id = t3.id)
@@ -614,6 +634,13 @@ impl Factory {
         }, self.arena.get_mut())
     }
 
+    pub fn new_common_table_expressions(&self, with_clause: ArenaVec<CteWithItem>, query: ArenaBox<dyn Relation>) -> ArenaBox<CommonTableExpressions> {
+        ArenaBox::new(CommonTableExpressions {
+            with_clause,
+            query,
+        }, self.arena.get_mut())
+    }
+
     pub fn new_select(&self, distinct: bool) -> ArenaBox<Select> {
         ArenaBox::new(Select {
             distinct,
@@ -764,6 +791,7 @@ macro_rules! try_cast_to_relation {
 
 impl From<ArenaBox<dyn Statement>> for ArenaBox<dyn Relation> {
     fn from(value: ArenaBox<dyn Statement>) -> Self {
+        try_cast_to_relation!(value, CommonTableExpressions);
         try_cast_to_relation!(value, Select);
         try_cast_to_relation!(value, Collection);
         try_cast_to_relation!(value, JoinClause);

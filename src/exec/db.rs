@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusty_pool::ThreadPool;
 
-use crate::{Corrupting, log_debug, Status, storage};
+use crate::{corrupted_err, Corrupting, log_debug, Status, storage};
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, Logger};
 use crate::exec::connection::Connection;
 use crate::exec::evaluator::Value;
@@ -617,7 +617,7 @@ impl DB {
                 let mut it = keep_it.borrow_mut();
                 it.seek(tuple.row_key());
                 if it.valid() && it.key().starts_with(tuple.row_key()) {
-                    Err(Status::corrupted("Duplicated primary key, must be unique."))?;
+                    corrupted_err!("Duplicated primary key, must be unique.")?;
                 }
             }
 
@@ -647,12 +647,12 @@ impl DB {
                 let key = index.index_keys[i].as_slice();
                 if table.secondary_indices[i].unique {
                     if self.storage.get_pinnable(&rd_opts, column_family, key).is_ok() {
-                        let message = format!("Duplicated secondary key, index {} is unique.",
-                                              table.secondary_indices[i].name);
-                        Err(Status::corrupted(message))?;
+                        corrupted_err!("Duplicated secondary key, index {} is unique.",
+                            table.secondary_indices[i].name)?;
                     }
                 }
-                batch.insert(column_family, key, index.row_key());
+                let pack_info = (index.row_key().len() as u32).to_le_bytes();
+                batch.insert(column_family, key, &pack_info);
             }
         }
 
@@ -729,6 +729,12 @@ impl DB {
             },
         }
         Ok(())
+    }
+
+    pub fn decode_row_key_from_secondary_index<'a>(index: &'a [u8], pack_info: &[u8]) -> &'a [u8] {
+        let row_key_len = u32::from_le_bytes(pack_info.try_into().unwrap()) as usize;
+        debug_assert!(row_key_len < index.len());
+        &index[index.len() - row_key_len..]
     }
 
     pub fn encode_key<W: Write>(value: &Value, wr: &mut W) {
@@ -1928,11 +1934,14 @@ mod tests {
         let suite = SqlSuite::new("tests/db121")?;
         suite.execute_file(Path::new("testdata/t3_t4_small_data_for_join.sql"), &suite.arena)?;
 
-        let rs = suite.execute_query_str("select * from t4", &suite.arena)?;
-        SqlSuite::print_rows(rs)?;
-
+        let data = [
+            "(2, 101, \"Jc\", 1, 101, \"Js\")",
+            "(2, 101, \"Jc\", 2, 101, \"Jc\")",
+            "(3, 102, \"Jk\", 3, 102, \"Jk\")",
+            "(4, 102, \"Ol\", 3, 102, \"Jk\")",
+        ];
         let rs = suite.execute_query_str("select * from t3 inner join t4 on(t3.dd = t4.df)", &suite.arena)?;
-        SqlSuite::print_rows(rs)?;
+        SqlSuite::assert_rows(&data, rs)?;
         Ok(())
     }
 }

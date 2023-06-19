@@ -178,6 +178,36 @@ impl Visitor for YamlWriter<'_> {
         todo!()
     }
 
+    fn visit_common_table_expressions(&mut self, this: &mut CommonTableExpressions) {
+        emit_header!(self, "CommonTableExpressions:");
+        indent! { self;
+            self.emit_prefix("with_clause:\n");
+            indent! { self;
+                for item in this.with_clause.iter_mut() {
+                    emit!(self, "- name: {}", item.name);
+                    if !item.columns.is_empty() {
+                        self.emit_prefix("  columns:\n");
+                        indent! { self;
+                            for col in &item.columns {
+                                emit!(self, "  - {}", col);
+                            }
+                        }
+                    }
+                    self.emit_prefix("  reference:\n");
+                    indent! { self;
+                        self.indent += 1;
+                        self.emit_rel("", item.reference.deref_mut());
+                        self.indent -= 1;
+                    }
+                }
+            };
+            self.emit_prefix("query:\n");
+            indent! { self;
+                self.emit_rel("", this.query.deref_mut());
+            }
+        }
+    }
+
     fn visit_select(&mut self, this: &mut Select) {
         emit_header!(self, "Select:");
         indent! { self;

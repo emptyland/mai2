@@ -93,7 +93,7 @@ impl RangeScanOps {
         &self.range_begin.as_slice()[..DB::KEY_ID_LEN]
     }
 
-    fn is_primary_key_scanning(&self) -> bool { self.key_id == 0 }
+    fn is_primary_key_scanning(&self) -> bool { DB::is_primary_key(self.key_id) }
 
     fn get_index_key<'a>(&self, key: &'a [u8]) -> &'a [u8] {
         if self.is_primary_key_scanning() {
@@ -124,7 +124,7 @@ impl RangeScanOps {
             let rd_opts = ReadOptions::default();
             let db = self.storage.as_ref().unwrap();
 
-            row_key.write(iter.value()).unwrap();
+            row_key.write(DB::decode_row_key_from_secondary_index(iter.key(), iter.value())).unwrap();
             let prefix_len = row_key.len();
 
             for (col_id, _) in self.col_id_to_order.iter() {
@@ -150,7 +150,6 @@ impl RangeScanOps {
                 iter.move_next();
             }
         }
-
 
         if iter.status().is_corruption() {
             Err(iter.status())
@@ -1319,14 +1318,15 @@ impl IndexNestedLoopJoinOps {
         if iter.valid() && iter.key().starts_with(key_prefix) {
             let iter_pk_box = storage.new_iterator(&rd_opts, cf)?;
             let mut iter_pk = iter_pk_box.borrow_mut();
-            iter_pk.seek(iter.value());
-            if !iter.valid() {
+            let row_key = DB::decode_row_key_from_secondary_index(iter.key(), iter.value());
+            iter_pk.seek(row_key);
+            if !iter_pk.valid() {
                 return Err(Status::NotFound);
             }
-            if iter.status().is_not_ok() {
-                return Err(iter.status().clone());
+            if iter_pk.status().is_not_ok() {
+                return Err(iter_pk.status().clone());
             }
-            return match self.next_matching_tuple_directly(iter.value(), columns, iter_pk.deref_mut(), arena) {
+            return match self.next_matching_tuple_directly(row_key, columns, iter_pk.deref_mut(), arena) {
                 Err(e) => Err(e),
                 Ok(tuple) => {
                     iter.move_next();

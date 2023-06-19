@@ -1,6 +1,6 @@
 use std::io::Read;
 
-use crate::{Arena, ArenaMut};
+use crate::{Arena, arena_vec, ArenaMut};
 use crate::base::{ArenaBox, ArenaStr, ArenaVec};
 use crate::sql::{from_parsing_result, ParseError, Result, SourceLocation, SourcePosition};
 use crate::sql::ast::*;
@@ -84,6 +84,10 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
                 }
                 Token::Insert => {
                     let rv = proc(self.parse_insert_into_table()?.into(), self.placeholder_order);
+                    stmts.push(rv);
+                }
+                Token::With => {
+                    let rv = proc(self.parse_cte()?, self.placeholder_order);
                     stmts.push(rv);
                 }
                 Token::Select => {
@@ -334,6 +338,44 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
             let from = self.factory.new_from_clause(name);
             Ok(ArenaBox::<dyn Statement>::from(from).into())
         }
+    }
+
+    fn parse_cte(&mut self) -> Result<ArenaBox<dyn Statement>> {
+        self.match_expected(Token::With)?;
+
+        let mut items = arena_vec!(&self.factory.arena);
+        loop {
+            let cte_name = self.match_id()?;
+            let mut columns = arena_vec!(&self.factory.arena);
+            if self.test(Token::LParent)? {
+                loop {
+                    let col_name = self.match_id()?;
+                    columns.push(col_name);
+                    if !self.test(Token::Comma)? {
+                        break;
+                    }
+                }
+                self.match_expected(Token::RParent)?;
+            }
+
+            self.match_expected(Token::As)?;
+            self.match_expected(Token::LParent)?;
+            let reference = ArenaBox::<dyn Relation>::from(self.parse_select()?);
+            self.match_expected(Token::RParent)?;
+
+            let item = CteWithItem {
+                name: cte_name,
+                columns,
+                reference,
+            };
+            items.push(item);
+            if !self.test(Token::Comma)? {
+                break;
+            }
+        }
+
+        let query = ArenaBox::<dyn Relation>::from(self.parse_select()?);
+        Ok(self.factory.new_common_table_expressions(items, query).into())
     }
 
     fn parse_select(&mut self) -> Result<ArenaBox<dyn Statement>> {
@@ -909,6 +951,65 @@ on t1.id = t2.id
 ", yaml);
         Ok(())
 
+    }
+
+    #[test]
+    fn parsing_cte_sanity() -> Result<()> {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+
+        const SQL: &str = "with
+            cte1 as (select * from a),
+            cte2(col1, col2) as (select * from b)
+        select * from cte1 inner join cte2 on (cte1.id = cte2.id);
+        ";
+        let yaml = parse_all_to_yaml(arena, SQL)?;
+        assert_eq!("CommonTableExpressions:
+  with_clause:
+    - name: cte1
+      reference:
+        Select:
+          distinct: false
+          columns:
+            - expr: *
+          from:
+            FromClause:
+              name: a
+    - name: cte2
+      columns:
+        - col1
+        - col2
+      reference:
+        Select:
+          distinct: false
+          columns:
+            - expr: *
+          from:
+            FromClause:
+              name: b
+  query:
+    Select:
+      distinct: false
+      columns:
+        - expr: *
+      from:
+        JoinClause:
+          op: INNER JOIN
+          lhs:
+            FromClause:
+              name: cte1
+          rhs:
+            FromClause:
+              name: cte2
+          on_clause:
+            BinaryExpression:
+              op: Eq(=)
+              lhs:
+                FullQualifiedName: cte1.id
+              rhs:
+                FullQualifiedName: cte2.id
+", yaml);
+        Ok(())
     }
 
     fn parse_all_to_yaml(arena: ArenaMut<Arena>, sql: &str) -> Result<String> {
