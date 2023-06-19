@@ -146,7 +146,7 @@ impl ResultSet {
             self.arena = Arena::new_ref();
         }
 
-        let mut feedback = FeedbackImpl { status: Status::Ok };
+        let mut feedback = FeedbackImpl::default();
         self.current = self.plan_root.next(&mut feedback, &self.arena);
         self.status = feedback.status;
 
@@ -198,12 +198,24 @@ impl Drop for ResultSet {
     }
 }
 
+#[derive(Debug, Default)]
 pub struct FeedbackImpl {
-    pub status: Status
+    pub status: Status,
+    need_row_key: bool
+}
+
+impl FeedbackImpl {
+    pub fn new(need_row_key: bool) -> Self {
+        Self {
+            status: Status::Ok,
+            need_row_key,
+        }
+    }
 }
 
 impl Feedback for FeedbackImpl {
     fn catch_error(&mut self, status: Status) {
         self.status = status;
     }
+    fn need_row_key(&self) -> bool { self.need_row_key }
 }

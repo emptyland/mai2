@@ -755,6 +755,14 @@ impl<T> ArenaVec<T> {
     }
 }
 
+impl <T: Clone> ArenaVec<T> {
+    pub fn with_data(arena: &ArenaMut<Arena>, data: &[T]) -> Self {
+        Self::with_init(arena, |i|{
+            data[i].clone()
+        }, data.len())
+    }
+}
+
 impl <T: Clone> Clone for ArenaVec<T> {
     fn clone(&self) -> Self { self.dup(&self.owns) }
 }

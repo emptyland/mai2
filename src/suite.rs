@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-#[cfg(test)]
+//#[cfg(test)]
 pub mod testing {
     use std::ops::Deref;
     use std::sync::Arc;
@@ -40,9 +40,9 @@ pub mod testing {
             let tables = self.db.lock_tables();
             let table = tables.get(&name.to_string()).unwrap();
             let mut cols = if alias.is_empty() {
-                ColumnSet::new(name, &self.arena)
+                ColumnSet::new(name, table.metadata.id, &self.arena)
             } else {
-                ColumnSet::new(alias, &self.arena)
+                ColumnSet::new(alias, table.metadata.id,&self.arena)
             };
             for col in &table.metadata.columns {
                 cols.append(col.name.as_str(), "", col.id, col.ty.clone());

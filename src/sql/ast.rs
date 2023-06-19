@@ -4,6 +4,7 @@ use std::ptr::{addr_of, addr_of_mut, NonNull};
 use std::slice;
 
 use num_enum::TryFromPrimitive;
+use crate::arena_vec;
 
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::sql::lexer::Token;
@@ -50,6 +51,7 @@ ast_nodes_impl![
     (Select, visit_select),
     (FromClause, visit_from_clause),
     (JoinClause, visit_join_clause),
+    (Delete, visit_delete),
     (Identifier, visit_identifier),
     (FullyQualifiedName, visit_full_qualified_name),
     (UnaryExpression, visit_unary_expression),
@@ -407,6 +409,25 @@ impl Relation for FromClause {
     fn alias_as(&mut self, name: ArenaStr) { self.alias = name; }
 }
 
+// DML:
+// delete from t
+// [where expr]
+// [order by expr...]
+// [limit literal]
+//
+// delete t1,t2... from t1 join ...
+// [where expr]
+//
+// delete from t1, t2 ... using t1 join ...
+// [where expr]
+pub struct Delete {
+    pub names: ArenaVec<ArenaStr>,
+    pub relation: Option<ArenaBox<dyn Relation>>,
+    pub where_clause: Option<ArenaBox<dyn Expression>>,
+    pub order_by_clause: ArenaVec<ArenaBox<dyn Expression>>,
+    pub limit_clause: Option<ArenaBox<dyn Expression>>,
+}
+
 // Expression:
 
 pub struct Identifier {
@@ -603,6 +624,16 @@ impl Factory {
             name,
             primary_key,
             table_name,
+        }, self.arena.get_mut())
+    }
+
+    pub fn new_delete(&self, names: ArenaVec<ArenaStr>, relation: Option<ArenaBox<dyn Relation>>) -> ArenaBox<Delete> {
+        ArenaBox::new(Delete {
+            names,
+            where_clause: None,
+            relation,
+            order_by_clause: arena_vec!(&self.arena),
+            limit_clause: None,
         }, self.arena.get_mut())
     }
 

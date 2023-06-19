@@ -5,7 +5,7 @@ use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use crate::{arena_vec, corrupted_err, Corrupting, Result, Status, storage};
+use crate::{arena_vec, corrupted_err, Corrupting, Result, Status, storage, zone_limit_guard, zone_limit_guard_on};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaRef, ArenaStr, ArenaVec};
 use crate::exec::connection::FeedbackImpl;
 use crate::exec::db::{ColumnType, DB};
@@ -30,6 +30,7 @@ pub trait PhysicalPlanOps {
 
 pub trait Feedback {
     fn catch_error(&mut self, status: Status);
+    fn need_row_key(&self) -> bool { false }
 }
 
 pub struct RangeScanOps {
@@ -121,7 +122,7 @@ impl RangeScanOps {
         }
 
         let mut row_key = ArenaVec::<u8>::new(arena);
-        if !self.is_primary_key_scanning() { // 2rd index
+        if !self.is_primary_key_scanning() { // secondary index
             let rd_opts = ReadOptions::default();
             let db = self.storage.as_ref().unwrap();
 
@@ -219,6 +220,9 @@ impl PhysicalPlanOps for RangeScanOps {
         let arena = zone.get_mut();
         let mut tuple = Tuple::with(&self.projected_columns, &arena);
         let rs = self.next_row(iter.deref_mut(), |key, v| {
+            if feedback.need_row_key() && tuple.row_key().is_empty() {
+                tuple.attach_row_key(ArenaVec::with_data(&arena, &key[..key.len() - DB::COL_ID_LEN]));
+            }
             let (_, col_id) = DB::parse_row_key(key);
             if let Some(index) = self.col_id_to_order.get(&col_id) {
                 let ty = &tuple.columns().columns[*index].ty;
@@ -567,7 +571,7 @@ pub struct ReturningOneDummyOps {
 
 impl ReturningOneDummyOps {
     pub fn new(arena: &ArenaMut<Arena>) -> Self {
-        let mut columns = ColumnSet::new("", arena);
+        let mut columns = ColumnSet::new("", 0, arena);
         columns.append_with_name("$$", ColumnType::TinyInt(1));
 
         Self {
@@ -610,7 +614,7 @@ pub struct RenamingOps {
 impl PhysicalPlanOps for RenamingOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
         let origin = self.child.prepare()?;
-        let mut cols = ColumnSet::new(self.schema_as.as_str(), &self.arena);
+        let mut cols = ColumnSet::new(self.schema_as.as_str(), origin.tid, &self.arena);
         debug_assert_eq!(origin.columns.len(), self.columns_as.len());
         for i in 0..origin.columns.len() {
             let col = &origin.columns[i];
@@ -725,7 +729,7 @@ impl GroupingAggregatorOps {
 
         let mut zone = Arena::new_ref();
         let arena = zone.get_mut();
-        let mut feedback = FeedbackImpl { status: Status::Ok };
+        let mut feedback = FeedbackImpl::default();
 
         let mut evaluator = Evaluator::new(&arena);
         let wr_opts = WriteOptions::default();
@@ -774,9 +778,9 @@ impl GroupingAggregatorOps {
         Ok(())
     }
 
-    fn aggregators_terminate(&mut self, zone: &ArenaRef<Arena>, input: &Tuple) -> Result<Tuple> {
+    fn aggregators_terminate(&mut self, zone: &ArenaRef<Arena>, group_key: Option<Tuple>) -> Result<Tuple> {
         let arena = zone.get_mut();
-        let mut tuple = Tuple::with(&self.projected_columns, &arena);
+        let mut tuple = Tuple::with_filling(&self.projected_columns, |_|{Value::Null}, arena.get_mut());
 
         debug_assert!(self.aggregators.len() <= self.projected_columns.len());
         for i in 0..self.aggregators.len() {
@@ -785,7 +789,11 @@ impl GroupingAggregatorOps {
             tuple.set(i, value);
             agg.rets.clear();
         }
+        if group_key.is_none() {
+            return Ok(tuple);
+        }
 
+        let input = group_key.unwrap();
         for i in self.aggregators.len()..self.projected_columns.len() {
             let dest_col = &self.projected_columns[i];
             let rs = input.columns().index_by_name(dest_col.desc.as_str(),
@@ -840,6 +848,7 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
             self.cf = Some(cf);
         }
 
+        self.eof = false;
         self.upstream_columns = Some(upstream_cols);
         Ok(self.projected_columns.clone())
     }
@@ -862,19 +871,20 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
         let context = self.context.as_ref().cloned().unwrap();
 
         if self.group_keys.is_empty() {
+            if self.eof {
+                return None;
+            }
+
             let mut zone = Arena::new_ref();
             let mut group_tuple = Option::<Tuple>::None;
 
             debug_assert!(self.aggregators.len() <= self.projected_columns.len());
             loop {
-                if zone.rss_in_bytes >= 10 * config::MB {
-                    let new_zone = Arena::new_ref();
-                    if let Some(tuple) = &group_tuple {
-                        group_tuple = Some(tuple.dup(&new_zone.get_mut()));
+                zone_limit_guard_on!(zone, new_zone, 1, {
+                    if let Some(gk) = &group_tuple {
+                        group_tuple = Some(gk.dup(&new_zone.get_mut()));
                     }
-                    drop(zone);
-                    zone = new_zone;
-                }
+                });
                 match self.child.next(_feedback, &zone) {
                     Some(tuple) => match self.aggregators_iterate(&tuple, &context, &zone) {
                         Err(e) => {
@@ -883,13 +893,13 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
                         }
                         Ok(_) => group_tuple = Some(tuple)
                     }
-                    None => break
+                    None => {
+                        self.eof = true;
+                        break;
+                    }
                 } // match
             } // loop
-            if group_tuple.is_none() {
-                return None;
-            }
-            match self.aggregators_terminate(&_zone, group_tuple.as_ref().unwrap()) {
+            match self.aggregators_terminate(&_zone, group_tuple) {
                 Err(e) => {
                     _feedback.catch_error(e);
                     None
@@ -906,14 +916,11 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
             let mut zone = Arena::new_ref();
             let mut group_tuple = Option::<Tuple>::None;
             while &iter.key()[..iter.key().len() - 8] == self.current_key.as_slice() {
-                if zone.rss_in_bytes >= 10 * config::MB {
-                    let new_zone = Arena::new_ref();
-                    if let Some(tuple) = &group_tuple {
-                        group_tuple = Some(tuple.dup(&new_zone.get_mut()));
+                zone_limit_guard_on!(zone, new_zone, 1, {
+                    if let Some(gk) = &group_tuple {
+                        group_tuple = Some(gk.dup(&new_zone.get_mut()));
                     }
-                    drop(zone);
-                    zone = new_zone;
-                }
+                });
                 let arena = zone.get_mut();
 
                 let tuple = DB::decode_tuple(self.upstream_columns.as_ref().unwrap(),
@@ -941,7 +948,7 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
                 return None;
             }
 
-            match self.aggregators_terminate(&_zone, group_tuple.as_ref().unwrap()) {
+            match self.aggregators_terminate(&_zone, group_tuple) {
                 Err(e) => {
                     _feedback.catch_error(e);
                     None
@@ -987,16 +994,12 @@ impl SimpleNestedLoopJoinOps {
 
     fn match_left_outer(&mut self, drive: Tuple, inner: bool, owns: &ArenaMut<Arena>) -> Result<Tuple> {
         let mut zone = Arena::new_ref();
-        let mut feedback = FeedbackImpl { status: Status::Ok };
+        let mut feedback = FeedbackImpl::default();
         let env = self.context.as_ref().unwrap();
 
         self.matcher.prepare()?;
         loop {
-            if zone.rss_in_bytes >= 10 * config::MB {
-                let z = Arena::new_ref();
-                drop(zone);
-                zone = z;
-            }
+            zone_limit_guard!(zone, 1);
             let arena = zone.get_mut();
 
             let rs = self.matcher.next(&mut feedback, &zone);
@@ -1034,16 +1037,12 @@ impl SimpleNestedLoopJoinOps {
 
     fn match_right_outer(&mut self, match_: Tuple, owns: &ArenaMut<Arena>) -> Result<Tuple> {
         let mut zone = Arena::new_ref();
-        let mut feedback = FeedbackImpl { status: Status::Ok };
+        let mut feedback = FeedbackImpl::default();
         let env = self.context.as_ref().unwrap();
 
         self.driver.prepare()?;
         loop {
-            if zone.rss_in_bytes >= 10 * config::MB {
-                let z = Arena::new_ref();
-                drop(zone);
-                zone = z;
-            }
+            zone_limit_guard!(zone, 1);
             let arena = zone.get_mut();
 
             let rs = self.driver.next(&mut feedback, &zone);
@@ -1525,7 +1524,7 @@ impl EmptyOps {
 
 impl PhysicalPlanOps for EmptyOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
-        let mut columns = ColumnSet::new("<empty>", &self.arena);
+        let mut columns = ColumnSet::new("<empty>", 0, &self.arena);
         columns.append_with_name("_", ColumnType::Int(1));
         Ok(ArenaBox::new(columns, self.arena.get_mut()))
     }
@@ -1577,7 +1576,7 @@ mod tests {
         DB::encode_idx_id(0, &mut end_key);
         DB::encode_row_key(&Value::Int(N), &ty, &mut end_key)?;
 
-        let mut columns = ArenaBox::new(ColumnSet::new("t1", &arena), arena.get_mut());
+        let mut columns = ArenaBox::new(ColumnSet::new("t1", 0, &arena), arena.get_mut());
         columns.append("id", "", 1, ColumnType::Int(11));
         columns.append("name", "", 2, ColumnType::Varchar(64));
 
@@ -1587,7 +1586,7 @@ mod tests {
                                          arena.clone(), db.clone(),
                                          db.default_column_family().clone());
         plan.prepare()?;
-        let mut feedback = FeedbackImpl { status: Status::Ok };
+        let mut feedback = FeedbackImpl::default();
         let mut i = 0i64;
         loop {
             let rs = plan.next(&mut feedback, &zone);
@@ -1608,7 +1607,7 @@ mod tests {
     fn simple_nested_loop_join() -> Result<()> {
         let zone = Arena::new_ref();
         let arena = zone.get_mut();
-        let mut t1_cols = ColumnSet::new("t1", &arena);
+        let mut t1_cols = ColumnSet::new("t1", 0, &arena);
         t1_cols.append("a", "", 0, ColumnType::Int(11));
         t1_cols.append("b", "", 2, ColumnType::Int(11));
         t1_cols.append("c", "", 3, ColumnType::Int(11));
@@ -1624,7 +1623,7 @@ mod tests {
         let plan_t1 =
             ArenaBox::new(MockingProducerOps::new(data, t1.clone()), arena.get_mut());
 
-        let mut t2_cols = ColumnSet::new("t2", &arena);
+        let mut t2_cols = ColumnSet::new("t2", 0, &arena);
         t2_cols.append("d", "", 0, ColumnType::Int(11));
         t2_cols.append("e", "", 2, ColumnType::Int(11));
         t2_cols.append("f", "", 3, ColumnType::Int(11));
@@ -1640,7 +1639,7 @@ mod tests {
         let plan_t2 =
             ArenaBox::new(MockingProducerOps::new(data, t2.clone()), arena.get_mut());
 
-        let mut tt_cols = ColumnSet::new("", &arena);
+        let mut tt_cols = ColumnSet::new("", 0, &arena);
         for t in &[t1, t2] {
             for i in 0..t.len() {
                 let col = &t[i];
@@ -1689,7 +1688,7 @@ mod tests {
         plan.prepare()?;
         let mut i = 0;
         loop {
-            let mut feedback = FeedbackImpl { status: Status::Ok };
+            let mut feedback = FeedbackImpl::default();
             let rs = plan.next(&mut feedback, &zone);
             assert_eq!(Status::Ok, feedback.status);
             if rs.is_none() {

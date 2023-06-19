@@ -10,7 +10,7 @@ use std::ops::{AddAssign, DerefMut, Index};
 use std::ptr::{addr_of, NonNull, slice_from_raw_parts_mut};
 use std::sync::{Arc, MutexGuard, Weak};
 
-use crate::{corrupted, corrupted_err, Corrupting, Result, Status, visit_fatal};
+use crate::{arena_vec, corrupted, corrupted_err, Corrupting, Result, Status, visit_fatal};
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::{from_sql_result, function};
 use crate::exec::connection::ResultSet;
@@ -217,7 +217,7 @@ impl Executor {
 
     fn build_standalone_projecting(&mut self, this: &mut Select) -> Result<ResultSet> {
         let mut columns_expr = ArenaVec::new(&self.arena);
-        let mut columns = ColumnSet::new("", &self.arena);
+        let mut columns = ColumnSet::new("", 0, &self.arena);
         let mut i = 0;
         let context = Arc::new(UniversalContext::new(self.prepared_stmts.back().cloned()));
         for col in this.columns.iter_mut() {
@@ -551,6 +551,38 @@ impl Visitor for Executor {
         }
     }
 
+    fn visit_delete(&mut self, this: &mut Delete) {
+        debug_assert!(!this.names.is_empty());
+        let db = self.db.upgrade().unwrap();
+        let mut tables_will_be_delete = arena_vec!(&self.arena);
+        let tables = db.lock_tables();
+        for name in &this.names {
+            match tables.get(&name.to_string()) {
+                Some(table) => tables_will_be_delete.push(table.clone()),
+                None => visit_fatal!(self, "Table name: {name} not found."),
+            }
+        }
+        drop(tables);
+
+        let mut maker = PlanMaker::new(&db, self.prepared_stmts.back().cloned(), &self.arena);
+        let mut producer = if this.names.len() == 1 && this.relation.is_none() {
+            // Simple delete
+            let rs = maker.make_rows_producer(this.names[0].as_str(), &this.where_clause, &this.limit_clause);
+            if let Err(e) = rs {
+                self.rs = e;
+                return;
+            }
+            rs.unwrap()
+        } else {
+            todo!()
+        };
+        match db.delete_rows(&tables_will_be_delete, producer.clone()) {
+            Ok(affected_rows) => self.affected_rows = affected_rows,
+            Err(e) => self.rs = e
+        }
+        producer.finalize();
+    }
+
     fn visit_insert_into_table(&mut self, this: &mut InsertIntoTable) {
         let db = self.db.upgrade().unwrap();
         let tables = db.lock_tables();
@@ -562,8 +594,8 @@ impl Visitor for Executor {
 
         let mut insertion_cols = Vec::new();
         let mut columns = {
-            let tmp = ColumnSet::new(
-                table.metadata.name.as_str(), &mut self.arena);
+            let tmp = ColumnSet::new(table.metadata.name.as_str(), table.metadata.id,
+                                     &mut self.arena);
             ArenaBox::new(tmp, self.arena.deref_mut())
         };
         for col_name in &this.columns_name {
@@ -646,16 +678,26 @@ impl Visitor for Executor {
 pub struct ColumnSet {
     pub schema: ArenaStr,
     pub columns: ArenaVec<Column>,
+    pub tid: u64,
     arena: ArenaMut<Arena>,
 }
 
 impl ColumnSet {
-    pub fn new(schema: &str, arena_mut: &ArenaMut<Arena>) -> Self {
+    pub fn new(schema: &str, tid: u64, arena_mut: &ArenaMut<Arena>) -> Self {
         let mut arena = arena_mut.clone();
         Self {
             schema: ArenaStr::from_arena(schema, &mut arena),
             columns: ArenaVec::new(&arena),
+            tid,
             arena,
+        }
+    }
+
+    pub fn table_id(&self) -> Option<u64> {
+        if self.tid > 0 {
+            Some(self.tid)
+        } else {
+            None
         }
     }
 
@@ -792,6 +834,8 @@ impl Tuple {
         this.row_key = Self::new_row_key(key, arena.get_mut());
         this
     }
+
+    pub fn attach_row_key(&mut self, key: ArenaVec<u8>) { self.associate_row_key(&key) }
 
     pub fn associate_row_key(&mut self, key: &ArenaVec<u8>) {
         unsafe {

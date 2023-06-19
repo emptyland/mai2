@@ -299,6 +299,37 @@ impl Visitor for YamlWriter<'_> {
         }
     }
 
+    fn visit_delete(&mut self, this: &mut Delete) {
+        emit_header!(self, "Delete:");
+        indent! { self;
+            self.emit_prefix("names:\n");
+            indent! { self;
+                for name in &this.names {
+                    emit!(self, " - {}", name);
+                }
+            };
+            if let Some(rel) = &mut this.relation {
+                self.emit_prefix("relation:\n");
+                indent! { self;
+                    self.emit_rel("", rel.deref_mut());
+                }
+            };
+            if let Some(expr) = &mut this.where_clause {
+                emit!(self, "where:");
+                indent! { self;
+                    self.emit_expr("", expr.deref_mut());
+                }
+            };
+            // order by
+            if !this.order_by_clause.is_empty() {
+                todo!()
+            };
+            if let Some(limit) = &mut this.limit_clause {
+                self.emit_expr("limit: ", limit.deref_mut());
+            };
+        }
+    }
+
     fn visit_identifier(&mut self, this: &mut Identifier) {
         emit_header!(self, "Identifier: {}", this.symbol);
     }

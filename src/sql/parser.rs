@@ -14,7 +14,7 @@ pub struct Parser<'a, R: ?Sized> {
 }
 
 pub fn parse_sql_expr<R: Read + ?Sized>(reader: &mut R, arena: &ArenaMut<Arena>)
-    -> crate::Result<ArenaBox<dyn Expression>> {
+                                        -> crate::Result<ArenaBox<dyn Expression>> {
     let factory = Factory::new(arena);
     let mut parser = from_parsing_result(Parser::new(reader, factory))?;
     from_parsing_result(parser.parse_expr())
@@ -92,6 +92,10 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
                 }
                 Token::Select => {
                     let rv = proc(self.parse_select()?, self.placeholder_order);
+                    stmts.push(rv);
+                }
+                Token::Delete => {
+                    let rv = proc(self.parse_delete()?, self.placeholder_order);
                     stmts.push(rv);
                 }
                 _ => Err(self.current_syntax_error("Unexpected statement".to_string()))?
@@ -378,6 +382,96 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
         Ok(self.factory.new_common_table_expressions(items, query).into())
     }
 
+    // delete from t
+    // [where expr]
+    // [order by expr...]
+    // [limit literal]
+    //
+    // delete t1,t2... from t1 join ...
+    // [where expr]
+    //
+    // delete from t1, t2 ... using t1 join ...
+    // [where expr]
+    fn parse_delete(&mut self) -> Result<ArenaBox<dyn Statement>> {
+        self.match_expected(Token::Delete)?;
+        //let mut multi_delete = false;
+
+        let mut names = arena_vec!(&self.factory.arena);
+        if !self.test(Token::From)? {
+            loop {
+                names.push(self.match_id()?);
+                if !self.test(Token::Comma)? {
+                    break;
+                }
+            }
+            self.match_expected(Token::From)?;
+            //multi_delete = true;
+        }
+
+        let mut relation = Option::<ArenaBox<dyn Relation>>::None;
+        if names.is_empty() {
+            loop {
+                names.push(self.match_id()?);
+                if !self.test(Token::Comma)? {
+                    break;
+                }
+            }
+
+            if self.test(Token::Using)? {
+                relation = Some(self.parse_join_only_use_table_rel()?);
+            }
+        } else {
+            relation = Some(self.parse_join_only_use_table_rel()?);
+        }
+        let mut node = self.factory.new_delete(names, relation);
+
+        node.where_clause = if self.test(Token::Where)? {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        if node.relation.is_none() {
+            if self.test(Token::Order)? {
+                self.match_expected(Token::By)?;
+                todo!()
+            }
+
+            if self.test(Token::Limit)? {
+                node.limit_clause = Some(self.parse_expr()?);
+            }
+        }
+
+        Ok(node.into())
+    }
+
+    fn parse_join_only_use_table_rel(&mut self) -> Result<ArenaBox<dyn Relation>> {
+        let mut rel = self.match_table_rel()?;
+        loop {
+            match self.parse_join_op()? {
+                Some(op) => {
+                    let rhs = self.match_table_rel()?;
+                    self.match_expected(Token::On)?;
+                    let on_clause = self.parse_expr()?;
+                    let join_node = self.factory.new_join_clause(op, rel.clone(),
+                                                                 rhs.clone(), on_clause);
+                    rel = ArenaBox::<dyn Statement>::from(join_node).into();
+                }
+                None => break
+            }
+        }
+        Ok(rel)
+    }
+
+    fn match_table_rel(&mut self) -> Result<ArenaBox<dyn Relation>> {
+        let name = self.match_id()?;
+        let mut rel = self.factory.new_from_clause(name);
+        let alias = self.match_alias()?;
+        rel.alias_as(alias);
+        let stmt: ArenaBox<dyn Statement> = rel.into();
+        Ok(stmt.into())
+    }
+
     fn parse_select(&mut self) -> Result<ArenaBox<dyn Statement>> {
         self.match_expected(Token::Select)?;
         let distinct = self.test(Token::Distinct)?;
@@ -408,9 +502,8 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
                         rhs.alias_as(self.match_alias()?);
                         self.match_expected(Token::On)?;
                         let on_clause = self.parse_expr()?;
-                        let join_node = self.factory.new_join_clause(join_op,
-                                                                     clause.clone(), rhs,
-                                                                     on_clause);
+                        let join_node = self.factory.new_join_clause(join_op, clause.clone(), rhs,
+                                                                                        on_clause);
                         node.from_clause = Some(ArenaBox::<dyn Statement>::from(join_node).into())
                     }
                     None => {}
@@ -950,7 +1043,6 @@ on t1.id = t2.id
         IntLiteral: 1
 ", yaml);
         Ok(())
-
     }
 
     #[test]
@@ -1009,6 +1101,61 @@ on t1.id = t2.id
               rhs:
                 FullQualifiedName: cte2.id
 ", yaml);
+        Ok(())
+    }
+
+    #[test]
+    fn parsing_delete_sanity() -> Result<()> {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+
+        let yaml = parse_all_to_yaml(arena.clone(), "DELETE FROM t1")?;
+        assert_eq!("Delete:
+  names:
+     - t1\n", yaml);
+
+        let yaml = parse_all_to_yaml(arena.clone(), "DELETE FROM t1 WHERE id = 0")?;
+        //println!("{yaml}");
+        assert_eq!("Delete:
+  names:
+     - t1
+  where:
+    BinaryExpression:
+      op: Eq(=)
+      lhs:
+        Identifier: id
+      rhs:
+        IntLiteral: 0\n", yaml);
+
+        let yaml = parse_all_to_yaml(arena.clone(), "DELETE FROM t1, t2 USING t1 JOIN t2 ON(t1.id = t2.id) WHERE t1.name = \"xxx\"")?;
+        // println!("{yaml}");
+        assert_eq!("Delete:
+  names:
+     - t1
+     - t2
+  relation:
+    JoinClause:
+      op: CROSS JOIN
+      lhs:
+        FromClause:
+          name: t1
+      rhs:
+        FromClause:
+          name: t2
+      on_clause:
+        BinaryExpression:
+          op: Eq(=)
+          lhs:
+            FullQualifiedName: t1.id
+          rhs:
+            FullQualifiedName: t2.id
+  where:
+    BinaryExpression:
+      op: Eq(=)
+      lhs:
+        FullQualifiedName: t1.name
+      rhs:
+        StrLiteral: xxx\n", yaml);
         Ok(())
     }
 

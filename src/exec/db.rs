@@ -10,12 +10,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusty_pool::ThreadPool;
 
-use crate::{corrupted_err, Corrupting, log_debug, Status, storage};
+use crate::{ArenaVec, corrupted_err, Corrupting, log_debug, Status, storage, zone_limit_guard};
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, Logger};
-use crate::exec::connection::Connection;
+use crate::exec::connection::{Connection, FeedbackImpl};
 use crate::exec::evaluator::Value;
 use crate::exec::executor::{ColumnSet, SecondaryIndexBundle, Tuple};
 use crate::exec::locking::{LockingInstance, LockingManagement};
+use crate::exec::physical_plan::PhysicalPlanOps;
 use crate::Result;
 use crate::storage::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME, Env,
                      from_io_result, Options, ReadOptions, WriteBatch, WriteOptions};
@@ -666,6 +667,46 @@ impl DB {
         self.storage.write(&wr_opts, batch)?;
         //log_debug!(self.logger, "rows: {} insert ok", tuples.len());
         Ok(tuples.len() as u64)
+    }
+
+    pub fn delete_rows(&self, tables: &[TableRef], mut row_producer: ArenaBox<dyn PhysicalPlanOps>) -> Result<u64> {
+        debug_assert!(tables.len() >= 1);
+        row_producer.prepare()?;
+        let mut zone = Arena::new_ref();
+        let mut feedback = FeedbackImpl::new(true);
+        let mut affected_rows = 0;
+        loop {
+            zone_limit_guard!(zone, 1);
+
+            let rs = row_producer.next(&mut feedback, &zone);
+            if feedback.status.is_not_ok() {
+                break Err(feedback.status)
+            }
+            if rs.is_none() {
+                break Ok(affected_rows);
+            }
+            let tuple = rs.unwrap();
+            let row_key = tuple.row_key();
+
+            let arena = zone.get_mut();
+            let mut key_buf = ArenaVec::with_data(&arena, row_key);
+            if tables.len() == 1 {
+                self.delete_rows_impl(&tables[0], &mut key_buf)?;
+            } else {
+                todo!()
+            }
+            affected_rows += 1;
+        }
+    }
+
+    fn delete_rows_impl(&self, table: &TableRef, key_buf: &mut ArenaVec<u8>) -> Result<()> {
+        let original_len = key_buf.len();
+        for col in &table.metadata.columns {
+            Self::encode_col_id(col.id, key_buf);
+            self.storage.delete(&self.wr_opts, &table.column_family, key_buf)?;
+            key_buf.truncate(original_len);
+        }
+        Ok(())
     }
 
     pub fn is_primary_key(key_id: u64) -> bool { key_id == DB::PRIMARY_KEY_ID as u64 }
@@ -1388,7 +1429,7 @@ mod tests {
     fn row_encoding() {
         let zone = Arena::new_val();
         let arena = zone.get_mut();
-        let mut columns = ColumnSet::new("t1", &arena);
+        let mut columns = ColumnSet::new("t1", 0, &arena);
         columns.append_with_name("a", ColumnType::Int(11));
         columns.append_with_name("b", ColumnType::Float(0, 0));
         columns.append_with_name("c", ColumnType::Double(0, 0));
@@ -1472,7 +1513,7 @@ mod tests {
         stmt.bind_i64(1, 2);
         conn.execute_prepared_statement(&mut stmt)?;
 
-        let mut column_set = ArenaBox::new(ColumnSet::new("t1", &mut arena), arena.deref_mut());
+        let mut column_set = ArenaBox::new(ColumnSet::new("t1", 0, &mut arena), arena.deref_mut());
         column_set.append_with_name("a", ColumnType::Int(11));
         column_set.append_with_name("b", ColumnType::Int(11));
 
@@ -1508,7 +1549,7 @@ mod tests {
         let conn = db.connect();
         conn.execute_str(sql, &arena)?;
 
-        let mut column_set = ArenaBox::new(ColumnSet::new("t1", &mut arena), arena.deref_mut());
+        let mut column_set = ArenaBox::new(ColumnSet::new("t1", 0, &mut arena), arena.deref_mut());
         column_set.append_with_name("a", ColumnType::Int(11));
         column_set.append_with_name("b", ColumnType::Int(11));
         column_set.append_with_name("c", ColumnType::Int(11));

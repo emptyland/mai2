@@ -3,6 +3,7 @@ use std::path::Path;
 use mai2::{Arena, Result};
 use mai2::exec::db::DB;
 use mai2::storage::JunkFilesCleaner;
+use mai2::suite::testing::SqlSuite;
 
 #[test]
 fn sql_create_table_and_insert() -> Result<()> {
@@ -232,6 +233,37 @@ fn sql_select_join_small_tables() -> Result<()> {
     assert!(rs.next());
     assert_eq!("(3, 300, 3, \"world\")", rs.current()?.to_string());
     assert!(!rs.next());
+
+    Ok(())
+}
+
+#[test]
+fn sql_simple_delete_all() -> Result<()> {
+    let suite = SqlSuite::new("tests/dbi-007")?;
+    suite.execute_file(Path::new("testdata/t1_with_pk_and_data.sql"), &suite.arena)?;
+
+    assert_eq!(9, suite.execute_str("delete from t1;", &suite.arena)?);
+
+    let mut rs = suite.execute_query_str("select count(*) from t1;", &suite.arena)?;
+    assert!(rs.next());
+    assert_eq!(Some(0), rs.current()?.get_i64(0));
+    assert!(!rs.next());
+    Ok(())
+}
+
+#[test]
+fn sql_simple_delete_one() -> Result<()> {
+    let suite = SqlSuite::new("tests/dbi-008")?;
+    suite.execute_file(Path::new("testdata/t1_t2_small_data_for_join.sql"), &suite.arena)?;
+
+    assert_eq!(1, suite.execute_str("delete from t1 where id = 2", &suite.arena)?);
+
+    let data = [
+        "(1, 100)",
+        "(3, 300)",
+    ];
+    let rs = suite.execute_query_str("select * from t1;", &suite.arena)?;
+    SqlSuite::assert_rows(&data, rs)?;
 
     Ok(())
 }

@@ -1,5 +1,7 @@
-#[derive(Debug, Clone, PartialEq)]
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum Status {
+    #[default]
     Ok,
     Corruption(String),
     NotFound,

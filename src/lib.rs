@@ -7,12 +7,14 @@ extern crate serde_yaml;
 pub use crate::base::*;
 pub use crate::status::*;
 
+//#[cfg(test)]
+pub mod suite;
+
 pub mod storage;
 pub mod exec;
 pub mod status;
 mod base;
 mod sql;
-mod suite;
 
 pub type Result<T> = std::result::Result<T, Status>;
 

@@ -67,11 +67,13 @@ pub enum Token {
     Inner,
     Outer,
     Cross,
+    Using,
     As,
     Union,
     All,
     Limit,
     Offset,
+    Delete,
 
     // types:
     Char,
@@ -170,11 +172,13 @@ impl Keywords {
                 Inner,
                 Outer,
                 Cross,
+                Using,
                 As,
                 Union,
                 All,
                 Limit,
                 Offset,
+                Delete,
 
                 Char,
                 Varchar,
