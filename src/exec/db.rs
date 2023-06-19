@@ -737,6 +737,12 @@ impl DB {
         &index[index.len() - row_key_len..]
     }
 
+    pub fn decode_index_from_secondary_index<'a>(index: &'a [u8], pack_info: &[u8]) -> &'a [u8] {
+        let row_key_len = u32::from_le_bytes(pack_info.try_into().unwrap()) as usize;
+        debug_assert!(row_key_len < index.len());
+        &index[..index.len() - row_key_len]
+    }
+
     pub fn encode_key<W: Write>(value: &Value, wr: &mut W) {
         if Self::encode_null_bytes(value, wr) {
             return;

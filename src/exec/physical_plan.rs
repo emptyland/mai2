@@ -46,7 +46,7 @@ pub struct RangeScanOps {
     eof: Cell<bool>,
     arena: ArenaMut<Arena>,
 
-    iter: Option<storage::IteratorArc>,
+    iter: Option<IteratorArc>,
     storage: Option<Arc<dyn storage::DB>>,
     cf: Option<Arc<dyn ColumnFamily>>,
     col_id_to_order: HashMap<u32, usize>,
@@ -95,11 +95,11 @@ impl RangeScanOps {
 
     fn is_primary_key_scanning(&self) -> bool { DB::is_primary_key(self.key_id) }
 
-    fn get_index_key<'a>(&self, key: &'a [u8]) -> &'a [u8] {
+    fn get_index_key<'a>(&self, key: &'a [u8], pack_info: &[u8]) -> &'a [u8] {
         if self.is_primary_key_scanning() {
             &key[..key.len() - DB::COL_ID_LEN]
         } else {
-            key
+            DB::decode_index_from_secondary_index(key, pack_info)
         }
     }
 
@@ -108,10 +108,11 @@ impl RangeScanOps {
         debug_assert!(iter.key().len() >= DB::KEY_ID_LEN + DB::COL_ID_LEN);
         debug_assert!(!self.eof.get());
 
-        let key_ref = self.get_index_key(iter.key());
-        if !key_ref.starts_with(self.key_id_bytes()) {
+        if !iter.key().starts_with(self.key_id_bytes()) {
             return Err(Status::NotFound);
         }
+
+        let key_ref = self.get_index_key(iter.key(), iter.value());
         if key_ref == self.range_end.as_slice() {
             self.eof.set(true);
             if !self.right_close {
@@ -171,7 +172,7 @@ impl PhysicalPlanOps for RangeScanOps {
         if iter.status().is_corruption() {
             return Err(iter.status());
         }
-        let key = self.get_index_key(iter.key());
+        let key = self.get_index_key(iter.key(), iter.value());
         if key == self.range_begin.as_slice() {
             if !self.left_close {
                 iter.move_next();
