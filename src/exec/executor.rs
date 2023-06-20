@@ -654,7 +654,8 @@ impl Visitor for Executor {
         let mut maker = PlanMaker::new(&db, self.prepared_stmts.back().cloned(), &self.arena);
         let mut producer = if this.names.len() == 1 && this.relation.is_none() {
             // Simple delete
-            let rs = maker.make_rows_producer(this.names[0].as_str(), &this.where_clause, &this.limit_clause);
+            let rs = maker.make_rows_producer(this.names[0].as_str(), &this.where_clause,
+                                              &this.limit_clause);
             if let Err(e) = rs {
                 self.rs = e;
                 return;

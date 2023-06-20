@@ -217,7 +217,9 @@ impl LogReader {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+
     use crate::storage::{MemorySequentialFile, MemoryWritableFile, WritableFile};
+
     use super::*;
 
     #[test]

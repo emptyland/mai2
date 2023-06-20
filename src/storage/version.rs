@@ -844,7 +844,7 @@ impl Version {
     }
 
     pub fn get(&self, read_opts: &ReadOptions, key: &[u8], sequence_number: u64, cache: &TableCache) ->
-        Result<(PinnableValue, Tag)> {
+    Result<(PinnableValue, Tag)> {
         let internal_key = InternalKey::from_key(key, sequence_number, Tag::Key);
         let owns = self.owns.upgrade().unwrap();
         let internal_key_cmp = &owns.internal_key_cmp;

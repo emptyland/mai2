@@ -36,7 +36,7 @@ pub mod config;
 pub type Result<T> = std::result::Result<T, Status>;
 
 pub fn open_kv_storage(options: Options, name: String, column_family_descriptors: &[ColumnFamilyDescriptor])
-    -> Result<(Arc<dyn DB>, Vec<Arc<dyn ColumnFamily>>)> {
+                       -> Result<(Arc<dyn DB>, Vec<Arc<dyn ColumnFamily>>)> {
     let (db, cfs) = DBImpl::open(options, name, column_family_descriptors)?;
     Ok((db, cfs))
 }

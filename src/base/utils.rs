@@ -73,8 +73,8 @@ pub fn round_up<T>(x: *mut T, m: i64) -> *mut T {
     round_down((x as i64 + m - 1) as *mut T, m)
 }
 
-pub fn to_ascii_lowercase<const N: usize>(input: &str) -> [u8;N] {
-    let mut buf: [u8;N] = [0;N];
+pub fn to_ascii_lowercase<const N: usize>(input: &str) -> [u8; N] {
+    let mut buf: [u8; N] = [0; N];
     debug_assert!(input.as_bytes().len() <= buf.len());
     unsafe {
         ptr::copy_nonoverlapping(addr_of!(input.as_bytes()[0]), addr_of_mut!(buf[0]),
@@ -86,16 +86,16 @@ pub fn to_ascii_lowercase<const N: usize>(input: &str) -> [u8;N] {
 
 pub struct SliceReadWrapper<'a> {
     buf: &'a [u8],
-    position: usize
+    position: usize,
 }
 
-impl <'a> SliceReadWrapper<'a> {
+impl<'a> SliceReadWrapper<'a> {
     fn readable_in_bytes(&self) -> usize {
         self.buf.len() - self.position
     }
 }
 
-impl <'a> From<&'a str> for SliceReadWrapper<'a> {
+impl<'a> From<&'a str> for SliceReadWrapper<'a> {
     fn from(value: &'a str) -> Self {
         Self {
             buf: value.as_bytes(),
@@ -104,16 +104,16 @@ impl <'a> From<&'a str> for SliceReadWrapper<'a> {
     }
 }
 
-impl <'a> From<&'a String> for SliceReadWrapper<'a> {
+impl<'a> From<&'a String> for SliceReadWrapper<'a> {
     fn from(value: &'a String) -> Self {
         Self {
             buf: value.as_bytes(),
-            position: 0
+            position: 0,
         }
     }
 }
 
-impl <'a> Read for SliceReadWrapper<'a> {
+impl<'a> Read for SliceReadWrapper<'a> {
     fn read(&mut self, mut buf: &mut [u8]) -> std::io::Result<usize> {
         let len = min(buf.len(), self.readable_in_bytes());
         buf.write(&self.buf[self.position..self.position + len])?;

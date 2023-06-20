@@ -6,8 +6,8 @@ use std::sync::atomic::Ordering::{AcqRel, Acquire};
 
 use crate::{Result, Status};
 use crate::base::{Arena, ArenaRef, ScopedMemory};
-use crate::storage::inline_skip_list;
 use crate::storage::comparator::Comparator;
+use crate::storage::inline_skip_list;
 use crate::storage::inline_skip_list::InlineSkipList;
 use crate::storage::Iterator;
 use crate::storage::key::{InternalKey, InternalKeyComparator, KeyBundle, Tag};
@@ -148,6 +148,7 @@ impl Iterator for IteratorImpl {
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
+
     use crate::storage::BitwiseComparator;
 
     use super::*;

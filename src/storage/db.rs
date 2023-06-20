@@ -461,7 +461,7 @@ impl DBImpl {
     }
 
     fn drop_column_family_impl<'a>(&'a self, cfi: Arc<ColumnFamilyImpl>,
-                               mut versions: MutexGuard<'a, VersionSet>) -> Result<MutexGuard<VersionSet>> {
+                                   mut versions: MutexGuard<'a, VersionSet>) -> Result<MutexGuard<VersionSet>> {
         while cfi.background_progress() {
             // Waiting for all background progress done
             versions = cfi.background_cv.wait(versions).unwrap();
@@ -1072,7 +1072,9 @@ impl Drop for DBImpl {
         // Cleanup all temporary column families:
         let mut locking = self.versions.lock().unwrap();
         let cfs = locking.column_families().borrow().temporary_column_families();
-        log_debug!(self.logger, "temporary column families: {} will be cleanup.", cfs.len());
+        if !cfs.is_empty() {
+            log_debug!(self.logger, "temporary column families: {} will be cleanup.", cfs.len());
+        }
         for cfi in cfs {
             debug_assert!(cfi.options().temporary);
             locking = self.drop_column_family_impl(cfi.clone(), locking).unwrap();

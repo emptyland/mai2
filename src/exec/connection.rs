@@ -21,7 +21,7 @@ impl Connection {
     pub fn new(id: u64, db: &Weak<DB>) -> Self {
         Connection {
             id,
-            executor: RefCell::new(Executor::new(db))
+            executor: RefCell::new(Executor::new(db)),
         }
     }
 
@@ -48,13 +48,13 @@ impl Connection {
     }
 
     pub fn prepare_str(&self, sql: &str, arena: &ArenaMut<Arena>)
-        -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
+                       -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
         let mut rd = utils::SliceReadWrapper::from(sql);
         self.prepare(&mut rd, arena)
     }
 
     pub fn prepare<R: Read + ?Sized>(&self, reader: &mut R, arena: &ArenaMut<Arena>)
-        -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
+                                     -> Result<ArenaVec<ArenaBox<PreparedStatement>>> {
         self.executor.borrow_mut().prepare(reader, arena)
     }
 
@@ -88,7 +88,8 @@ impl Drop for Connection {
 }
 
 pub struct ResultSet {
-    arena: ArenaRef<Arena>, // for result tuple
+    arena: ArenaRef<Arena>,
+    // for result tuple
     columns: ArenaBox<ColumnSet>,
     current: Option<Tuple>,
     pub status: Status,
@@ -166,7 +167,7 @@ impl ResultSet {
         match &self.current {
             Some(tuple) => Ok(ResultRow {
                 tuple,
-                owns: self
+                owns: self,
             }),
             None => Err(Status::NotFound)
         }
@@ -175,10 +176,10 @@ impl ResultSet {
 
 pub struct ResultRow<'a> {
     tuple: &'a Tuple,
-    owns: &'a ResultSet
+    owns: &'a ResultSet,
 }
 
-impl <'a> ResultRow<'a> {
+impl<'a> ResultRow<'a> {
     pub fn columns(&self) -> &ColumnSet { self.tuple.columns() }
 
     pub fn column_ty(&self, i: usize) -> &ColumnType { &self.columns().columns[i].ty }
@@ -201,7 +202,7 @@ impl Drop for ResultSet {
 #[derive(Debug, Default)]
 pub struct FeedbackImpl {
     pub status: Status,
-    need_row_key: bool
+    need_row_key: bool,
 }
 
 impl FeedbackImpl {

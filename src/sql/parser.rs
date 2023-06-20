@@ -503,7 +503,7 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
                         self.match_expected(Token::On)?;
                         let on_clause = self.parse_expr()?;
                         let join_node = self.factory.new_join_clause(join_op, clause.clone(), rhs,
-                                                                                        on_clause);
+                                                                     on_clause);
                         node.from_clause = Some(ArenaBox::<dyn Statement>::from(join_node).into())
                     }
                     None => {}

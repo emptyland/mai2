@@ -402,6 +402,7 @@ impl ColumnFamily for ColumnFamilyHandle {
 }
 
 unsafe impl Send for ColumnFamilyHandle {}
+
 unsafe impl Sync for ColumnFamilyHandle {}
 
 pub struct ColumnFamilySet {
@@ -491,8 +492,8 @@ impl ColumnFamilySet {
     pub fn temporary_column_families(&self) -> Vec<Arc<ColumnFamilyImpl>> {
         self.column_families.values()
             .enumerate()
-            .map(|(_, x)| {x})
-            .filter(|x|{x.options().temporary})
+            .map(|(_, x)| { x })
+            .filter(|x| { x.options().temporary })
             .cloned()
             .collect()
     }

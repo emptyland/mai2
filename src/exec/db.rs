@@ -448,7 +448,7 @@ impl DB {
             if row_key != rk {
                 key.truncate(DB::KEY_ID_LEN); // still keep index id (4 bytes u32)
                 self.build_secondary_index_key(&table.column_family,
-                                               secondary_index_iter.as_ref().map(|x|{ x.borrow_mut() }),
+                                               secondary_index_iter.as_ref().map(|x| { x.borrow_mut() }),
                                                &col_vals,
                                                secondary_index,
                                                &col_id_to_idx,
@@ -474,7 +474,7 @@ impl DB {
         if !row_key.is_empty() {
             key.truncate(DB::KEY_ID_LEN); // still keep index id (4 bytes u32)
             self.build_secondary_index_key(&table.column_family,
-                                           secondary_index_iter.as_ref().map(|x|{ x.borrow_mut() }),
+                                           secondary_index_iter.as_ref().map(|x| { x.borrow_mut() }),
                                            &col_vals,
                                            secondary_index,
                                            &col_id_to_idx,
@@ -701,7 +701,7 @@ impl DB {
 
             let rs = row_producer.next(&mut feedback, &zone);
             if feedback.status.is_not_ok() {
-                break Err(feedback.status)
+                break Err(feedback.status);
             }
             if rs.is_none() {
                 break Ok(affected_rows);
@@ -784,7 +784,7 @@ impl DB {
     }
 
     fn iterate_multi_row_key<'a, F>(row_key: &'a [u8], mut callback: F)
-    where F: FnMut(u64, &'a [u8]) {
+        where F: FnMut(u64, &'a [u8]) {
         let mut pos = 0;
         while pos < row_key.len() {
             let id_part = &row_key[pos..pos + size_of::<u64>()];

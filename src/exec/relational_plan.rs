@@ -19,19 +19,19 @@ fn finalize(node: &mut dyn RelationalModel) {
 
 pub struct ChildrenIter<'a> {
     owns: &'a dyn RelationalModel,
-    index: usize
+    index: usize,
 }
 
-impl <'a> ChildrenIter<'a> {
+impl<'a> ChildrenIter<'a> {
     pub fn new(owns: &'a dyn RelationalModel) -> Self {
         Self {
             owns,
-            index: 0
+            index: 0,
         }
     }
 }
 
-impl <'a> Iterator for ChildrenIter<'a> {
+impl<'a> Iterator for ChildrenIter<'a> {
     type Item = ArenaBox<dyn RelationalModel>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -45,9 +45,7 @@ impl <'a> Iterator for ChildrenIter<'a> {
     }
 }
 
-pub struct Projection {
-
-}
+pub struct Projection {}
 
 pub struct Selection {
     pub filtering_expr: ArenaBox<dyn Expression>,
@@ -65,7 +63,7 @@ impl RelationalModel for Selection {
 }
 
 pub struct PhysicalTable {
-    pub table_ref: Option<Arc<TableHandle>>
+    pub table_ref: Option<Arc<TableHandle>>,
 }
 
 impl RelationalModel for PhysicalTable {

@@ -371,6 +371,7 @@ impl<'a, Cmp: for<'b> Comparing<&'b [u8]>> Iterator for IteratorImpl<'a, Cmp> {
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
+
     use crate::storage::{BitwiseComparator, Comparator};
     use crate::storage::key::{InternalKey, InternalKeyComparator};
 

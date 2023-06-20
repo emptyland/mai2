@@ -95,14 +95,22 @@ pub enum Token {
     Le,
     Gt,
     Ge,
-    LBrace, // {
-    RBrace, // }
-    LBracket, // [
-    RBracket, // ]
-    LParent, // (
-    RParent, // )
-    Comma, // ,
-    Semi, // ;
+    LBrace,
+    // {
+    RBrace,
+    // }
+    LBracket,
+    // [
+    RBracket,
+    // ]
+    LParent,
+    // (
+    RParent,
+    // )
+    Comma,
+    // ,
+    Semi,
+    // ;
     Dot, // .
 
     Question, // ?
@@ -200,7 +208,7 @@ impl Keywords {
     }
 
     pub fn keyword_or_else<Fn>(&self, key: &str, f: Fn) -> Token
-    where Fn: FnOnce() -> Token {
+        where Fn: FnOnce() -> Token {
         match self.get_keyword(key) {
             Some(token) => token,
             None => f()
@@ -268,7 +276,7 @@ impl<'a, R: Read + ?Sized> Lexer<'a, R> {
                     let start_pos = self.current_position();
                     self.move_next()?;
                     if self.peek().is_numeric() {
-                        return self.parse_number(true)
+                        return self.parse_number(true);
                     }
                     return Ok(self.to_single_token(Token::Minus, start_pos));
                 }
@@ -303,7 +311,7 @@ impl<'a, R: Read + ?Sized> Lexer<'a, R> {
                     } else {
                         let message = format!("Invalid token: `{}'", ch);
                         return Err(ParseError::TokenError(message,
-                                                          self.current_position()))
+                                                          self.current_position()));
                     }
                 }
             }
@@ -328,7 +336,7 @@ impl<'a, R: Read + ?Sized> Lexer<'a, R> {
             }
         }
         let token = KEYWORDS.keyword_or_else(id.as_str(),
-                                             ||{Token::Id(self.string(&id)) });
+                                             || { Token::Id(self.string(&id)) });
         Ok(self.to_concat_token(token, start_pos))
     }
 
@@ -344,7 +352,7 @@ impl<'a, R: Read + ?Sized> Lexer<'a, R> {
             } else if ch == '.' {
                 if has_dot {
                     return Err(ParseError::TokenError("Duplicated dot in number".to_string(),
-                                                      self.current_position()))
+                                                      self.current_position()));
                 } else {
                     self.move_next()?;
                     has_dot = true;
@@ -356,10 +364,10 @@ impl<'a, R: Read + ?Sized> Lexer<'a, R> {
         }
         let token = if has_dot {
             let n = f64::from_str(buf.as_str()).unwrap();
-            Token::FloatLiteral(if minus {-n} else {n})
+            Token::FloatLiteral(if minus { -n } else { n })
         } else {
             let n = i64::from_str(buf.as_str()).unwrap();
-            Token::IntLiteral(if minus {-n} else {n})
+            Token::IntLiteral(if minus { -n } else { n })
         };
         Ok(self.to_concat_token(token, start_pos))
     }
@@ -404,7 +412,7 @@ impl<'a, R: Read + ?Sized> Lexer<'a, R> {
             location: SourceLocation {
                 start: pos.clone(),
                 end: pos,
-            }
+            },
         }
     }
 

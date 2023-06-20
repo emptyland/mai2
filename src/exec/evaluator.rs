@@ -37,8 +37,10 @@ pub trait Context {
 pub enum Value {
     #[default]
     Undefined,
-    NegativeInf, // -∞
-    PositiveInf, // +∞
+    NegativeInf,
+    // -∞
+    PositiveInf,
+    // +∞
     Null,
     Int(i64),
     Float(f64),
@@ -137,7 +139,7 @@ impl PartialOrd for Value {
 
 unsafe impl Sync for Value {}
 
-impl <T: Clone> Reducer<T> {
+impl<T: Clone> Reducer<T> {
     pub fn new(arena: &ArenaMut<Arena>) -> Self {
         Self {
             arena: arena.clone(),
@@ -246,12 +248,12 @@ impl Evaluator {
 
     fn eval_compare_op<T: PartialOrd>(lhs: T, rhs: T, op: &Operator) -> Value {
         match op {
-            Operator::Lt => Value::Int(if lhs < rhs {1} else {0}),
-            Operator::Le => Value::Int(if lhs <= rhs {1} else {0}),
-            Operator::Gt => Value::Int(if lhs > rhs {1} else {0}),
-            Operator::Ge => Value::Int(if lhs >= rhs {1} else {0}),
-            Operator::Eq => Value::Int(if lhs == rhs {1} else {0}),
-            Operator::Ne => Value::Int(if lhs != rhs {1} else {0}),
+            Operator::Lt => Value::Int(if lhs < rhs { 1 } else { 0 }),
+            Operator::Le => Value::Int(if lhs <= rhs { 1 } else { 0 }),
+            Operator::Gt => Value::Int(if lhs > rhs { 1 } else { 0 }),
+            Operator::Ge => Value::Int(if lhs >= rhs { 1 } else { 0 }),
+            Operator::Eq => Value::Int(if lhs == rhs { 1 } else { 0 }),
+            Operator::Ne => Value::Int(if lhs != rhs { 1 } else { 0 }),
             _ => unreachable!()
         }
     }
@@ -314,10 +316,10 @@ impl Visitor for Evaluator {
             Operator::Not => {
                 let operand = self.evaluate_returning(this.operands_mut()[0].deref_mut());
                 match Self::require_int(&operand) {
-                    Value::Int(n) => self.ret(Value::Int(if n != 0 {1} else {0})),
+                    Value::Int(n) => self.ret(Value::Int(if n != 0 { 1 } else { 0 })),
                     _ => self.ret(operand)
                 }
-            },
+            }
             Operator::Minus => {
                 let operand = self.evaluate_returning(this.operands_mut()[0].deref_mut());
                 match Self::require_number(&operand) {
@@ -325,7 +327,7 @@ impl Visitor for Evaluator {
                     Value::Float(n) => self.ret(Value::Float(-n)),
                     _ => self.ret(operand)
                 }
-            },
+            }
             _ => unreachable!()
         }
     }
@@ -350,7 +352,7 @@ impl Visitor for Evaluator {
                 }
                 match lhs {
                     Value::Int(a) => match rhs {
-                        Value::Int(b) => self.ret(if b == 0 {Value::Null} else {Value::Int(a / b)}),
+                        Value::Int(b) => self.ret(if b == 0 { Value::Null } else { Value::Int(a / b) }),
                         Value::Float(b) => self.ret(Value::Float((a as f64) / b)),
                         _ => self.ret(rhs)
                     }
@@ -392,7 +394,7 @@ impl Visitor for Evaluator {
                 }
                 match lhs {
                     Value::Int(a) => match rhs {
-                        Value::Int(b) => self.ret(Value::Int(if a != 0 && b != 0 {1} else {0})),
+                        Value::Int(b) => self.ret(Value::Int(if a != 0 && b != 0 { 1 } else { 0 })),
                         _ => self.ret(rhs)
                     }
                     _ => self.ret(lhs)
@@ -403,7 +405,7 @@ impl Visitor for Evaluator {
                 let rhs = Self::require_int(&self.evaluate_returning(this.rhs_mut().deref_mut()));
                 match lhs {
                     Value::Int(a) => match rhs {
-                        Value::Int(b) => self.ret(Value::Int(if a != 0 || b != 0 {1} else {0})),
+                        Value::Int(b) => self.ret(Value::Int(if a != 0 || b != 0 { 1 } else { 0 })),
                         _ => self.ret(rhs)
                     }
                     _ => self.ret(lhs)

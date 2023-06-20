@@ -240,7 +240,7 @@ impl WriteBatch {
         self.redo.write(key).unwrap();
         (value.len() as u32).write_to(&mut self.redo);
         self.redo.write(value).unwrap();
-        self.need_wal += if cf.temporary() {0} else {1};
+        self.need_wal += if cf.temporary() { 0 } else { 1 };
     }
 
     pub fn delete(&mut self, cf: &Arc<dyn ColumnFamily>, key: &[u8]) {
@@ -248,7 +248,7 @@ impl WriteBatch {
         self.redo.push(Tag::Deletion.to_byte());
         (key.len() as u32).write_to(&mut self.redo);
         self.redo.write(key).unwrap();
-        self.need_wal += if cf.temporary() {0} else {1};
+        self.need_wal += if cf.temporary() { 0 } else { 1 };
     }
 
     pub fn iterate<S>(&self, stub: &S) where S: WriteBatchStub {

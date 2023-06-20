@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+
 //#[cfg(test)]
 pub mod testing {
     use std::ops::Deref;
@@ -42,7 +43,7 @@ pub mod testing {
             let mut cols = if alias.is_empty() {
                 ColumnSet::new(name, table.metadata.id, &self.arena)
             } else {
-                ColumnSet::new(alias, table.metadata.id,&self.arena)
+                ColumnSet::new(alias, table.metadata.id, &self.arena)
             };
             for col in &table.metadata.columns {
                 cols.append(col.name.as_str(), "", col.id, col.ty.clone());
@@ -54,7 +55,7 @@ pub mod testing {
             parse_sql_expr_from_content(sql, &self.arena)
         }
 
-        pub fn assert_rows(data: &[&str], mut rs: ResultSet) -> Result<() >{
+        pub fn assert_rows(data: &[&str], mut rs: ResultSet) -> Result<()> {
             let mut i = 0;
             while rs.next() {
                 assert_eq!(data[i], rs.current()?.to_string());

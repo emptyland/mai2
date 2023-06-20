@@ -197,9 +197,9 @@ mod udaf {
                         buf.rows += 1;
                     }
                     VariableNumber::Floating(n) => {
-                        let new_buf = NumberBuf{
+                        let new_buf = NumberBuf {
                             value: buf.value as f64 + n.value,
-                            rows: buf.rows + 1
+                            rows: buf.rows + 1,
                         };
                         rv.number = VariableNumber::Floating(new_buf);
                     }
@@ -219,6 +219,7 @@ mod udaf {
             }
         }
     }
+
     impl Aggregator for Sum {
         fn signature(&self, params: &[ColumnType]) -> ColumnType {
             if params.len() < 1 {
@@ -238,7 +239,7 @@ mod udaf {
 
         fn iterate(&self, dest: &mut dyn Writable, args: &[ArenaBox<dyn Writable>]) -> Result<()> {
             if args.len() != 1 {
-                return corrupted_err!("Invalid number of arguments, need 1, expected: {}", args.len())
+                return corrupted_err!("Invalid number of arguments, need 1, expected: {}", args.len());
             }
             Sum::apply(dest, args[0].deref());
             Ok(())
@@ -408,7 +409,7 @@ impl BuiltinFns {
     }
 
     fn new_udf(&self, name: &str, ctx: &ExecutionContext) -> Option<ArenaBox<dyn UDF>> {
-        let buf: [u8;64] = utils::to_ascii_lowercase(name);
+        let buf: [u8; 64] = utils::to_ascii_lowercase(name);
         match self.udfs.get(std::str::from_utf8(&buf[..name.len()]).unwrap()) {
             Some(new) =>
                 Some(new(ctx)),
@@ -417,7 +418,7 @@ impl BuiltinFns {
     }
 
     fn new_udaf(&self, name: &str, ctx: &ExecutionContext) -> Option<ArenaBox<dyn Aggregator>> {
-        let buf: [u8;64] = utils::to_ascii_lowercase(name);
+        let buf: [u8; 64] = utils::to_ascii_lowercase(name);
         match self.udafs.get(std::str::from_utf8(&buf[..name.len()]).unwrap()) {
             Some(new) =>
                 Some(new(ctx)),

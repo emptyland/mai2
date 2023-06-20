@@ -23,11 +23,11 @@ pub struct ArenaVal<T: Sized> {
     mut_count: Cell<usize>,
 }
 
-impl <T: Allocator + Sized> ArenaVal<T> {
+impl<T: Allocator + Sized> ArenaVal<T> {
     pub fn new(arena: T) -> Self {
         Self {
             core: arena,
-            mut_count: Cell::new(0)
+            mut_count: Cell::new(0),
         }
     }
 
@@ -40,7 +40,7 @@ impl <T: Allocator + Sized> ArenaVal<T> {
     }
 }
 
-impl <T> Deref for ArenaVal<T> {
+impl<T> Deref for ArenaVal<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target { &self.core }
@@ -51,7 +51,7 @@ pub struct ArenaRef<T> {
     mut_count: Cell<usize>,
 }
 
-impl <T: Allocator> ArenaRef<T> {
+impl<T: Allocator> ArenaRef<T> {
     pub fn new(arena: T) -> Self {
         let layout = Layout::for_value(&arena);
         let ptr = unsafe {
@@ -61,14 +61,14 @@ impl <T: Allocator> ArenaRef<T> {
         };
         Self {
             core: NonNull::new(ptr).unwrap(),
-            mut_count: Cell::new(0)
+            mut_count: Cell::new(0),
         }
     }
 
     pub fn get_mut(&self) -> ArenaMut<T> { ArenaMut::new(self) }
 }
 
-impl <T> Deref for ArenaRef<T> {
+impl<T> Deref for ArenaRef<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -76,7 +76,7 @@ impl <T> Deref for ArenaRef<T> {
     }
 }
 
-impl <T> Drop for ArenaRef<T> {
+impl<T> Drop for ArenaRef<T> {
     fn drop(&mut self) {
         let layout = Layout::new::<T>();
         unsafe {
@@ -88,10 +88,10 @@ impl <T> Drop for ArenaRef<T> {
 
 #[derive(Debug)]
 pub struct ArenaMut<T> {
-    shadow: NonNull<T>
+    shadow: NonNull<T>,
 }
 
-impl <T: Allocator> ArenaMut<T> {
+impl<T: Allocator> ArenaMut<T> {
     fn new(this: &ArenaRef<T>) -> Self {
         this.mut_count.set(this.mut_count.get() + 1);
         Self { shadow: this.core.clone() }
@@ -101,20 +101,20 @@ impl <T: Allocator> ArenaMut<T> {
     pub fn get_mut(&self) -> &mut T { unsafe { &mut *self.shadow.as_ptr() } }
 }
 
-impl <T> Deref for ArenaMut<T> {
+impl<T> Deref for ArenaMut<T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { self.shadow.as_ref() }
     }
 }
 
-impl <T> DerefMut for ArenaMut<T> {
+impl<T> DerefMut for ArenaMut<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { self.shadow.as_mut() }
     }
 }
 
-impl <T> Clone for ArenaMut<T> {
+impl<T> Clone for ArenaMut<T> {
     fn clone(&self) -> Self {
         Self { shadow: self.shadow }
     }
@@ -182,7 +182,7 @@ impl Arena {
             match head {
                 Some(page) => unsafe {
                     if page.as_ref().contains(p) {
-                        break true
+                        break true;
                     }
                     head = &page.as_ref().next;
                 }
@@ -197,7 +197,7 @@ impl Arena {
             match head {
                 Some(page) => unsafe {
                     if page.as_ref().contains(p) {
-                        break true
+                        break true;
                     }
                     head = &page.as_ref().next;
                 }
@@ -398,7 +398,7 @@ impl Allocator for ScopedMemory {
 }
 
 pub struct ArenaBox<T: ?Sized> {
-    naked: NonNull<T>
+    naked: NonNull<T>,
 }
 
 impl<T> ArenaBox<T> {
@@ -411,7 +411,7 @@ impl<T> ArenaBox<T> {
     }
 }
 
-impl <T> From<&T> for ArenaBox<T> {
+impl<T> From<&T> for ArenaBox<T> {
     fn from(value: &T) -> Self {
         Self {
             naked: NonNull::new(value as *const T as *mut T).unwrap()
@@ -419,7 +419,7 @@ impl <T> From<&T> for ArenaBox<T> {
     }
 }
 
-impl <T: ?Sized> From<NonNull<T>> for ArenaBox<T> {
+impl<T: ?Sized> From<NonNull<T>> for ArenaBox<T> {
     fn from(value: NonNull<T>) -> Self {
         Self {
             naked: value
@@ -427,7 +427,7 @@ impl <T: ?Sized> From<NonNull<T>> for ArenaBox<T> {
     }
 }
 
-impl <T: ?Sized> From<&mut T> for ArenaBox<T> {
+impl<T: ?Sized> From<&mut T> for ArenaBox<T> {
     fn from(value: &mut T) -> Self {
         Self {
             naked: NonNull::new(value as *mut T).unwrap()
@@ -755,19 +755,19 @@ impl<T> ArenaVec<T> {
     }
 }
 
-impl <T: Clone> ArenaVec<T> {
+impl<T: Clone> ArenaVec<T> {
     pub fn with_data(arena: &ArenaMut<Arena>, data: &[T]) -> Self {
-        Self::with_init(arena, |i|{
+        Self::with_init(arena, |i| {
             data[i].clone()
         }, data.len())
     }
 }
 
-impl <T: Clone> Clone for ArenaVec<T> {
+impl<T: Clone> Clone for ArenaVec<T> {
     fn clone(&self) -> Self { self.dup(&self.owns) }
 }
 
-impl <T: Clone> ArenaVec<T> {
+impl<T: Clone> ArenaVec<T> {
     pub fn to_vec(&self) -> Vec<T> {
         Vec::from(self.as_slice())
     }
@@ -781,13 +781,13 @@ impl <T: Clone> ArenaVec<T> {
     }
 }
 
-impl <T> Deref for ArenaVec<T> {
+impl<T> Deref for ArenaVec<T> {
     type Target = [T];
 
     fn deref(&self) -> &Self::Target { self.as_slice() }
 }
 
-impl <T> DerefMut for ArenaVec<T> {
+impl<T> DerefMut for ArenaVec<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_slice_mut()
     }
@@ -799,7 +799,7 @@ impl Hash for ArenaVec<u8> {
     }
 }
 
-impl <T: PartialEq> PartialEq for ArenaVec<T> {
+impl<T: PartialEq> PartialEq for ArenaVec<T> {
     fn eq(&self, other: &Self) -> bool {
         if self.len() == other.len() {
             for i in 0..self.len() {
@@ -813,9 +813,9 @@ impl <T: PartialEq> PartialEq for ArenaVec<T> {
     }
 }
 
-impl <T: Eq> Eq for ArenaVec<T> {}
+impl<T: Eq> Eq for ArenaVec<T> {}
 
-impl <T> Index<usize> for ArenaVec<T> {
+impl<T> Index<usize> for ArenaVec<T> {
     type Output = T;
 
     fn index(&self, index: usize) -> &Self::Output {

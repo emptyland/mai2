@@ -4,8 +4,8 @@ use std::ptr::{addr_of, addr_of_mut, NonNull};
 use std::slice;
 
 use num_enum::TryFromPrimitive;
-use crate::arena_vec;
 
+use crate::arena_vec;
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::sql::lexer::Token;
 
@@ -847,7 +847,9 @@ pub mod utils {
 #[cfg(test)]
 mod tests {
     use std::ops::DerefMut;
+
     use crate::sql::serialize::serialize_expr_to_string;
+
     use super::*;
 
     #[test]

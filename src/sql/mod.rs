@@ -14,7 +14,7 @@ pub mod serialize;
 
 
 pub fn parse_sql_expr_from_content(sql: &str, arena: &ArenaMut<Arena>)
-    -> crate::Result<ArenaBox<dyn Expression>> {
+                                   -> crate::Result<ArenaBox<dyn Expression>> {
     let mut rd = utils::SliceReadWrapper::from(sql);
     parse_sql_expr(&mut rd, arena)
 }
@@ -37,7 +37,7 @@ impl ParseError {
                         location.end.line,
                         location.end.column,
                         e)
-            },
+            }
             Self::TokenError(e, pos) => {
                 format!("Incorrect token: [{}:{}] {}", pos.line, pos.column, e)
             }

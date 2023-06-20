@@ -17,7 +17,7 @@ pub trait FixedEncode<T: Sized> {
 
 impl VarintEncode<bool> for bool {
     fn write_to(&self, buf: &mut Vec<u8>) -> usize {
-        buf.push(if *self {1} else {0});
+        buf.push(if *self { 1 } else { 0 });
         1
     }
 }

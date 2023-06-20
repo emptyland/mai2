@@ -12,7 +12,7 @@ use std::thread::yield_now;
 use crate::base::{Allocator, Arena, utils};
 
 pub struct LockingManagement {
-    lock_instances: RwLock<HashMap<u64, Arc<LockingInstance>>>
+    lock_instances: RwLock<HashMap<u64, Arc<LockingInstance>>>,
 }
 
 impl LockingManagement {
@@ -41,10 +41,11 @@ impl LockingManagement {
 pub struct LockingInstance {
     lock_stripes: [AtomicPtr<LockingStripe>; 1024],
     available_stripes: AtomicUsize,
-    arena: Mutex<Arena>
+    arena: Mutex<Arena>,
 }
 
 unsafe impl Sync for LockingInstance {}
+
 unsafe impl Send for LockingInstance {}
 
 impl LockingInstance {
@@ -54,16 +55,16 @@ impl LockingInstance {
 
     pub fn new() -> Self {
         Self {
-            lock_stripes: from_fn(|_|{AtomicPtr::new(ptr::null_mut())}),
+            lock_stripes: from_fn(|_| { AtomicPtr::new(ptr::null_mut()) }),
             available_stripes: AtomicUsize::new(0),
-            arena: Mutex::new(Arena::new())
+            arena: Mutex::new(Arena::new()),
         }
     }
 
     pub fn group(&self) -> LockingGroup {
         LockingGroup {
             owns: self,
-            stripes: HashSet::new()
+            stripes: HashSet::new(),
         }
     }
 
@@ -131,21 +132,21 @@ impl LockingGroup<'_> {
     }
 
     pub fn shared_lock_all(&self) -> Vec<RwLockReadGuard<u64>> {
-        self.stripes().iter().map(|x|{
+        self.stripes().iter().map(|x| {
             x.lock_count.fetch_add(1, Ordering::Relaxed);
             x.lock.read().unwrap()
         }).collect()
     }
 
     pub fn exclusive_lock_all(&self) -> Vec<RwLockWriteGuard<u64>> {
-        self.stripes().iter().map(|x|{
+        self.stripes().iter().map(|x| {
             x.lock_count.fetch_add(1, Ordering::Relaxed);
             x.lock.write().unwrap()
         }).collect()
     }
 
     fn stripes(&self) -> Vec<&LockingStripe> {
-        self.stripes.iter().map(|x|{
+        self.stripes.iter().map(|x| {
             self.owns.stripe_at_or_lazy_init(*x)
         }).collect()
     }

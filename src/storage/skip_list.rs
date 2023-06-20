@@ -1,5 +1,5 @@
-use std::cmp;
 use std::alloc::Layout;
+use std::cmp;
 use std::mem::{align_of, size_of};
 use std::ops::DerefMut;
 use std::ptr::{NonNull, slice_from_raw_parts, slice_from_raw_parts_mut};

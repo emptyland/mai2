@@ -780,7 +780,7 @@ impl GroupingAggregatorOps {
 
     fn aggregators_terminate(&mut self, zone: &ArenaRef<Arena>, group_key: Option<Tuple>) -> Result<Tuple> {
         let arena = zone.get_mut();
-        let mut tuple = Tuple::with_filling(&self.projected_columns, |_|{Value::Null}, arena.get_mut());
+        let mut tuple = Tuple::with_filling(&self.projected_columns, |_| { Value::Null }, arena.get_mut());
 
         debug_assert!(self.aggregators.len() <= self.projected_columns.len());
         for i in 0..self.aggregators.len() {
@@ -1454,7 +1454,7 @@ impl PhysicalPlanOps for IndexNestedLoopJoinOps {
                     } else {
                         break Some(self.merge_tuples(drive, match_, &arena));
                     }
-                },
+                }
                 Err(e) => {
                     if !e.is_not_found() {
                         feedback.catch_error(e);

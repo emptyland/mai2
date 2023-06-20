@@ -316,6 +316,7 @@ impl Comparator for InternalKeyComparator {
 mod tests {
     use crate::base::Arena;
     use crate::storage::BitwiseComparator;
+
     use super::*;
 
     #[test]
