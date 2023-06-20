@@ -22,7 +22,6 @@ use crate::storage::Comparator;
 use crate::storage::config::max_size_for_level;
 use crate::storage::key::{InternalKey, InternalKeyComparator, Tag};
 use crate::storage::Status;
-use crate::storage::Status::NotFound;
 use crate::storage::wal::{LogReader, LogWriter};
 
 pub struct VersionSet {
@@ -865,7 +864,7 @@ impl Version {
             let rs = cache.get(read_opts, owns.deref(), target_file.number,
                                &internal_key);
             if let Err(status) = &rs {
-                if *status != NotFound {
+                if !status.is_not_found() {
                     rs?;
                 }
                 continue;
@@ -881,7 +880,7 @@ impl Version {
                     let rs = cache.get(read_opts, owns.deref(), target_file.number,
                                        &internal_key);
                     if let Err(status) = &rs {
-                        if *status != NotFound {
+                        if !status.is_not_found() {
                             rs?;
                         }
                         continue;

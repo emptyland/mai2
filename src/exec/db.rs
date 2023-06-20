@@ -1,3 +1,4 @@
+use std::cell::RefMut;
 use std::collections::HashMap;
 use std::default::Default;
 use std::io::Write;
@@ -389,15 +390,13 @@ impl DB {
 
     pub fn build_secondary_index(&self, table: &TableHandle, secondary_index_id: u64) -> Result<u64> {
         let secondary_index = table.get_2rd_idx_by_id(secondary_index_id).unwrap();
-        let rd_opts = ReadOptions::default();
-        let iter_box = self.storage.new_iterator(&rd_opts, &table.column_family)?;
+        let iter_box = self.storage.new_iterator(&self.rd_opts, &table.column_family)?;
         let mut iter = iter_box.borrow_mut();
         let col_id_to_idx = {
             let mut tmp = HashMap::new();
             for i in 0..secondary_index.key_parts.len() {
                 let col_id = secondary_index.key_parts[i];
-                tmp.insert(secondary_index.key_parts[i],
-                           (i, table.get_col_by_id(col_id).unwrap()));
+                tmp.insert(secondary_index.key_parts[i], (i, table.get_col_by_id(col_id).unwrap()));
             }
             tmp
         };
@@ -414,10 +413,16 @@ impl DB {
 
         let lock_inst = self.locks.instance(table.metadata.id).unwrap();
 
+        let secondary_index_iter = if secondary_index.unique {
+            Some(self.storage.new_iterator(&self.rd_opts, &table.column_family)?)
+        } else {
+            None
+        };
+
         iter.seek(&Self::PRIMARY_KEY_ID_BYTES);
         while iter.valid() {
             if iter.key().len() <= Self::PRIMARY_KEY_ID_BYTES.len() + Self::COL_ID_LEN {
-                return Err(Status::corrupted("Incorrect primary key data, too small."));
+                corrupted_err!("Incorrect primary key data, too small.")?
             }
             let key_id = u32::from_be_bytes((&iter.key()[..4]).try_into().unwrap());
             if key_id != Self::PRIMARY_KEY_ID {
@@ -441,9 +446,15 @@ impl DB {
             }
 
             if row_key != rk {
-                key.truncate(4); // still keep index id (4 bytes u32)
-                self.build_secondary_index_key(&table.column_family, &col_vals, secondary_index,
-                                               &col_id_to_idx, &lock_inst, &row_key, &mut key)?;
+                key.truncate(DB::KEY_ID_LEN); // still keep index id (4 bytes u32)
+                self.build_secondary_index_key(&table.column_family,
+                                               secondary_index_iter.as_ref().map(|x|{ x.borrow_mut() }),
+                                               &col_vals,
+                                               secondary_index,
+                                               &col_id_to_idx,
+                                               &lock_inst,
+                                               &row_key,
+                                               &mut key)?;
 
                 affected_rows += 1;
                 col_vals.fill(Value::Null);
@@ -461,9 +472,15 @@ impl DB {
             iter.move_next();
         }
         if !row_key.is_empty() {
-            key.truncate(4); // still keep index id (4 bytes u32)
-            self.build_secondary_index_key(&table.column_family, &col_vals, secondary_index,
-                                           &col_id_to_idx, &lock_inst, &row_key, &mut key)?;
+            key.truncate(DB::KEY_ID_LEN); // still keep index id (4 bytes u32)
+            self.build_secondary_index_key(&table.column_family,
+                                           secondary_index_iter.as_ref().map(|x|{ x.borrow_mut() }),
+                                           &col_vals,
+                                           secondary_index,
+                                           &col_id_to_idx,
+                                           &lock_inst,
+                                           &row_key,
+                                           &mut key)?;
             affected_rows += 1;
         }
 
@@ -475,6 +492,7 @@ impl DB {
     }
 
     fn build_secondary_index_key(&self, column_family: &Arc<dyn ColumnFamily>,
+                                 iter: Option<RefMut<dyn storage::Iterator>>,
                                  col_vals: &[Value],
                                  secondary_index: &SecondaryIndexMetadata,
                                  col_id_to_idx: &HashMap<u32, (usize, &ColumnMetadata)>,
@@ -493,22 +511,22 @@ impl DB {
         } else {
             None
         };
+
         if secondary_index.unique {
-            match self.storage.get_pinnable(&self.rd_opts, &column_family, &key) {
-                Ok(_) => {
-                    let message = format!("Duplicated secondary key, index {} is unique.",
-                                          secondary_index.name);
-                    return Err(Status::corrupted(message));
-                }
-                Err(e) => {
-                    if e != Status::NotFound {
-                        return Err(e);
-                    }
-                }
+            let mut it = iter.unwrap();
+            it.seek(key);
+            if !it.valid() && !it.status().is_not_found() {
+                Err(it.status().clone())?;
+            }
+            // Secondary index key is exists!
+            if it.valid() && it.key().starts_with(key) {
+                corrupted_err!("Duplicated secondary key, index {} is unique.", secondary_index.name)?;
             }
         }
 
-        self.storage.insert(&self.wr_opts, &column_family, key, row_key)?;
+        key.write(row_key).unwrap();
+        let pack_info = (row_key.len() as u32).to_le_bytes();
+        self.storage.insert(&self.wr_opts, &column_family, key, &pack_info)?;
         Ok(())
     }
 
@@ -585,8 +603,7 @@ impl DB {
                        -> Result<u64> {
         let mut batch = WriteBatch::new();
         let wr_opts = WriteOptions::default();
-        debug_assert_eq!(column_family.name(),
-                         format!("{}{}", Self::DATA_COL_TABLE_PREFIX, &table.id));
+        debug_assert_eq!(column_family.name(), format!("{}{}", Self::DATA_COL_TABLE_PREFIX, &table.id));
 
         let inst = self.locks.instance(table.id).unwrap();
         let mut lock_group = inst.group();
@@ -598,7 +615,7 @@ impl DB {
         for index in secondary_indices {
             for i in 0..table.secondary_indices.len() {
                 if table.secondary_indices[i].unique {
-                    lock_group.add(index.index_keys[i].as_slice());
+                    lock_group.add(index.index(i));
                 }
             }
         }
@@ -629,7 +646,6 @@ impl DB {
                 let value = tuple.get(col.order);
                 debug_assert!(!value.is_undefined());
                 if value.is_null() {
-                    //dbg!(value);
                     continue;
                 }
                 key.write(&col.id.to_be_bytes()).unwrap();
@@ -643,17 +659,23 @@ impl DB {
             key.clear();
         }
 
+        let iter_box = self.storage.new_iterator(&self.rd_opts, column_family)?;
         for index in secondary_indices {
             for i in 0..table.secondary_indices.len() {
-                let key = index.index_keys[i].as_slice();
                 if table.secondary_indices[i].unique {
-                    if self.storage.get_pinnable(&rd_opts, column_family, key).is_ok() {
-                        corrupted_err!("Duplicated secondary key, index {} is unique.",
-                            table.secondary_indices[i].name)?;
+                    let mut iter = iter_box.borrow_mut();
+
+                    let secondary_index_key = index.index(i);
+                    iter.seek(secondary_index_key);
+                    if !iter.valid() && !iter.status().is_not_found() {
+                        Err(iter.status().clone())?;
+                    }
+                    if iter.valid() && iter.key().starts_with(secondary_index_key) {
+                        corrupted_err!("Duplicated secondary key, index {} is unique.", table.secondary_indices[i].name)?;
                     }
                 }
                 let pack_info = (index.row_key().len() as u32).to_le_bytes();
-                batch.insert(column_family, key, &pack_info);
+                batch.insert(column_family, &index.index_keys[i], &pack_info);
             }
         }
 
@@ -665,7 +687,6 @@ impl DB {
         }
 
         self.storage.write(&wr_opts, batch)?;
-        //log_debug!(self.logger, "rows: {} insert ok", tuples.len());
         Ok(tuples.len() as u64)
     }
 
@@ -1748,11 +1769,13 @@ mod tests {
             if index_id != 2 {
                 break;
             }
+            let index = DB::decode_index_from_secondary_index(iter.key(), iter.value());
 
-            let null_byte = iter.key()[4];
+            let null_byte = index[4];
             assert_eq!(DB::NOT_NULL_BYTE, null_byte);
 
-            let key = std::str::from_utf8(&iter.key()[5..]).unwrap();
+
+            let key = std::str::from_utf8(&index[5..]).unwrap();
             assert_eq!(9, key.len());
             assert_eq!(i, u32::from_str_radix(key.trim(), 10).unwrap());
 

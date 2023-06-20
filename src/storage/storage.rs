@@ -313,6 +313,9 @@ pub trait DB: Send + Sync {
     fn get_pinnable(&self, options: &ReadOptions, column_family: &Arc<dyn ColumnFamily>,
                     key: &[u8]) -> Result<PinnableValue>;
 
+    // fn nearly_prefix_pinnable(&self, options: &ReadOptions, column_family: &Arc<dyn ColumnFamily>,
+    //                           prefix: &[u8]) -> Result<PinnableValue>;
+
     fn new_iterator(&self, options: &ReadOptions, column_family: &Arc<dyn ColumnFamily>)
                     -> Result<IteratorArc>;
 

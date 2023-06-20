@@ -499,7 +499,7 @@ impl Visitor for Executor {
             }
             Ok(affected_rows) => {
                 db.write_table_metadata(&shadow_table.metadata).unwrap();
-                // TODO
+                // TODO:
                 self.affected_rows = affected_rows;
             }
         }
@@ -531,8 +531,7 @@ impl Visitor for Executor {
                     break;
                 }
             }
-            debug_assert_eq!(table.metadata.secondary_indices.len() - 1,
-                             metadata.secondary_indices.len());
+            debug_assert_eq!(table.metadata.secondary_indices.len() - 1, metadata.secondary_indices.len());
             table.update(metadata)
         });
 
@@ -549,38 +548,6 @@ impl Visitor for Executor {
                 // TODO: record warning message
             }
         }
-    }
-
-    fn visit_delete(&mut self, this: &mut Delete) {
-        debug_assert!(!this.names.is_empty());
-        let db = self.db.upgrade().unwrap();
-        let mut tables_will_be_delete = arena_vec!(&self.arena);
-        let tables = db.lock_tables();
-        for name in &this.names {
-            match tables.get(&name.to_string()) {
-                Some(table) => tables_will_be_delete.push(table.clone()),
-                None => visit_fatal!(self, "Table name: {name} not found."),
-            }
-        }
-        drop(tables);
-
-        let mut maker = PlanMaker::new(&db, self.prepared_stmts.back().cloned(), &self.arena);
-        let mut producer = if this.names.len() == 1 && this.relation.is_none() {
-            // Simple delete
-            let rs = maker.make_rows_producer(this.names[0].as_str(), &this.where_clause, &this.limit_clause);
-            if let Err(e) = rs {
-                self.rs = e;
-                return;
-            }
-            rs.unwrap()
-        } else {
-            todo!()
-        };
-        match db.delete_rows(&tables_will_be_delete, producer.clone()) {
-            Ok(affected_rows) => self.affected_rows = affected_rows,
-            Err(e) => self.rs = e
-        }
-        producer.finalize();
     }
 
     fn visit_insert_into_table(&mut self, this: &mut InsertIntoTable) {
@@ -601,8 +568,7 @@ impl Visitor for Executor {
         for col_name in &this.columns_name {
             match table.get_col_by_name(&col_name.to_string()) {
                 Some(col) => insertion_cols.push(col.id),
-                None => visit_fatal!(self, "Column: `{}` not found in table: `{}`",
-                    col_name.as_str(), this.table_name)
+                None => visit_fatal!(self, "Column: `{}` not found in table: `{}`", col_name.as_str(), this.table_name)
             }
         }
         for col in &table.metadata.columns {
@@ -614,8 +580,7 @@ impl Visitor for Executor {
 
         for row in &this.values {
             if row.len() < insertion_cols.len() {
-                visit_fatal!(self, "Not enough number of row values for insertion, need: {}",
-                    insertion_cols.len());
+                visit_fatal!(self, "Not enough number of row values for insertion, need: {}", insertion_cols.len());
             }
         }
 
@@ -657,6 +622,10 @@ impl Visitor for Executor {
         }
     }
 
+    fn visit_collection(&mut self, this: &mut Collection) {
+        self.process_dql(this);
+    }
+
     fn visit_select(&mut self, this: &mut Select) {
         match &this.from_clause {
             None => { // fast path
@@ -669,8 +638,36 @@ impl Visitor for Executor {
         }
     }
 
-    fn visit_collection(&mut self, this: &mut Collection) {
-        self.process_dql(this);
+    fn visit_delete(&mut self, this: &mut Delete) {
+        debug_assert!(!this.names.is_empty());
+        let db = self.db.upgrade().unwrap();
+        let mut tables_will_be_delete = arena_vec!(&self.arena);
+        let tables = db.lock_tables();
+        for name in &this.names {
+            match tables.get(&name.to_string()) {
+                Some(table) => tables_will_be_delete.push(table.clone()),
+                None => visit_fatal!(self, "Table name: {name} not found."),
+            }
+        }
+        drop(tables);
+
+        let mut maker = PlanMaker::new(&db, self.prepared_stmts.back().cloned(), &self.arena);
+        let mut producer = if this.names.len() == 1 && this.relation.is_none() {
+            // Simple delete
+            let rs = maker.make_rows_producer(this.names[0].as_str(), &this.where_clause, &this.limit_clause);
+            if let Err(e) = rs {
+                self.rs = e;
+                return;
+            }
+            rs.unwrap()
+        } else {
+            todo!()
+        };
+        match db.delete_rows(&tables_will_be_delete, producer.clone()) {
+            Ok(affected_rows) => self.affected_rows = affected_rows,
+            Err(e) => self.rs = e
+        }
+        producer.finalize();
     }
 }
 
@@ -950,6 +947,15 @@ impl SecondaryIndexBundle {
 
     pub fn row_key(&self) -> &[u8] {
         unsafe { self.row_key.as_ref() }
+    }
+
+    pub fn index_with_row_key(&self, i: usize) -> &[u8] {
+        self.index_keys[i].as_slice()
+    }
+
+    pub fn index(&self, i: usize) -> &[u8] {
+        let full_key = self.index_with_row_key(i);
+        &full_key[..full_key.len() - self.row_key().len()]
     }
 }
 
