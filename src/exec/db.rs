@@ -1,5 +1,5 @@
 use std::cell::RefMut;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::default::Default;
 use std::io::Write;
 use std::iter;
@@ -710,24 +710,95 @@ impl DB {
             let row_key = tuple.row_key();
 
             let arena = zone.get_mut();
-            let mut key_buf = ArenaVec::with_data(&arena, row_key);
-            if tables.len() == 1 {
-                self.delete_rows_impl(&tables[0], &mut key_buf)?;
-            } else {
-                todo!()
+            for table in tables {
+                self.delete_row_impl(table, &tuple, &arena)?;
             }
             affected_rows += 1;
         }
     }
 
-    fn delete_rows_impl(&self, table: &TableRef, key_buf: &mut ArenaVec<u8>) -> Result<()> {
-        let original_len = key_buf.len();
-        for col in &table.metadata.columns {
-            Self::encode_col_id(col.id, key_buf);
-            self.storage.delete(&self.wr_opts, &table.column_family, key_buf)?;
-            key_buf.truncate(original_len);
+    fn delete_row_impl(&self, table: &TableRef, tuple: &Tuple, arena: &ArenaMut<Arena>) -> Result<()> {
+        let inst = self.locks.instance(table.metadata.id).unwrap();
+        let mut lock_group = inst.group();
+
+        let mut updates = WriteBatch::new();
+        let mut key = ArenaVec::<u8>::new(arena);
+
+        debug_assert_ne!(0, table.metadata.id);
+        let row_keys = Self::extract_multi_row_keys_from_tuple(tuple, table.metadata.id);
+
+        for row_key in &row_keys {
+            lock_group.add(row_key);
+
+            key.clear();
+            key.write(row_key).unwrap();
+
+            let original_len = key.len();
+            for col in &table.metadata.columns {
+                Self::encode_col_id(col.id, &mut key);
+                updates.delete(&table.column_family, &key);
+                key.truncate(original_len);
+            }
         }
-        Ok(())
+
+        for index in &table.metadata.secondary_indices {
+            key.clear();
+            Self::encode_idx_id(index.id, &mut key);
+            for col_id in &index.key_parts {
+                let col = table.get_col_by_id(*col_id).unwrap();
+                let pos = if tuple.columns().table_id() == Some(table.metadata.id) {
+                    tuple.columns().index_by_id(col.id).unwrap()
+                } else {
+                    tuple.columns().index_by_prefix_and_id(table.metadata.name.as_str(), col.id).unwrap()
+                };
+                Self::encode_secondary_index(&tuple[pos], &col.ty, &mut key);
+            }
+            if index.unique {
+                lock_group.add(&key);
+            }
+
+            let original_len = key.len();
+            for row_key in &row_keys {
+                key.write(row_key).unwrap();
+                updates.delete(&table.column_family, &key);
+                key.truncate(original_len);
+            }
+        }
+
+        let _locking = lock_group.exclusive_lock_all();
+        self.storage.write(&self.wr_opts, updates)
+    }
+
+    fn extract_multi_row_keys_from_tuple(tuple: &Tuple, table_id: u64) -> HashSet<&[u8]> {
+        let mut row_keys = HashSet::new();
+        if tuple.columns().table_id() == Some(table_id) {
+            row_keys.insert(tuple.row_key());
+        } else {
+            Self::iterate_multi_row_key(tuple.row_key(), |tid, row_key| {
+                if tid == table_id {
+                    row_keys.insert(row_key);
+                }
+            });
+        }
+        row_keys
+    }
+
+    fn iterate_multi_row_key<'a, F>(row_key: &'a [u8], mut callback: F)
+    where F: FnMut(u64, &'a [u8]) {
+        let mut pos = 0;
+        while pos < row_key.len() {
+            let id_part = &row_key[pos..pos + size_of::<u64>()];
+            let id = u64::from_be_bytes(id_part.try_into().unwrap());
+            pos += size_of::<u64>();
+
+            let len_part = &row_key[pos..pos + size_of::<u32>()];
+            pos += size_of::<u32>();
+            let len = u32::from_be_bytes(len_part.try_into().unwrap()) as usize;
+
+            let part = &row_key[pos..pos + len];
+            pos += len;
+            callback(id, part)
+        }
     }
 
     pub fn is_primary_key(key_id: u64) -> bool { key_id == DB::PRIMARY_KEY_ID as u64 }

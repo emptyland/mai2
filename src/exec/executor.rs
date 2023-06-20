@@ -729,6 +729,16 @@ impl ColumnSet {
         None
     }
 
+    pub fn index_by_prefix_and_id(&self, prefix: &str, col_id: u32) -> Option<usize> {
+        for i in 0..self.columns.len() {
+            let col = &self.columns[i];
+            if col.desc.as_str() == prefix && col.id == col_id {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     pub fn find_by_name(&self, prefix: &str, suffix: &str) -> Option<&Column> {
         self.index_by_name(prefix, suffix).map(|x| {
             &self.columns[x]
