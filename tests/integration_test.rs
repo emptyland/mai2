@@ -267,3 +267,25 @@ fn sql_simple_delete_one() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn sql_multi_delete_one() -> Result<()> {
+    let suite = SqlSuite::new("tests/dbi-009")?;
+    suite.execute_file(Path::new("testdata/t3_t4_small_data_for_join.sql"), &suite.arena)?;
+
+    let data = [
+        "(2, 101, \"Jc\", 2, 101, \"Jc\")",
+    ];
+    let rs = suite.execute_query_str("select * from t3 right join t4 on(t3.id = t4.id) where t3.id = 2", &suite.arena)?;
+    SqlSuite::assert_rows(&data, rs)?;
+
+    suite.execute_str("delete t3, t4 from t3 right join t4 on (t3.id = t4.id) where t3.id = 2", &suite.arena)?;
+
+    let data = [
+        "(1, 100, \"Js\", 1, 101, \"Js\")",
+        "(3, 102, \"Jk\", 3, 102, \"Jk\")",
+    ];
+    let rs = suite.execute_query_str("select * from t3 right join t4 on(t3.id = t4.id)", &suite.arena)?;
+    SqlSuite::assert_rows(&data, rs)?;
+    Ok(())
+}

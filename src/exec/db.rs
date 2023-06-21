@@ -746,10 +746,10 @@ impl DB {
             Self::encode_idx_id(index.id, &mut key);
             for col_id in &index.key_parts {
                 let col = table.get_col_by_id(*col_id).unwrap();
-                let pos = if tuple.columns().table_id() == Some(table.metadata.id) {
+                let pos = if tuple.columns().original_table_id() == Some(table.metadata.id) {
                     tuple.columns().index_by_id(col.id).unwrap()
                 } else {
-                    tuple.columns().index_by_prefix_and_id(table.metadata.name.as_str(), col.id).unwrap()
+                    tuple.columns().index_by_original_and_id(table.metadata.id, col.id).unwrap()
                 };
                 Self::encode_secondary_index(&tuple[pos], &col.ty, &mut key);
             }
@@ -771,7 +771,7 @@ impl DB {
 
     fn extract_multi_row_keys_from_tuple(tuple: &Tuple, table_id: u64) -> HashSet<&[u8]> {
         let mut row_keys = HashSet::new();
-        if tuple.columns().table_id() == Some(table_id) {
+        if tuple.columns().original_table_id() == Some(table_id) {
             row_keys.insert(tuple.row_key());
         } else {
             Self::iterate_multi_row_key(tuple.row_key(), |tid, row_key| {
@@ -783,8 +783,7 @@ impl DB {
         row_keys
     }
 
-    fn iterate_multi_row_key<'a, F>(row_key: &'a [u8], mut callback: F)
-        where F: FnMut(u64, &'a [u8]) {
+    fn iterate_multi_row_key<'a, F>(row_key: &'a [u8], mut callback: F) where F: FnMut(u64, &'a [u8]) {
         let mut pos = 0;
         while pos < row_key.len() {
             let id_part = &row_key[pos..pos + size_of::<u64>()];
@@ -798,6 +797,17 @@ impl DB {
             let part = &row_key[pos..pos + len];
             pos += len;
             callback(id, part)
+        }
+    }
+
+    pub fn encode_multi_row_key<W: Write>(tuple: &Tuple, w: &mut W) {
+        debug_assert!(!tuple.row_key().is_empty());
+        if let Some(tid) = tuple.columns().original_table_id() {
+            w.write(&tid.to_be_bytes()).unwrap();
+            w.write(&(tuple.row_key().len() as u32).to_be_bytes()).unwrap();
+            w.write(tuple.row_key()).unwrap();
+        } else {
+            w.write(tuple.row_key()).unwrap();
         }
     }
 

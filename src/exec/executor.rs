@@ -572,7 +572,7 @@ impl Visitor for Executor {
             }
         }
         for col in &table.metadata.columns {
-            columns.append(col.name.as_str(), "", col.id, col.ty.clone());
+            columns.append_physical(col.name.as_str(), table.metadata.id, col.id, col.ty.clone());
         }
 
         let use_anonymous_row_key = table.metadata.primary_keys.is_empty();
@@ -652,18 +652,17 @@ impl Visitor for Executor {
         drop(tables);
 
         let mut maker = PlanMaker::new(&db, self.prepared_stmts.back().cloned(), &self.arena);
-        let mut producer = if this.names.len() == 1 && this.relation.is_none() {
+        let rs = if this.names.len() == 1 && this.relation.is_none() {
             // Simple delete
-            let rs = maker.make_rows_producer(this.names[0].as_str(), &this.where_clause,
-                                              &this.limit_clause);
-            if let Err(e) = rs {
-                self.rs = e;
-                return;
-            }
-            rs.unwrap()
+            maker.make_rows_simple_producer(this.names[0].as_str(), &this.where_clause, &this.limit_clause)
         } else {
-            todo!()
+            maker.make_rows_multi_producer(this.relation.as_ref().unwrap(), &this.where_clause, &this.limit_clause)
         };
+        if let Err(e) = rs {
+            self.rs = e;
+            return;
+        }
+        let mut producer = rs.unwrap().clone();
         match db.delete_rows(&tables_will_be_delete, producer.clone()) {
             Ok(affected_rows) => self.affected_rows = affected_rows,
             Err(e) => self.rs = e
@@ -691,7 +690,7 @@ impl ColumnSet {
         }
     }
 
-    pub fn table_id(&self) -> Option<u64> {
+    pub fn original_table_id(&self) -> Option<u64> {
         if self.tid > 0 {
             Some(self.tid)
         } else {
@@ -700,15 +699,20 @@ impl ColumnSet {
     }
 
     pub fn append_with_name(&mut self, name: &str, ty: ColumnType) {
-        self.append(name, "", 0, ty);
+        self.append(name, "", 0, 0, ty);
     }
 
-    pub fn append(&mut self, name: &str, desc: &str, id: u32, ty: ColumnType) {
+    pub fn append_physical(&mut self, name: &str, table_id: u64, id: u32, ty: ColumnType) {
+        self.append(name, "", table_id, id, ty)
+    }
+
+    pub fn append(&mut self, name: &str, desc: &str, table_id: u64, id: u32, ty: ColumnType) {
         let order = self.columns.len();
         self.columns.push(Column {
             name: ArenaStr::from_arena(name, &mut self.arena),
             desc: ArenaStr::from_arena(desc, &mut self.arena),
             id,
+            original_tid: table_id,
             ty,
             order,
         });
@@ -730,10 +734,10 @@ impl ColumnSet {
         None
     }
 
-    pub fn index_by_prefix_and_id(&self, prefix: &str, col_id: u32) -> Option<usize> {
+    pub fn index_by_original_and_id(&self, table_id: u64, col_id: u32) -> Option<usize> {
         for i in 0..self.columns.len() {
             let col = &self.columns[i];
-            if col.desc.as_str() == prefix && col.id == col_id {
+            if col.original_tid == table_id && col.id == col_id {
                 return Some(i);
             }
         }
@@ -777,7 +781,8 @@ impl Index<usize> for ColumnSet {
 pub struct Column {
     pub name: ArenaStr,
     pub desc: ArenaStr,
-    pub id: u32,
+    pub id: u32,           // physical column id
+    pub original_tid: u64, // original physical table id
     pub ty: ColumnType,
     pub order: usize,
 }

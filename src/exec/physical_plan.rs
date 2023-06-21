@@ -623,7 +623,7 @@ impl PhysicalPlanOps for RenamingOps {
             } else {
                 self.columns_as[i].as_str()
             };
-            cols.append(name, col.desc.as_str(), col.id, col.ty.clone());
+            cols.append(name, col.desc.as_str(), col.original_tid, col.id, col.ty.clone());
         }
         self.projected_columns = Some(ArenaBox::new(cols, self.arena.get_mut()));
         Ok(self.projected_columns.clone().unwrap())
@@ -1030,7 +1030,7 @@ impl SimpleNestedLoopJoinOps {
             env.attach(&tuple);
             let rv = evaluator.evaluate(self.matching.deref_mut(), env.clone())?;
             if Evaluator::normalize_to_bool(&rv) {
-                break Ok(tuple.dup(owns));
+                break Ok(Self::finalize_tuple(tuple, drive, match_, feedback.need_row_key(), owns));
             }
         }
     }
@@ -1071,9 +1071,20 @@ impl SimpleNestedLoopJoinOps {
             env.attach(&tuple);
             let rv = evaluator.evaluate(self.matching.deref_mut(), env.clone())?;
             if Evaluator::normalize_to_bool(&rv) {
-                break Ok(tuple.dup(owns));
+                break Ok(Self::finalize_tuple(tuple, drive, match_, feedback.need_row_key(), owns));
             }
         }
+    }
+
+    fn finalize_tuple(tuple: Tuple, this: Tuple, that: Tuple, need_row_key: bool, arena: &ArenaMut<Arena>) -> Tuple {
+        let mut row = tuple.dup(arena);
+        if need_row_key {
+            let mut multi_row_key = arena_vec!(arena);
+            DB::encode_multi_row_key(&this, &mut multi_row_key);
+            DB::encode_multi_row_key(&that, &mut multi_row_key);
+            row.attach_row_key(multi_row_key);
+        }
+        row
     }
 }
 
@@ -1144,6 +1155,7 @@ pub struct IndexNestedLoopJoinOps {
     matching_columns: ArenaBox<ColumnSet>,
     matching_key_id: u64,
     matching_key: RefCell<ArenaVec<u8>>,
+    need_produce_row_key: bool,
 
     storage: Option<Arc<dyn storage::DB>>,
     iter: Option<IteratorArc>,
@@ -1177,6 +1189,7 @@ impl IndexNestedLoopJoinOps {
             matching_columns,
             matching_key_id,
             matching_key: RefCell::new(arena_vec!(&arena)),
+            need_produce_row_key: false,
             arena,
             storage: Some(storage),
             iter: None,
@@ -1193,10 +1206,6 @@ impl IndexNestedLoopJoinOps {
             let iter_box = self.iter.as_ref().unwrap().clone();
             let iter = iter_box.borrow();
             let arena = zone.get_mut();
-            // if iter.valid() {
-            //     dbg!(iter.key());
-            //     dbg!(&self.matching_key.borrow());
-            // }
             if iter.valid() && iter.key().starts_with(&self.matching_key.borrow()) {
                 Some(DB::decode_tuple(&self.driving_columns, &self.driving_vals, &arena))
             } else {
@@ -1352,6 +1361,9 @@ impl IndexNestedLoopJoinOps {
             let row_key = &iter.key()[..iter.key().len() - DB::COL_ID_LEN];
             if prev_row_key.is_empty() {
                 (&mut prev_row_key).write(row_key).unwrap();
+                if self.need_produce_row_key {
+                    tuple.attach_row_key(ArenaVec::with_data(arena, row_key));
+                }
             }
             let (_, col_id) = DB::parse_row_key(iter.key());
 
@@ -1360,9 +1372,9 @@ impl IndexNestedLoopJoinOps {
             tuple.set(i, value);
 
             if prev_row_key.as_slice() != row_key {
-                prev_row_key.clear();
-                (&mut prev_row_key).write(row_key).unwrap();
-                tuple.associate_row_key(&prev_row_key);
+                // prev_row_key.clear();
+                // (&mut prev_row_key).write(row_key).unwrap();
+                // tuple.associate_row_key(&prev_row_key);
                 return Ok(tuple);
             }
             iter.move_next();
@@ -1382,6 +1394,12 @@ impl IndexNestedLoopJoinOps {
         for i in drive.len()..tuple.len() {
             tuple.set(i, match_[i - drive.len()].dup(arena));
         }
+        if self.need_produce_row_key {
+            let mut multi_row_key = arena_vec!(arena);
+            DB::encode_multi_row_key(&drive, &mut multi_row_key);
+            DB::encode_multi_row_key(&match_, &mut multi_row_key);
+            tuple.attach_row_key(multi_row_key);
+        }
         tuple
     }
 
@@ -1393,6 +1411,11 @@ impl IndexNestedLoopJoinOps {
         }
         for i in drive.len()..tuple.len() {
             tuple.set(i, Value::Null);
+        }
+        if self.need_produce_row_key {
+            let mut multi_row_key = arena_vec!(arena);
+            DB::encode_multi_row_key(&drive, &mut multi_row_key);
+            tuple.attach_row_key(multi_row_key);
         }
         tuple
     }
@@ -1408,7 +1431,11 @@ impl IndexNestedLoopJoinOps {
         for i in match_len..tuple.len() {
             tuple.set(i, drive[i - match_len].dup(arena));
         }
-
+        if self.need_produce_row_key {
+            let mut multi_row_key = arena_vec!(arena);
+            DB::encode_multi_row_key(&drive, &mut multi_row_key);
+            tuple.attach_row_key(multi_row_key);
+        }
         tuple
     }
 }
@@ -1442,6 +1469,7 @@ impl PhysicalPlanOps for IndexNestedLoopJoinOps {
     fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
         let arena = zone.get_mut();
         loop {
+            self.need_produce_row_key = feedback.need_row_key();
             let rs = self.next_driving_tuple(feedback, zone);
             if rs.is_none() {
                 break None;
@@ -1577,8 +1605,8 @@ mod tests {
         DB::encode_row_key(&Value::Int(N), &ty, &mut end_key)?;
 
         let mut columns = ArenaBox::new(ColumnSet::new("t1", 0, &arena), arena.get_mut());
-        columns.append("id", "", 1, ColumnType::Int(11));
-        columns.append("name", "", 2, ColumnType::Varchar(64));
+        columns.append("id", "", 0, 1, ColumnType::Int(11));
+        columns.append("name", "", 0, 2, ColumnType::Varchar(64));
 
         let mut plan = RangeScanOps::new(columns,
                                          begin_key, true,
@@ -1608,9 +1636,9 @@ mod tests {
         let zone = Arena::new_ref();
         let arena = zone.get_mut();
         let mut t1_cols = ColumnSet::new("t1", 0, &arena);
-        t1_cols.append("a", "", 0, ColumnType::Int(11));
-        t1_cols.append("b", "", 2, ColumnType::Int(11));
-        t1_cols.append("c", "", 3, ColumnType::Int(11));
+        t1_cols.append("a", "", 0, 1, ColumnType::Int(11));
+        t1_cols.append("b", "", 0, 2, ColumnType::Int(11));
+        t1_cols.append("c", "", 0, 3, ColumnType::Int(11));
         let t1 = ArenaBox::new(t1_cols, arena.get_mut());
         let mut data = arena_vec!(&arena);
         for i in 0..3 {
@@ -1624,9 +1652,9 @@ mod tests {
             ArenaBox::new(MockingProducerOps::new(data, t1.clone()), arena.get_mut());
 
         let mut t2_cols = ColumnSet::new("t2", 0, &arena);
-        t2_cols.append("d", "", 0, ColumnType::Int(11));
-        t2_cols.append("e", "", 2, ColumnType::Int(11));
-        t2_cols.append("f", "", 3, ColumnType::Int(11));
+        t2_cols.append("d", "", 0, 1, ColumnType::Int(11));
+        t2_cols.append("e", "", 0, 2, ColumnType::Int(11));
+        t2_cols.append("f", "", 0, 3, ColumnType::Int(11));
         let t2 = ArenaBox::new(t2_cols, arena.get_mut());
         let mut data = arena_vec!(&arena);
         for i in 0..3 {
@@ -1643,7 +1671,7 @@ mod tests {
         for t in &[t1, t2] {
             for i in 0..t.len() {
                 let col = &t[i];
-                tt_cols.append(col.name.as_str(), t.schema.as_str(), 0, col.ty.clone());
+                tt_cols.append(col.name.as_str(), t.schema.as_str(), 0, 0, col.ty.clone());
             }
         }
         let tt = ArenaBox::new(tt_cols, arena.get_mut());

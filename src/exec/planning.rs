@@ -11,7 +11,7 @@ use crate::exec::evaluator::{Evaluator, TypingReducer, Value};
 use crate::exec::executor::{ColumnSet, PreparedStatement, TypingStubContext, UniversalContext};
 use crate::exec::function;
 use crate::exec::function::{Aggregator, ExecutionContext};
-use crate::exec::physical_plan::{AggregatorBundle, DistinctOps, FilteringOps, GroupingAggregatorOps, IndexNestedLoopJoinOps, MergingOps, PhysicalPlanOps, ProjectingOps, RangeScanOps, SimpleNestedLoopJoinOps};
+use crate::exec::physical_plan::*;
 use crate::sql::ast::*;
 
 pub struct PlanMaker {
@@ -47,9 +47,28 @@ impl PlanMaker {
         }
     }
 
-    pub fn make_rows_producer(&mut self, name: &str,
-                              where_clause: &Option<ArenaBox<dyn Expression>>,
-                              limit: &Option<ArenaBox<dyn Expression>>) -> Result<ArenaBox<dyn PhysicalPlanOps>> {
+    pub fn make_rows_multi_producer(&mut self, relation: &ArenaBox<dyn Relation>,
+                                    where_clause: &Option<ArenaBox<dyn Expression>>,
+                                    limit: &Option<ArenaBox<dyn Expression>>) -> Result<ArenaBox<dyn PhysicalPlanOps>> {
+        let mut rel = relation.clone();
+        let mut plan = self.make(rel.deref_mut())?;
+        let limit = self.eval_require_u64_literal(limit)?;
+        let cols = self.schemas.pop().unwrap();
+        if let Some(filter) = where_clause {
+            let filtering = FilteringOps::new(filter, &plan, &cols,
+                                              self.prepared_stmt.clone(), &self.arena);
+            plan = ArenaBox::new(filtering, self.arena.get_mut()).into();
+        }
+        if limit.is_some() {
+            let merging = MergingOps::new(arena_vec!(&self.arena, [plan]), limit, None);
+            plan = ArenaBox::new(merging, self.arena.get_mut()).into();
+        }
+        Ok(plan)
+    }
+
+    pub fn make_rows_simple_producer(&mut self, name: &str,
+                                     where_clause: &Option<ArenaBox<dyn Expression>>,
+                                     limit: &Option<ArenaBox<dyn Expression>>) -> Result<ArenaBox<dyn PhysicalPlanOps>> {
         let (table, cols) = self.resolve_physical_table(name, "")?;
         let limit = self.eval_require_u64_literal(limit)?;
         if where_clause.is_none() {
@@ -119,8 +138,7 @@ impl PlanMaker {
         };
         let mut columns = ColumnSet::new(schema, table.metadata.id, &self.arena);
         for col in &table.metadata.columns {
-            //columns.append_with_name(col.name.as_str(), col.ty.clone());
-            columns.append(col.name.as_str(), "", col.id, col.ty.clone());
+            columns.append_physical(col.name.as_str(), table.metadata.id, col.id, col.ty.clone());
         }
         Ok((table, ArenaBox::new(columns, self.arena.get_mut())))
     }
@@ -254,18 +272,18 @@ impl PlanMaker {
                            &self.arena);
         for (_, name) in names {
             let col = table.get_col_by_name(&name.to_string()).unwrap();
-            columns.append(name.as_str(), alias.as_str(), col.id, col.ty.clone());
+            columns.append(name.as_str(), alias.as_str(), table.metadata.id, col.id, col.ty.clone());
         }
         ArenaBox::new(columns, self.arena.get_mut())
     }
 
     fn merge_joining_columns_set(&self, driver: &ColumnSet, matcher: &ColumnSet) -> ArenaBox<ColumnSet> {
         let mut cols = ColumnSet::new("", 0, &self.arena);
-        for col in &driver.columns {
-            cols.append(col.name.as_str(), driver.schema.as_str(), 0, col.ty.clone());
-        }
-        for col in &matcher.columns {
-            cols.append(col.name.as_str(), matcher.schema.as_str(), 0, col.ty.clone());
+        for cols_set in [&driver, &matcher] {
+            for col in &cols_set.columns {
+                cols.append(col.name.as_str(), cols_set.schema.as_str(), col.original_tid, col.id,
+                            col.ty.clone());
+            }
         }
         ArenaBox::new(cols, self.arena.get_mut())
     }
@@ -282,7 +300,7 @@ impl PlanMaker {
         drop(i);
 
         for col in &up_cols.columns {
-            cols.append(col.name.as_str(), col.desc.as_str(), col.id, col.ty.clone());
+            cols.append(col.name.as_str(), col.desc.as_str(), col.original_tid, col.id, col.ty.clone());
         }
         ArenaBox::new(cols, self.arena.get_mut())
     }
@@ -416,10 +434,10 @@ impl PlanMaker {
                     None
                 };
 
-            let ty = if let Some(col) = &certain_col {
-                col.ty.clone()
+            let (tid, id, ty) = if let Some(col) = &certain_col {
+                (col.original_tid, col.id, col.ty.clone())
             } else {
-                reducer.reduce(expr.deref_mut(), context.clone())?
+                (0, 0, reducer.reduce(expr.deref_mut(), context.clone())?)
             };
             //let ty = reducer.reduce(expr.deref_mut(), context.clone())?;
             let mut desc = ArenaStr::default();
@@ -434,7 +452,7 @@ impl PlanMaker {
                 i += 1;
                 format!("_{i}")
             };
-            cols.append(name.as_str(), desc.as_str(), 0, ty);
+            cols.append(name.as_str(), desc.as_str(), tid, id, ty);
             exprs.push(expr);
         }
 
@@ -718,55 +736,6 @@ impl Visitor for PlanMaker {
                                   &mut this.on_clause);
         }
     }
-
-    // fn visit_join_clause(&mut self, this: &mut JoinClause) {
-    //     if matches!(this.op, JoinOp::RightOuterJoin) {
-    //         let lhs = self.visit_from_clause(this.lhs.deref_mut());
-    //         if self.rs.is_not_ok() {
-    //             return;
-    //         }
-    //         let (rhs_cols, rhs_plan) = try_make_plan!(self, this.rhs);
-    //         if let Some(table) = lhs {
-    //             let lhs_cols = self.schemas.pop().unwrap();
-    //             let rs = self.choose_join_plan_with_physical_table(rhs_cols, rhs_plan, lhs_cols,
-    //                                                                table, this.op.clone(), &mut this.on_clause);
-    //             if let Err(e) = rs {
-    //                 self.rs = e;
-    //                 return;
-    //             }
-    //         } else {
-    //             let (lhs_cols, lhs_plan) = (
-    //                 self.schemas.pop().unwrap(),
-    //                 self.current.pop().unwrap()
-    //             );
-    //             self.make_simple_nested_loop_join(lhs_cols.deref(), lhs_plan, rhs_cols.deref(), rhs_plan,
-    //                                               this.op.clone(), this.on_clause.clone());
-    //         }
-    //     }
-    //
-    //     let (lhs_cols, lhs_plan) = try_make_plan!(self, this.lhs);
-    //     let rhs = self.visit_from_clause(this.rhs.deref_mut());
-    //     if self.rs.is_not_ok() {
-    //         return;
-    //     }
-    //
-    //     if let Some(matcher_table) = rhs {
-    //         let rhs_cols = self.schemas.pop().unwrap();
-    //         let rs = self.choose_join_plan_with_physical_table(lhs_cols, lhs_plan, rhs_cols,
-    //                                                            matcher_table, this.op.clone(), &mut this.on_clause);
-    //         if let Err(e) = rs {
-    //             self.rs = e;
-    //             return;
-    //         }
-    //     } else {
-    //         let (rhs_cols, rhs_plan) = (
-    //             self.schemas.pop().unwrap(),
-    //             self.current.pop().unwrap()
-    //         );
-    //         self.make_simple_nested_loop_join(lhs_cols.deref(), lhs_plan, rhs_cols.deref(), rhs_plan,
-    //                                           this.op.clone(), this.on_clause.clone());
-    //     }
-    // }
 }
 
 
@@ -2195,9 +2164,9 @@ mod tests {
         let arena = zone.get_mut();
         let mut ast = parse_sql_as_select("select a + count(a), count(*);", &arena)?;
         let mut cols = ColumnSet::new("default", 0, &arena);
-        cols.append("a", "", 1, ColumnType::Int(11));
-        cols.append("b", "", 2, ColumnType::Char(9));
-        cols.append("c", "", 3, ColumnType::TinyInt(1));
+        cols.append("a", "", 0, 1, ColumnType::Int(11));
+        cols.append("b", "", 0, 2, ColumnType::Char(9));
+        cols.append("c", "", 0, 3, ColumnType::TinyInt(1));
         let mut visitor =
             ProjectionColumnsVisitor::new(&ArenaBox::new(cols, arena.get_mut()), &arena, &arena);
         visitor.try_rewrite(&mut ast.columns)?;
@@ -2241,9 +2210,9 @@ mod tests {
         let arena = zone.get_mut();
         let mut ast = parse_sql_as_select("select a, *, b;", &arena)?;
         let mut cols = ColumnSet::new("default", 0, &arena);
-        cols.append("a", "", 1, ColumnType::Int(11));
-        cols.append("b", "", 2, ColumnType::Char(9));
-        cols.append("c", "", 3, ColumnType::TinyInt(1));
+        cols.append("a", "", 0, 1, ColumnType::Int(11));
+        cols.append("b", "", 0, 2, ColumnType::Char(9));
+        cols.append("c", "", 0, 3, ColumnType::TinyInt(1));
         let mut visitor =
             ProjectionColumnsVisitor::new(&ArenaBox::new(cols, arena.get_mut()), &arena, &arena);
 

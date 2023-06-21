@@ -46,7 +46,7 @@ pub mod testing {
                 ColumnSet::new(alias, table.metadata.id, &self.arena)
             };
             for col in &table.metadata.columns {
-                cols.append(col.name.as_str(), "", col.id, col.ty.clone());
+                cols.append_physical(col.name.as_str(), table.metadata.id, col.id, col.ty.clone());
             }
             ArenaBox::new(cols, self.arena.get_mut())
         }
