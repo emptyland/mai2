@@ -15,6 +15,7 @@ pub mod exec;
 pub mod status;
 mod base;
 mod sql;
+mod mysql;
 
 pub type Result<T> = std::result::Result<T, Status>;
 
