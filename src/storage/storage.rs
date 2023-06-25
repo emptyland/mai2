@@ -155,10 +155,52 @@ impl Default for Options {
     }
 }
 
-#[derive(Clone, Default)]
+pub struct ReadOptionsBuilder {
+    opts: ReadOptions
+}
+
+impl ReadOptionsBuilder {
+    pub fn snapshot(&mut self, snapshot: Arc<dyn Snapshot>) -> &mut Self {
+        self.opts.snapshot = Some(snapshot);
+        self
+    }
+
+    pub fn option_snapshot(&mut self, snapshot: Option<Arc<dyn Snapshot>>) -> &mut Self {
+        self.opts.snapshot = snapshot;
+        self
+    }
+
+    pub fn verify_checksum(&mut self, verify_checksum: bool) -> &mut Self {
+        self.opts.verify_checksum = verify_checksum;
+        self
+    }
+
+    pub fn build(&self) -> ReadOptions {
+        self.opts.clone()
+    }
+}
+
+#[derive(Clone)]
 pub struct ReadOptions {
     pub snapshot: Option<Arc<dyn Snapshot>>,
     pub verify_checksum: bool,
+}
+
+impl ReadOptions {
+    pub fn with() -> ReadOptionsBuilder {
+        ReadOptionsBuilder {
+            opts: Self::default()
+        }
+    }
+}
+
+impl Default for ReadOptions {
+    fn default() -> Self {
+        Self {
+            snapshot: None,
+            verify_checksum: true
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -320,8 +362,6 @@ pub trait DB: Send + Sync {
                     -> Result<IteratorArc>;
 
     fn get_snapshot(&self) -> Arc<dyn Snapshot>;
-
-    fn release_snapshot(&self, snapshot: Arc<dyn Snapshot>);
 }
 
 pub struct PinnableValue {

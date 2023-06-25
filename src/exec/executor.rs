@@ -251,7 +251,7 @@ impl Executor {
         let db = self.db.upgrade().unwrap();
         let _locking = db.lock_tables();
         let mut planner =
-            PlanMaker::new(&db, self.prepared_stmts.back().cloned(),
+            PlanMaker::new(&db, db.get_snapshot(), self.prepared_stmts.back().cloned(),
                            &self.arena);
         match planner.make(this) {
             Err(e) => self.rs = e,
@@ -651,7 +651,7 @@ impl Visitor for Executor {
         }
         drop(tables);
 
-        let mut maker = PlanMaker::new(&db, self.prepared_stmts.back().cloned(), &self.arena);
+        let mut maker = PlanMaker::new(&db, db.get_snapshot(), self.prepared_stmts.back().cloned(), &self.arena);
         let rs = if this.names.len() == 1 && this.relation.is_none() {
             // Simple delete
             maker.make_rows_simple_producer(this.names[0].as_str(), &this.where_clause, &this.limit_clause)

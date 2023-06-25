@@ -13,9 +13,11 @@ use crate::exec::function;
 use crate::exec::function::{Aggregator, ExecutionContext};
 use crate::exec::physical_plan::*;
 use crate::sql::ast::*;
+use crate::storage::storage;
 
 pub struct PlanMaker {
     db: Arc<DB>,
+    snapshot: Arc<dyn storage::Snapshot>,
     arena: ArenaMut<Arena>,
     prepared_stmt: Option<ArenaBox<PreparedStatement>>,
     rs: Status,
@@ -24,9 +26,13 @@ pub struct PlanMaker {
 }
 
 impl PlanMaker {
-    pub fn new(db: &Arc<DB>, prepared_stmt: Option<ArenaBox<PreparedStatement>>, arena: &ArenaMut<Arena>) -> Self {
+    pub fn new(db: &Arc<DB>,
+               snapshot: Arc<dyn storage::Snapshot>,
+               prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+               arena: &ArenaMut<Arena>) -> Self {
         Self {
             db: db.clone(),
+            snapshot,
             arena: arena.clone(),
             prepared_stmt,
             rs: Status::Ok,
@@ -183,7 +189,9 @@ impl PlanMaker {
                                     end_key, true,
                                     limit, offset,
                                     self.arena.clone(),
-                                    self.db.storage.clone(), table.column_family.clone());
+                                    self.db.storage.clone(),
+                                    self.snapshot.clone(),
+                                    table.column_family.clone());
         Ok(ArenaBox::new(ops, self.arena.get_mut()).into())
     }
 
@@ -258,6 +266,7 @@ impl PlanMaker {
                                         switch!(set.segments.len() == 1, offset, None),
                                         self.arena.clone(),
                                         self.db.storage.clone(),
+                                        self.snapshot.clone(),
                                         table.column_family.clone());
             receiver.push(ArenaBox::new(ops, self.arena.get_mut()).into())
         }
@@ -397,7 +406,8 @@ impl PlanMaker {
                                                     join_op, lhs_cols, matching_key_bundle,
                                                     rhs_cols, matching_key_id,
                                                     self.prepared_stmt.clone(), self.arena.clone(),
-                                                    self.db.storage.clone(), matcher.column_family.clone());
+                                                    self.db.storage.clone(), self.snapshot.clone(),
+                                                    matcher.column_family.clone());
         let plan = ArenaBox::new(join_plan, self.arena.get_mut());
         self.schemas.push(cols);
         self.current.push(plan.into());

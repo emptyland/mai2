@@ -1,83 +1,66 @@
 use std::any::Any;
-use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Weak};
+use crate::{log_warn, Logger};
+use crate::storage::db::DBImpl;
 
 use crate::storage::Snapshot;
 
 pub struct SnapshotSet {
-    snapshots: Cell<Vec<Arc<SnapshotImpl>>>,
-    sequence_numbers: Cell<HashSet<u64>>,
+    logger: Arc<dyn Logger>,
+    //snapshots: Vec<Arc<SnapshotImpl>>,
+    sequence_numbers: BTreeSet<u64>
 }
 
 impl SnapshotSet {
-    pub fn new() -> Arc<SnapshotSet> {
-        Arc::new(Self {
-            snapshots: Cell::new(Vec::new()),
-            sequence_numbers: Cell::new(HashSet::new()),
-        })
+    pub fn new(logger: &Arc<dyn Logger>) -> SnapshotSet {
+        Self {
+            logger: logger.clone(),
+            //snapshots: Vec::default(),
+            sequence_numbers: BTreeSet::default(),
+        }
     }
 
-    pub fn new_snapshot(this: &Arc<SnapshotSet>, sequence_number: u64, ts: u64) -> Arc<dyn Snapshot> {
+    pub fn new_snapshot(&mut self, owns: &Weak<DBImpl>, sequence_number: u64, ts: u64) -> Arc<dyn Snapshot> {
         let snapshot = Arc::new(SnapshotImpl {
+            owns: owns.clone(),
             sequence_number,
-            ts,
-            owns: Arc::downgrade(this),
+            ts
         });
-        let mut container = this.snapshots.take();
-        let mut numbers = this.sequence_numbers.take();
-        container.push(snapshot.clone());
-        numbers.insert(snapshot.sequence_number);
-        this.snapshots.set(container);
-        this.sequence_numbers.set(numbers);
+        self.sequence_numbers.insert(snapshot.sequence_number);
         snapshot
     }
 
-    pub fn remove_snapshot(&self, target: Arc<dyn Snapshot>) {
-        let mut numbers = self.sequence_numbers.take();
-        let snapshot_impl = SnapshotImpl::from(&target);
-        assert!(numbers.contains(&snapshot_impl.sequence_number));
-
-        let container = self.snapshots.take();
-        self.snapshots.set(container.iter()
-            .filter(|x| {
-                (*x).sequence_number != snapshot_impl.sequence_number
-            })
-            .map(|x| {
-                x.clone()
-            })
-            .collect());
-
-        numbers.remove(&snapshot_impl.sequence_number);
-        self.sequence_numbers.set(numbers);
+    pub fn remove_snapshot(&mut self, snapshot_impl: &SnapshotImpl) {
+        //assert!(self.sequence_numbers.contains(&snapshot_impl.sequence_number));
+        self.sequence_numbers.remove(&snapshot_impl.sequence_number);
     }
 
     pub fn is_snapshot_valid(&self, sequence_number: u64) -> bool {
-        let numbers = self.sequence_numbers.take();
-        let exists = numbers.contains(&sequence_number);
-        self.sequence_numbers.set(numbers);
-        exists
+        self.sequence_numbers.contains(&sequence_number)
     }
 
-    pub fn oldest(&self) -> Arc<SnapshotImpl> {
-        let container = self.snapshots.take();
-        let rv = container.first().unwrap().clone();
-        self.snapshots.set(container);
-        rv
+    pub fn oldest(&self) -> u64 {
+        self.sequence_numbers.first().cloned().unwrap()
     }
 
     pub fn is_empty(&self) -> bool {
-        let container = self.snapshots.take();
-        let rv = container.is_empty();
-        self.snapshots.set(container);
-        rv
+        self.sequence_numbers.is_empty()
+    }
+}
+
+impl Drop for SnapshotSet {
+    fn drop(&mut self) {
+        if !self.sequence_numbers.is_empty() {
+            log_warn!(self.logger, "snapshot not released: {}", self.sequence_numbers.len());
+        }
     }
 }
 
 pub struct SnapshotImpl {
+    owns: Weak<DBImpl>,
     pub sequence_number: u64,
-    ts: u64,
-    owns: Weak<SnapshotSet>,
+    ts: u64
 }
 
 impl SnapshotImpl {
@@ -89,5 +72,14 @@ impl SnapshotImpl {
 impl Snapshot for SnapshotImpl {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+impl Drop for SnapshotImpl {
+    fn drop(&mut self) {
+        if let Some(db) = self.owns.upgrade() {
+            //log_debug!(db.logger, "release snapshot: {} at {}", self.sequence_number, self.ts);
+            db.snapshots.borrow_mut().remove_snapshot(self);
+        }
     }
 }

@@ -41,7 +41,7 @@ pub struct DBImpl {
     this: Option<Weak<DBImpl>>,
     options: Options,
     env: Arc<dyn Env>,
-    logger: Arc<dyn Logger>,
+    pub logger: Arc<dyn Logger>,
     versions: Arc<Mutex<VersionSet>>,
     table_cache: TableCache,
     default_column_family: Option<Arc<dyn ColumnFamily>>,
@@ -52,7 +52,7 @@ pub struct DBImpl {
     total_wal_size: AtomicU64,
     flush_worker: Cell<Option<WorkerDescriptor>>,
     compaction_worker: Cell<Option<WorkerDescriptor>>,
-    snapshots: Arc<SnapshotSet>,
+    pub snapshots: RefCell<SnapshotSet>,
 }
 
 enum WorkerCommand {
@@ -102,7 +102,7 @@ impl DBImpl {
             redo_log_number: Cell::new(0),
             flush_worker: Cell::new(None),
             compaction_worker: Cell::new(None),
-            snapshots: SnapshotSet::new(),
+            snapshots: RefCell::new(SnapshotSet::new(&logger)),
         };
         if env.file_not_exists(paths::current_file(db.abs_db_path.as_path()).as_path()) {
             if !db.options.create_if_missing {
@@ -669,10 +669,10 @@ impl DBImpl {
                                              compact.level,
                                              versions.generate_file_number(),
                                              &cfi.compaction_point(compact.level));
-        compaction.smallest_snapshot = if self.snapshots.is_empty() {
+        compaction.smallest_snapshot = if self.snapshots.borrow().is_empty() {
             versions.last_sequence_number()
         } else {
-            self.snapshots.oldest().sequence_number
+            self.snapshots.borrow().oldest()
         };
 
         for i in 0..compact.inputs.len() {
@@ -875,7 +875,7 @@ impl DBImpl {
                 versions.last_sequence_number()
             };
         if options.snapshot.is_some() {
-            if !self.snapshots.is_snapshot_valid(last_sequence_number) {
+            if !self.snapshots.borrow().is_snapshot_valid(last_sequence_number) {
                 return Err(Status::corrupted("invalid snapshot, it has been released?"));
             }
         }
@@ -1035,16 +1035,9 @@ impl DB for DBImpl {
         let mutex = self.versions.clone();
         let versions = mutex.lock().unwrap();
         //--------------------------lock version-set------------------------------------------------
-        SnapshotSet::new_snapshot(&self.snapshots, versions.last_sequence_number(),
-                                  self.env.current_time_mills())
-        //--------------------------unlock version-set----------------------------------------------
-    }
-
-    fn release_snapshot(&self, snapshot: Arc<dyn Snapshot>) {
-        let mutex = self.versions.clone();
-        let _locking = mutex.lock().unwrap();
-        //--------------------------lock version-set------------------------------------------------
-        self.snapshots.remove_snapshot(snapshot);
+        self.snapshots.borrow_mut().new_snapshot(self.this.as_ref().unwrap(),
+                                                 versions.last_sequence_number(),
+                                                 self.env.current_time_mills())
         //--------------------------unlock version-set----------------------------------------------
     }
 }
@@ -1283,8 +1276,6 @@ mod tests {
         let snapshot = db.get_snapshot();
         let snapshot_impl = SnapshotImpl::from(&snapshot);
         assert_eq!(1, snapshot_impl.sequence_number);
-
-        db.release_snapshot(snapshot);
         Ok(())
     }
 

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::default::Default;
 use std::io::Write;
 use std::iter;
-use std::mem::size_of;
+use std::mem::{replace, size_of};
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
@@ -31,6 +31,7 @@ pub struct DB {
     pub storage: Arc<dyn storage::DB>,
     pub rd_opts: ReadOptions,
     wr_opts: WriteOptions,
+    snapshot: RwLock<Arc<dyn storage::Snapshot>>,
     default_column_family: Arc<dyn ColumnFamily>,
     //tables: Mutex<HashMap<String, Box>>
     tables_handle: RwLock<HashMap<String, TableRef>>,
@@ -101,6 +102,7 @@ impl DB {
         let desc = Self::try_load_column_family_descriptors(&options.env, &dir, &name)?;
         let (storage, _) = storage::open_kv_storage(options, name.clone(), &desc)?;
 
+        let snapshot = storage.get_snapshot();
         let abs_db_path = storage.get_absolute_path().to_path_buf();
         let db = Arc::new_cyclic(|weak| {
             let default_column_family = storage.default_column_family();
@@ -112,6 +114,7 @@ impl DB {
                 storage,
                 rd_opts: ReadOptions::default(),
                 wr_opts: WriteOptions::default(),
+                snapshot: RwLock::new(snapshot),
                 default_column_family,
                 next_conn_id: AtomicU64::new(0),
                 next_table_id: AtomicU64::new(0),
@@ -687,11 +690,13 @@ impl DB {
         }
 
         self.storage.write(&wr_opts, batch)?;
+        self.update_snapshot();
         Ok(tuples.len() as u64)
     }
 
     pub fn delete_rows(&self, tables: &[TableRef], mut row_producer: ArenaBox<dyn PhysicalPlanOps>) -> Result<u64> {
         debug_assert!(tables.len() >= 1);
+        self.update_snapshot();
         row_producer.prepare()?;
         let mut zone = Arena::new_ref();
         let mut feedback = FeedbackImpl::new(true);
@@ -704,6 +709,7 @@ impl DB {
                 break Err(feedback.status);
             }
             if rs.is_none() {
+                self.update_snapshot();
                 break Ok(affected_rows);
             }
             let tuple = rs.unwrap();
@@ -1171,6 +1177,19 @@ impl DB {
                 break;
             }
         }
+    }
+
+    pub fn update_snapshot(&self) -> Arc<dyn storage::Snapshot> {
+        let snapshot = self.storage.get_snapshot();
+        let mut slot = self.snapshot.write().unwrap();
+        //*slot = snapshot.clone();
+        drop(replace(slot.deref_mut(), snapshot.clone()));
+        snapshot
+    }
+
+    pub fn get_snapshot(&self) -> Arc<dyn storage::Snapshot> {
+        let slot = self.snapshot.read().unwrap();
+        slot.clone()
     }
 
     pub fn _test_get_table_ref(&self, name: &str) -> Option<TableRef> {

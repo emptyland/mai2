@@ -13,7 +13,7 @@ use crate::exec::evaluator::{Evaluator, Value};
 use crate::exec::executor::{ColumnSet, PreparedStatement, Tuple, UpstreamContext};
 use crate::exec::function::{Aggregator, Writable};
 use crate::sql::ast::{Expression, JoinOp};
-use crate::storage::{ColumnFamily, ColumnFamilyOptions, config, IteratorArc, ReadOptions, Snapshot, WriteOptions};
+use crate::storage::{ColumnFamily, ColumnFamilyOptions, config, IteratorArc, ReadOptions, WriteOptions};
 
 pub trait PhysicalPlanOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>>;
@@ -49,6 +49,7 @@ pub struct RangeScanOps {
 
     iter: Option<IteratorArc>,
     storage: Option<Arc<dyn storage::DB>>,
+    snapshot: Option<Arc<dyn storage::Snapshot>>,
     cf: Option<Arc<dyn ColumnFamily>>,
     col_id_to_order: HashMap<u32, usize>,
 }
@@ -63,6 +64,7 @@ impl RangeScanOps {
                offset: Option<u64>,
                arena: ArenaMut<Arena>,
                storage: Arc<dyn storage::DB>,
+               snapshot: Arc<dyn storage::Snapshot>,
                cf: Arc<dyn ColumnFamily>) -> Self {
         let mut col_id_to_order = HashMap::new();
         for i in 0..projected_columns.columns.len() {
@@ -85,6 +87,7 @@ impl RangeScanOps {
             arena,
             iter: None,
             storage: Some(storage),
+            snapshot: Some(snapshot),
             cf: Some(cf),
             col_id_to_order,
         }
@@ -164,7 +167,10 @@ impl RangeScanOps {
 
 impl PhysicalPlanOps for RangeScanOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
-        let rd_opts = ReadOptions::default();
+        let rd_opts = ReadOptions::with()
+            .option_snapshot(self.snapshot.clone())
+            .build();
+
         self.iter = Some(self.storage.as_ref().unwrap().new_iterator(&rd_opts, self.cf.as_ref().unwrap())?);
 
         let iter_box = self.iter.as_ref().cloned().unwrap();
@@ -1159,7 +1165,7 @@ pub struct IndexNestedLoopJoinOps {
 
     storage: Option<Arc<dyn storage::DB>>,
     iter: Option<IteratorArc>,
-    snapshot: Option<Arc<dyn Snapshot>>,
+    snapshot: Option<Arc<dyn storage::Snapshot>>,
     cf: Option<Arc<dyn ColumnFamily>>,
     context: Option<Arc<UpstreamContext>>,
 }
@@ -1175,8 +1181,8 @@ impl IndexNestedLoopJoinOps {
                prepared_stmt: Option<ArenaBox<PreparedStatement>>,
                arena: ArenaMut<Arena>,
                storage: Arc<dyn storage::DB>,
+               snapshot: Arc<dyn storage::Snapshot>,
                cf: Arc<dyn ColumnFamily>) -> Self {
-        let snapshot = storage.get_snapshot();
         let mut env = UpstreamContext::new(prepared_stmt, &arena);
         env.add(projected_columns.deref());
         Self {
@@ -1321,8 +1327,9 @@ impl IndexNestedLoopJoinOps {
 
         let storage = self.storage.as_ref().unwrap();
         let cf = self.cf.as_ref().unwrap();
-        let mut rd_opts = ReadOptions::default();
-        rd_opts.snapshot = self.snapshot.clone();
+        let rd_opts = ReadOptions::with()
+            .option_snapshot(self.snapshot.clone())
+            .build();
 
         if iter.valid() && iter.key().starts_with(key_prefix) {
             let iter_pk_box = storage.new_iterator(&rd_opts, cf)?;
@@ -1448,10 +1455,10 @@ impl PhysicalPlanOps for IndexNestedLoopJoinOps {
         self.matching_key.borrow_mut().clear();
 
         let storage = self.storage.as_ref().unwrap();
-        let snapshot = self.snapshot.as_ref().unwrap();
         let cf = self.cf.as_ref().unwrap();
-        let mut rd_opts = ReadOptions::default();
-        rd_opts.snapshot = Some(snapshot.clone());
+        let rd_opts = ReadOptions::with()
+            .option_snapshot(self.snapshot.clone())
+            .build();
         let iter = storage.new_iterator(&rd_opts, cf)?;
         iter.borrow_mut().seek_to_first();
 
@@ -1612,6 +1619,7 @@ mod tests {
                                          begin_key, true,
                                          end_key, true, None, None,
                                          arena.clone(), db.clone(),
+                                         db.get_snapshot(),
                                          db.default_column_family().clone());
         plan.prepare()?;
         let mut feedback = FeedbackImpl::default();
