@@ -4,6 +4,27 @@ use std::ops::DerefMut;
 use crate::base::ArenaStr;
 use crate::sql::ast::*;
 
+macro_rules! emit {
+    ($self:ident, $($arg:tt)*) => {
+        $self.emit_indent();
+        writeln!($self.writer, $($arg)+).unwrap();
+    }
+}
+
+macro_rules! emit_header {
+    ($self:ident, $($arg:tt)*) => {
+        writeln!($self.writer, $($arg)+).unwrap();
+    }
+}
+
+macro_rules! indent {
+    {$self:ident; $($stmt:stmt);* $(;)?} => {
+        $self.indent += 1;
+        $($stmt)*
+        $self.indent -= 1;
+    }
+}
+
 pub struct YamlWriter<'a> {
     writer: &'a mut dyn Write,
     indent: u32,
@@ -14,6 +35,26 @@ impl<'a> YamlWriter<'a> {
         Self {
             writer,
             indent,
+        }
+    }
+
+    fn emit_assignments(&mut self, assignments: &mut [Assignment]) {
+        for item in assignments {
+            emit!(self, "- lhs: {}", item.lhs);
+            emit!(self, "  rhs:");
+            self.indent += 2;
+            self.emit_expr("", item.rhs.deref_mut());
+            self.indent -= 2;
+        }
+    }
+
+    fn emit_order_clause(&mut self, clause: &mut [OrderClause]) {
+        for item in clause {
+            emit!(self, "- key:");
+            self.indent += 2;
+            self.emit_expr("", item.key.deref_mut());
+            self.indent -= 2;
+            emit!(self, "  ordering: {}", item.ordering);
         }
     }
 
@@ -60,27 +101,6 @@ pub fn serialize_expr_to_string<T: Expression + ?Sized>(ast: &mut T) -> String {
     let mut encoder = YamlWriter::new(&mut wr, 0);
     ast.accept(&mut encoder);
     String::from_utf8_lossy(&wr).to_string()
-}
-
-macro_rules! emit {
-    ($self:ident, $($arg:tt)*) => {
-        $self.emit_indent();
-        writeln!($self.writer, $($arg)+).unwrap();
-    }
-}
-
-macro_rules! emit_header {
-    ($self:ident, $($arg:tt)*) => {
-        writeln!($self.writer, $($arg)+).unwrap();
-    }
-}
-
-macro_rules! indent {
-    {$self:ident; $($stmt:stmt);* $(;)?} => {
-        $self.indent += 1;
-        $($stmt)*
-        $self.indent -= 1;
-    }
 }
 
 impl Visitor for YamlWriter<'_> {
@@ -254,9 +274,7 @@ impl Visitor for YamlWriter<'_> {
             };
             if !this.order_by_clause.is_empty() {
                 emit!(self, "order_by: ");
-                for expr in this.order_by_clause.iter_mut() {
-                    self.emit_elem(expr.deref_mut())
-                }
+                self.emit_order_clause(&mut this.order_by_clause);
             };
             if let Some(limit) = &mut this.limit_clause {
                 self.emit_expr("limit: ", limit.deref_mut());
@@ -320,9 +338,36 @@ impl Visitor for YamlWriter<'_> {
                     self.emit_expr("", expr.deref_mut());
                 }
             };
-            // order by
             if !this.order_by_clause.is_empty() {
-                todo!()
+                emit!(self, "order_by: ");
+                self.emit_order_clause(&mut this.order_by_clause);
+            };
+            if let Some(limit) = &mut this.limit_clause {
+                self.emit_expr("limit: ", limit.deref_mut());
+            };
+        }
+    }
+
+    fn visit_update(&mut self, this: &mut Update) {
+        emit_header!(self, "Update:");
+        indent! { self;
+            self.emit_prefix("relation:\n");
+            indent! { self;
+                self.emit_rel("", this.relation.deref_mut());
+            };
+            emit!(self, "assignments:");
+            indent! { self;
+                self.emit_assignments(&mut this.assignments);
+            };
+            if let Some(expr) = &mut this.where_clause {
+                emit!(self, "where:");
+                indent! { self;
+                    self.emit_expr("", expr.deref_mut());
+                }
+            };
+            if !this.order_by_clause.is_empty() {
+                emit!(self, "order_by: ");
+                self.emit_order_clause(&mut this.order_by_clause);
             };
             if let Some(limit) = &mut this.limit_clause {
                 self.emit_expr("limit: ", limit.deref_mut());

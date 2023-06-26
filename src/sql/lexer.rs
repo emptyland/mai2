@@ -74,6 +74,8 @@ pub enum Token {
     Limit,
     Offset,
     Delete,
+    Update,
+    Set,
 
     // types:
     Char,
@@ -187,6 +189,8 @@ impl Keywords {
                 Limit,
                 Offset,
                 Delete,
+                Update,
+                Set,
 
                 Char,
                 Varchar,

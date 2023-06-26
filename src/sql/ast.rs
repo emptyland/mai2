@@ -52,6 +52,7 @@ ast_nodes_impl![
     (FromClause, visit_from_clause),
     (JoinClause, visit_join_clause),
     (Delete, visit_delete),
+    (Update, visit_update),
     (Identifier, visit_identifier),
     (FullyQualifiedName, visit_full_qualified_name),
     (UnaryExpression, visit_unary_expression),
@@ -377,7 +378,7 @@ pub struct Select {
     pub where_clause: Option<ArenaBox<dyn Expression>>,
     pub group_by_clause: ArenaVec<ArenaBox<dyn Expression>>,
     pub having_clause: Option<ArenaBox<dyn Expression>>,
-    pub order_by_clause: ArenaVec<ArenaBox<dyn Expression>>,
+    pub order_by_clause: ArenaVec<OrderClause>,
     pub limit_clause: Option<ArenaBox<dyn Expression>>,
     pub offset_clause: Option<ArenaBox<dyn Expression>>,
     pub alias: ArenaStr,
@@ -424,8 +425,46 @@ pub struct Delete {
     pub names: ArenaVec<ArenaStr>,
     pub relation: Option<ArenaBox<dyn Relation>>,
     pub where_clause: Option<ArenaBox<dyn Expression>>,
-    pub order_by_clause: ArenaVec<ArenaBox<dyn Expression>>,
+    pub order_by_clause: ArenaVec<OrderClause>,
     pub limit_clause: Option<ArenaBox<dyn Expression>>,
+}
+
+// update <table_ref>
+// set assignment_list
+// [where expr]
+// [order by expr...]
+// [limit literal]
+pub struct Update {
+    pub relation: ArenaBox<dyn Relation>,
+    pub assignments: ArenaVec<Assignment>,
+    pub where_clause: Option<ArenaBox<dyn Expression>>,
+    pub order_by_clause: ArenaVec<OrderClause>,
+    pub limit_clause: Option<ArenaBox<dyn Expression>>,
+}
+
+pub struct Assignment {
+    pub lhs: FullyQualifiedName,
+    pub rhs: ArenaBox<dyn Expression>,
+}
+
+pub struct OrderClause {
+    pub key: ArenaBox<dyn Expression>,
+    pub ordering: SqlOrdering,
+}
+
+#[derive(Debug, Clone)]
+pub enum SqlOrdering {
+    Asc,
+    Desc,
+}
+
+impl Display for SqlOrdering {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Asc => f.write_str("ASC"),
+            Self::Desc => f.write_str("DESC"),
+        }
+    }
 }
 
 // Expression:
@@ -507,6 +546,16 @@ impl FullyQualifiedName {
 }
 
 expression_impl!(FullyQualifiedName);
+
+impl Display for FullyQualifiedName {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.prefix.is_empty() {
+            f.write_str(self.suffix.as_str())
+        } else {
+            write!(f, "{}.{}", self.prefix, self.suffix)
+        }
+    }
+}
 
 pub struct CallFunction {
     pub callee_name: ArenaStr,
@@ -632,6 +681,16 @@ impl Factory {
             names,
             where_clause: None,
             relation,
+            order_by_clause: arena_vec!(&self.arena),
+            limit_clause: None,
+        }, self.arena.get_mut())
+    }
+
+    pub fn new_update(&self, relation: ArenaBox<dyn Relation>) -> ArenaBox<Update> {
+        ArenaBox::new(Update {
+            relation,
+            assignments: arena_vec!(&self.arena),
+            where_clause: None,
             order_by_clause: arena_vec!(&self.arena),
             limit_clause: None,
         }, self.arena.get_mut())

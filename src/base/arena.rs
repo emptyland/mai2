@@ -538,6 +538,16 @@ impl Debug for ArenaStr {
     }
 }
 
+impl Hash for ArenaStr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write(self.as_bytes())
+    }
+}
+
+impl Eq for ArenaStr {
+
+}
+
 impl PartialEq for ArenaStr {
     fn eq(&self, other: &Self) -> bool {
         self.as_str() == other.as_str()

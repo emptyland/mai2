@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::mem::replace;
 use std::ops::{Deref, DerefMut};
@@ -55,21 +56,34 @@ impl PlanMaker {
 
     pub fn make_rows_multi_producer(&mut self, relation: &ArenaBox<dyn Relation>,
                                     where_clause: &Option<ArenaBox<dyn Expression>>,
+                                    order_by_clause: &ArenaVec<OrderClause>,
                                     limit: &Option<ArenaBox<dyn Expression>>) -> Result<ArenaBox<dyn PhysicalPlanOps>> {
         let mut rel = relation.clone();
-        let mut plan = self.make(rel.deref_mut())?;
+        //let physical_table = self.visit_from_clause(rel.deref_mut());
         let limit = self.eval_require_u64_literal(limit)?;
-        let cols = self.schemas.pop().unwrap();
-        if let Some(filter) = where_clause {
-            let filtering = FilteringOps::new(filter, &plan, &cols,
-                                              self.prepared_stmt.clone(), &self.arena);
-            plan = ArenaBox::new(filtering, self.arena.get_mut()).into();
+        if let Some(table) = self.visit_from_clause(rel.deref_mut()) {
+            // Maybe fast path
+            let cols = self.schemas.pop().unwrap();
+            let mut wc = where_clause.clone();
+            self.make_selecting(&table, cols, &mut wc, limit, None)?;
+            self.schemas.pop();
+            Ok(self.current.pop().unwrap())
+        } else {
+            // Fallback (slow) path
+            let mut plan = self.make(rel.deref_mut())?;
+
+            let cols = self.schemas.pop().unwrap();
+            if let Some(filter) = where_clause {
+                let filtering = FilteringOps::new(filter, &plan, &cols,
+                                                  self.prepared_stmt.clone(), &self.arena);
+                plan = ArenaBox::new(filtering, self.arena.get_mut()).into();
+            }
+            if limit.is_some() {
+                let merging = MergingOps::new(arena_vec!(&self.arena, [plan]), limit, None);
+                plan = ArenaBox::new(merging, self.arena.get_mut()).into();
+            }
+            Ok(plan)
         }
-        if limit.is_some() {
-            let merging = MergingOps::new(arena_vec!(&self.arena, [plan]), limit, None);
-            plan = ArenaBox::new(merging, self.arena.get_mut()).into();
-        }
-        Ok(plan)
     }
 
     pub fn make_rows_simple_producer(&mut self, name: &str,
@@ -477,6 +491,26 @@ impl PlanMaker {
         Ok(())
     }
 
+    fn make_selecting(&mut self,
+                      table: &TableRef,
+                      cols: ArenaBox<ColumnSet>,
+                      where_clause: &mut Option<ArenaBox<dyn Expression>>,
+                      limit: Option<u64>,
+                      offset: Option<u64>) -> Result<()> {
+        if let Some(selection) = where_clause {
+            let mut analyzer =
+                PhysicalSelectionAnalyzer::new(&table, &self.arena, self.prepared_stmt.clone());
+            let analyzed_val = analyzer.analyze(selection.deref_mut())?;
+            self.make_by_physical_selection_analyzed_val(analyzed_val, table, &cols, limit, offset)
+        } else {
+            // just scan all rows of table
+            let plan = self.make_scan_table(table, &cols, limit, offset)?;
+            self.schemas.push(cols);
+            self.current.push(plan);
+            Ok(())
+        }
+    }
+
     fn eval_require_u64_literal(&self, may_expr: &Option<ArenaBox<dyn Expression>>) -> Result<Option<u64>> {
         match may_expr {
             Some(expr) => {
@@ -591,37 +625,12 @@ impl Visitor for PlanMaker {
             let low_columns =
                 self.build_column_set(&table, this.from_clause.as_ref().unwrap().alias(),
                                       &projection_col_visitor.projection_fields);
-
-            if let Some(selection) = &mut this.where_clause {
-                let mut analyzer =
-                    PhysicalSelectionAnalyzer::new(&table, &self.arena,
-                                                   self.prepared_stmt.clone());
-                match analyzer.analyze(selection.deref_mut()) {
-                    Err(e) => {
-                        self.rs = e;
-                        return;
-                    }
-                    Ok(analyzed_val) => {
-                        match self.make_by_physical_selection_analyzed_val(analyzed_val,
-                                                                           &table, &low_columns,
-                                                                           limit, offset) {
-                            Err(e) => self.rs = e,
-                            Ok(_) => (),
-                        }
-                    }
+            match self.make_selecting(table, low_columns, &mut this.where_clause, limit, offset) {
+                Err(e) => {
+                    self.rs = e;
+                    return;
                 }
-            } else {
-                // just scan all table
-                match self.make_scan_table(&table, &low_columns, limit, offset) {
-                    Err(e) => {
-                        self.rs = e;
-                        return;
-                    }
-                    Ok(plan) => {
-                        self.schemas.push(low_columns);
-                        self.current.push(plan);
-                    }
-                }
+                Ok(_) => ()
             }
         }
 
@@ -1890,6 +1899,46 @@ impl ProjectionColumnsVisitor {
     fn dont_rewrite(&mut self) { self.rewriting.push(None); }
 
     fn want_rewrite(&mut self, ast: ArenaBox<dyn Expression>) { self.rewriting.push(Some(ast)); }
+}
+
+pub fn resolve_physical_tables(rel: &ArenaBox<dyn Relation>) -> Result<HashMap<ArenaStr, ArenaBox<FromClause>>> {
+    let mut resolver = PhysicalTablesResolver {
+        tables: HashMap::default(),
+        rs: Status::Ok
+    };
+    let mut node = rel.clone();
+    node.accept(&mut resolver);
+    if resolver.rs.is_not_ok() {
+        Err(resolver.rs)
+    } else {
+        Ok(resolver.tables)
+    }
+}
+
+struct PhysicalTablesResolver {
+    tables: HashMap<ArenaStr, ArenaBox<FromClause>>,
+    rs: Status,
+}
+
+impl Visitor for PhysicalTablesResolver {
+    fn visit_from_clause(&mut self, this: &mut FromClause) {
+
+        let key = if this.alias.is_empty() {
+            this.name.clone()
+        } else {
+            this.alias.clone()
+        };
+
+        if self.tables.contains_key(&key) {
+            visit_fatal!(self, "Duplicated reference name: {}", key);
+        }
+        self.tables.insert(key, ArenaBox::from(this));
+    }
+
+    fn visit_join_clause(&mut self, this: &mut JoinClause) {
+        try_visit!(self, this.lhs);
+        try_visit!(self, this.rhs);
+    }
 }
 
 macro_rules! try_visit {

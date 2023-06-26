@@ -18,7 +18,7 @@ use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMet
 use crate::exec::evaluator::{Context, Evaluator, expr_typing_reduce, Value};
 use crate::exec::function::{ExecutionContext, UDF};
 use crate::exec::physical_plan::{ProjectingOps, ReturningOneDummyOps};
-use crate::exec::planning::PlanMaker;
+use crate::exec::planning::{PlanMaker, resolve_physical_tables};
 use crate::sql::ast::*;
 use crate::sql::lexer::Token;
 use crate::sql::parser::Parser;
@@ -656,7 +656,8 @@ impl Visitor for Executor {
             // Simple delete
             maker.make_rows_simple_producer(this.names[0].as_str(), &this.where_clause, &this.limit_clause)
         } else {
-            maker.make_rows_multi_producer(this.relation.as_ref().unwrap(), &this.where_clause, &this.limit_clause)
+            maker.make_rows_multi_producer(this.relation.as_ref().unwrap(), &this.where_clause,
+                                           &this.order_by_clause, &this.limit_clause)
         };
         if let Err(e) = rs {
             self.rs = e;
@@ -664,6 +665,63 @@ impl Visitor for Executor {
         }
         let mut producer = rs.unwrap().clone();
         match db.delete_rows(&tables_will_be_delete, producer.clone()) {
+            Ok(affected_rows) => self.affected_rows = affected_rows,
+            Err(e) => self.rs = e
+        }
+        producer.finalize();
+    }
+
+    fn visit_update(&mut self, this: &mut Update) {
+        let db = self.db.upgrade().unwrap();
+        let tables = db.lock_tables();
+        let rs = resolve_physical_tables(&this.relation);
+        if let Err(e) = rs {
+            self.rs = e;
+            return;
+        }
+        let mut tables_will_be_update = HashMap::new();
+        let refs = rs.unwrap();
+        for (key, from) in refs {
+            match tables.get(&from.name.to_string()) {
+                Some(table) => { tables_will_be_update.insert(key, table.clone()); }
+                None => visit_fatal!(self, "Table name: {} not found.", from.name),
+            }
+        }
+        drop(tables);
+
+        for assignment in &this.assignments {
+            if assignment.lhs.prefix.is_empty() {
+                if tables_will_be_update.len() > 1 {
+                    visit_fatal!(self, "Obscure assignment name: {}", assignment.lhs);
+                }
+                for table in tables_will_be_update.values() {
+                    if table.get_col_by_name(&assignment.lhs.suffix.to_string()).is_none() {
+                        visit_fatal!(self, "Unresolved assignment name: {}", assignment.lhs);
+                    }
+                    break;
+                }
+            } else {
+                if let Some(table) = tables_will_be_update.get(&assignment.lhs.prefix) {
+                    if table.get_col_by_name(&assignment.lhs.suffix.to_string()).is_none() {
+                        visit_fatal!(self, "Unresolved assignment name: {}", assignment.lhs);
+                    }
+                } else {
+                    visit_fatal!(self, "Unresolved assignment name: {}", assignment.lhs);
+                }
+            }
+        }
+
+        let mut maker = PlanMaker::new(&db, db.get_snapshot(),
+                                       self.prepared_stmts.back().cloned(), &self.arena);
+        let rs = maker.make_rows_multi_producer(&this.relation, &this.where_clause,
+                                                &this.order_by_clause, &this.limit_clause);
+        if let Err(e) = rs {
+            self.rs = e;
+            return;
+        }
+
+        let mut producer = rs.unwrap().clone();
+        match db.update_rows(&tables_will_be_update, &this.assignments, producer.clone()) {
             Ok(affected_rows) => self.affected_rows = affected_rows,
             Err(e) => self.rs = e
         }
@@ -781,8 +839,10 @@ impl Index<usize> for ColumnSet {
 pub struct Column {
     pub name: ArenaStr,
     pub desc: ArenaStr,
-    pub id: u32,           // physical column id
-    pub original_tid: u64, // original physical table id
+    pub id: u32,
+    // physical column id
+    pub original_tid: u64,
+    // original physical table id
     pub ty: ColumnType,
     pub order: usize,
 }

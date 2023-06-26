@@ -98,6 +98,10 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
                     let rv = proc(self.parse_delete()?, self.placeholder_order);
                     stmts.push(rv);
                 }
+                Token::Update => {
+                    let rv = proc(self.parse_update()?, self.placeholder_order);
+                    stmts.push(rv);
+                }
                 _ => Err(self.current_syntax_error("Unexpected statement".to_string()))?
             }
 
@@ -434,7 +438,7 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
         if node.relation.is_none() {
             if self.test(Token::Order)? {
                 self.match_expected(Token::By)?;
-                todo!()
+                self.parse_order_by_clause(&mut node.order_by_clause)?;
             }
 
             if self.test(Token::Limit)? {
@@ -442,6 +446,34 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
             }
         }
 
+        Ok(node.into())
+    }
+
+    fn parse_update(&mut self) -> Result<ArenaBox<dyn Statement>> {
+        self.match_expected(Token::Update)?;
+
+        let rel = self.parse_join_only_use_table_rel()?;
+
+        let mut node = self.factory.new_update(rel);
+        self.match_expected(Token::Set)?;
+        self.parse_assignment_at_least_one(&mut node.assignments)?;
+
+        if self.test(Token::Where)? {
+            node.where_clause = Some(self.parse_expr()?);
+        }
+
+        if node.relation.as_any().is::<FromClause>() {
+            return Ok(node.into());
+        }
+
+        if self.test(Token::Order)? {
+            self.match_expected(Token::By)?;
+            self.parse_order_by_clause(&mut node.order_by_clause)?;
+        }
+
+        if self.test(Token::Limit)? {
+            node.limit_clause = Some(self.parse_expr()?);
+        }
         Ok(node.into())
     }
 
@@ -526,7 +558,7 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
 
             if self.test(Token::Order)? {
                 self.match_expected(Token::By)?;
-                self.parse_expr_at_least_one(&mut node.group_by_clause)?;
+                 self.parse_order_by_clause(&mut node.order_by_clause)?;
             }
 
             if self.test(Token::Limit)? {
@@ -594,6 +626,31 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
         Ok(op)
     }
 
+    fn parse_assignment_at_least_one(&mut self, list: &mut ArenaVec<Assignment>) -> Result<()> {
+        loop {
+            let id = self.match_id()?;
+            let name = if self.test(Token::Dot)? {
+                self.match_id()?
+            } else {
+                ArenaStr::default()
+            };
+            self.match_expected(Token::Eq)?;
+            let expr = self.parse_expr()?;
+            let assignment = Assignment {
+                lhs: FullyQualifiedName {
+                    prefix: if name.is_empty() {ArenaStr::default()} else {id.clone()},
+                    suffix: if name.is_empty() {id} else {name},
+                },
+                rhs: expr,
+            };
+            list.push(assignment);
+
+            if !self.test(Token::Comma)? {
+                break Ok(())
+            }
+        }
+    }
+
     fn parse_expr_at_least_one(&mut self, list: &mut ArenaVec<ArenaBox<dyn Expression>>) -> Result<()> {
         loop {
             let expr = self.parse_expr()?;
@@ -631,6 +688,25 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
             }
         };
         Ok(item)
+    }
+
+    fn parse_order_by_clause(&mut self, list: &mut ArenaVec<OrderClause>) -> Result<()> {
+        loop {
+            let key = self.parse_expr()?;
+            let mut item = OrderClause {
+                key,
+                ordering: SqlOrdering::Asc
+            };
+            if self.test(Token::Asc)? {
+                // ignore...
+            } else if self.test(Token::Desc)? {
+                item.ordering = SqlOrdering::Desc;
+            }
+            list.push(item);
+            if !self.test(Token::Comma)? {
+                break Ok(())
+            }
+        }
     }
 
     fn parse_expr(&mut self) -> Result<ArenaBox<dyn Expression>> {
@@ -1156,6 +1232,68 @@ on t1.id = t2.id
         FullQualifiedName: t1.name
       rhs:
         StrLiteral: xxx\n", yaml);
+        Ok(())
+    }
+
+    #[test]
+    fn parsing_update_sanity() -> Result<()> {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+
+        let yaml = parse_all_to_yaml(arena.clone(), "update t1 set a = 1 where a = 1")?;
+        //println!("{}", yaml);
+        assert_eq!("Update:
+  relation:
+    FromClause:
+      name: t1
+  assignments:
+    - lhs: a
+      rhs:
+        IntLiteral: 1
+  where:
+    BinaryExpression:
+      op: Eq(=)
+      lhs:
+        Identifier: a
+      rhs:
+        IntLiteral: 1
+", yaml);
+
+        let yaml = parse_all_to_yaml(arena.clone(), "update t1 inner join t2 on (t1.id = t2.id) set t1.a = 1, t2.a = 2 where t1.a = 1")?;
+        // println!("{}", yaml);
+        assert_eq!("Update:
+  relation:
+    JoinClause:
+      op: INNER JOIN
+      lhs:
+        FromClause:
+          name: t1
+      rhs:
+        FromClause:
+          name: t2
+      on_clause:
+        BinaryExpression:
+          op: Eq(=)
+          lhs:
+            FullQualifiedName: t1.id
+          rhs:
+            FullQualifiedName: t2.id
+  assignments:
+    - lhs: t1.a
+      rhs:
+        IntLiteral: 1
+    - lhs: t2.a
+      rhs:
+        IntLiteral: 2
+  where:
+    BinaryExpression:
+      op: Eq(=)
+      lhs:
+        FullQualifiedName: t1.a
+      rhs:
+        IntLiteral: 1
+", yaml);
+
         Ok(())
     }
 
