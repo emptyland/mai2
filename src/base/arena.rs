@@ -904,9 +904,260 @@ impl<T: Debug> Debug for ArenaVec<T> {
     }
 }
 
+pub mod map {
+    use super::*;
+    use std::collections::hash_map::{DefaultHasher, RandomState};
+    use std::marker::PhantomData;
+    use std::mem;
+
+    pub struct ArenaMap<K, V, S = RandomState> {
+        arena: ArenaMut<Arena>,
+        slots: ArenaBox<[*mut Entry<K, V>]>,
+        len: usize,
+        conflict_factor: f32,
+        _holder: PhantomData<S>,
+    }
+
+    struct Entry<K, V> {
+        pair: (K, V),
+        hash_code: u64,
+        next: *mut Self,
+    }
+
+    impl <K, V> Entry<K, V> {
+        pub fn new<A: Allocator>(k: K, v: V, hash_code: u64, next: *mut Self, arena: &mut A) -> *mut Self {
+            let layout = Layout::new::<Self>();
+            let chunk = arena.allocate(layout).unwrap();
+            let ptr = chunk.as_ptr() as *mut Self;
+            unsafe {
+                let this = &mut *ptr;
+                //this.pair = (k, v);
+                ptr::write(&mut this.pair, (k, v));
+                this.hash_code = hash_code;
+                this.next = next;
+            }
+            ptr
+        }
+    }
+
+    impl <K: Eq + Hash, V> ArenaMap<K, V, RandomState> {
+
+        pub fn new(arena: &ArenaMut<Arena>) -> Self {
+            Self {
+                arena: arena.clone(),
+                slots: Self::zero_slots(),
+                len: 0,
+                conflict_factor: 0.7,
+                _holder: Default::default(),
+            }
+        }
+
+        pub(crate) fn from_pairs<const N: usize>(arena: &ArenaMut<Arena>, value: [(K, V); N]) -> Self {
+            let mut this = Self::new(arena);
+            for (k, v) in value {
+                this.insert(k, v);
+            }
+            this
+        }
+
+        pub fn capacity(&self) -> usize { self.slots.len() }
+
+        pub fn insert(&mut self, k: K, v: V) -> Option<V> {
+            match self.locate_entry_mut(&k) {
+                Some(entry) => {
+                    let origin = mem::replace(&mut entry.pair.1, v);
+                    Some(origin)
+                }
+                None => {
+                    self.rehash_if_needed(1);
+                    let (hash_code, slot) = self.locate_slot(&k);
+                    let node = Entry::new(k, v, hash_code, ptr::null_mut(), self.arena.get_mut());
+
+                    let n = unsafe { &mut *node };
+                    n.next = self.slots[slot];
+                    self.slots[slot] = node;
+                    self.len += 1;
+                    None
+                }
+            }
+        }
+
+        pub fn get(&self, k: &K) -> Option<&V> {
+            let (hash_code, slot) = self.locate_slot(&k);
+            let mut p = self.slots[slot];
+            while p != ptr::null_mut() {
+                let n = unsafe {&*p};
+                if n.hash_code == hash_code && n.pair.0.eq(k) {
+                    return Some(&n.pair.1);
+                }
+                p = n.next;
+            }
+            None
+        }
+
+        pub fn remove(&mut self, k: &K) -> Option<V> {
+            let (hash_code, slot) = self.locate_slot(&k);
+            let mut prev = ptr::null_mut() as *mut Entry<K, V>;
+            let mut x = self.slots[slot];
+            while x != ptr::null_mut() {
+                let n = unsafe {&mut *x };
+                if n.hash_code == hash_code && n.pair.0.eq(k) {
+                    if prev == ptr::null_mut() {
+                        self.slots[slot] = ptr::null_mut();
+                    } else {
+                        let mut p = unsafe { &mut *prev };
+                        p.next = n.next;
+                    }
+                    self.len -= 1;
+                    return Some(unsafe { ptr::read(x).pair.1 })
+                }
+
+                prev = x;
+                x = n.next;
+            }
+            None
+        }
+
+        pub fn is_empty(&self) -> bool { self.len == 0 }
+
+        pub fn len(&self) -> usize { self.len }
+
+        pub fn clear(&mut self) {
+            for slot in self.slots.iter_mut() {
+                let mut p = *slot;
+                while p != ptr::null_mut() {
+                    let n = unsafe { &*p };
+                    drop(unsafe { ptr::read(&n.pair) });
+                    p = n.next;
+                }
+                *slot = ptr::null_mut();
+            }
+            self.len = 0;
+        }
+
+        pub fn finalize(&mut self) {
+            self.clear();
+            self.slots = Self::zero_slots();
+        }
+
+        pub fn iter(&self) -> Iter<'_, K, V> {
+            let mut it = Iter {
+                slots: self.slots.clone(),
+                index: self.slots.len(),
+                current: ptr::null_mut(),
+                _holder: Default::default(),
+            };
+            for i in 0..self.slots.len() {
+                if self.slots[i] != ptr::null_mut() {
+                    it.index = i;
+                    it.current = self.slots[i];
+                    break
+                }
+            }
+            it
+        }
+
+        fn rehash_if_needed(&mut self, increment: usize) {
+            let factor = (self.len + increment) as f32 / self.capacity() as f32;
+            if factor <= self.conflict_factor {
+                return;
+            }
+
+            let slots = Self::allocate_slots(&self.arena, (self.capacity() << 1) + 4);
+            let mut original_slots = mem::replace(&mut self.slots, slots);
+            for original_slot in original_slots.iter_mut() {
+                while *original_slot != ptr::null_mut() {
+                    let p = *original_slot;
+                    *original_slot = unsafe{ &*p }.next;
+
+                    let n = unsafe { &mut *p };
+                    let i = n.hash_code as usize % self.capacity();
+                    n.next = self.slots[i];
+                    self.slots[i] = p;
+                }
+            }
+        }
+
+        fn locate_entry_mut(&mut self, k: &K) -> Option<&mut Entry<K, V>> {
+            if self.capacity() == 0 {
+                return None;
+            }
+            let (hash_code, slot) = self.locate_slot(k);
+            let mut p = self.slots[slot];
+            while p != ptr::null_mut() {
+                let n = unsafe { &mut *p };
+                if n.hash_code == hash_code && n.pair.0.eq(k) {
+                    return Some(n)
+                }
+                p = n.next;
+            }
+            None
+        }
+
+        fn locate_slot(&self, k: &K) -> (u64, usize) {
+            let mut s = DefaultHasher::default();
+            k.hash(&mut s);
+            let hash_code = s.finish();
+            (hash_code, hash_code as usize % self.capacity())
+        }
+
+        fn zero_slots() -> ArenaBox<[*mut Entry<K, V>]> {
+            static ZERO_DUMMY: [u8;8] = [0;8];
+            let ptr = addr_of!(ZERO_DUMMY[0]) as *mut *mut Entry<K, V>;
+            ArenaBox::from_ptr(NonNull::new(slice_from_raw_parts_mut(ptr, 0)).unwrap())
+        }
+
+        fn allocate_slots(arena: &ArenaMut<Arena>, len: usize) -> ArenaBox<[*mut Entry<K, V>]> {
+            let atomic = Layout::new::<*mut Entry<K, V>>();
+            let layout = Layout::from_size_align(atomic.size() * len, atomic.align()).unwrap();
+            let chunk: NonNull<[u8]> = arena.get_mut().allocate(layout).unwrap();
+            let addr = chunk.as_ptr() as *mut *mut Entry<K, V>;
+            let mut slots = ArenaBox::from_ptr(NonNull::new(slice_from_raw_parts_mut(addr, len)).unwrap());
+            for i in 0..slots.len() {
+                slots[i] = ptr::null_mut();
+            }
+            slots
+        }
+    }
+
+    pub struct Iter<'a, K, V> {
+        slots: ArenaBox<[*mut Entry<K, V>]>,
+        index: usize,
+        current: *mut Entry<K, V>,
+        _holder: PhantomData<&'a K>,
+    }
+
+    impl <'a, K: 'a, V: 'a> Iterator for Iter<'a, K, V> {
+        type Item = (&'a K, &'a V);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.index >= self.slots.len() && self.current == ptr::null_mut() {
+                return None;
+            }
+            if self.current == ptr::null_mut() {
+                loop {
+                    self.index += 1;
+                    if self.index >= self.slots.len() {
+                        return None;
+                    }
+                    if self.slots[self.index] != ptr::null_mut() {
+                        self.current = self.slots[self.index];
+                        break;
+                    }
+                }
+            }
+
+            let n = unsafe { &*self.current };
+            self.current = n.next;
+            Some((&n.pair.0, &n.pair.1))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use crate::map::ArenaMap;
 
     use super::*;
 
@@ -914,8 +1165,7 @@ mod tests {
     fn sanity() {
         let mut arena = Arena::new();
         let s: [u8; 16] = [1; 16];
-        let mut chunk = arena.allocate(Layout::from_size_align(16, 4).unwrap())
-            .expect("TODO: panic message");
+        let mut chunk = arena.allocate(Layout::from_size_align(16, 4).unwrap()).unwrap();
         unsafe {
             chunk.as_mut().write(&s).unwrap();
             assert_eq!(s, chunk.as_ref());
@@ -988,5 +1238,97 @@ mod tests {
         assert_eq!(5, a.len());
         assert_eq!(0, b.len());
         assert_eq!([6, 5, 4, 2, 3], a.as_slice());
+    }
+
+    #[test]
+    fn arena_map_sanity() {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let mut map = ArenaMap::new(&arena);
+        assert_eq!(None, map.insert("aaa", 1));
+        assert_eq!(4, map.capacity());
+        assert_eq!(1, map.len());
+
+        assert_eq!(None, map.insert("bbb", 2));
+        assert_eq!(4, map.capacity());
+        assert_eq!(2, map.len());
+
+        assert_eq!(None, map.remove(&"ccc"));
+        assert_eq!(4, map.capacity());
+        assert_eq!(2, map.len());
+
+        assert_eq!(Some(2), map.remove(&"bbb"));
+        assert_eq!(4, map.capacity());
+        assert_eq!(1, map.len());
+    }
+
+    #[test]
+    fn arena_map_large_insertion() {
+        const N: i32 = 1000;
+
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let mut map = ArenaMap::new(&arena);
+        for i in 0..N {
+            let s = format!("k.{i}");
+            map.insert(s, (i + 1) * 100);
+        }
+        assert_eq!(N as usize, map.len());
+
+        for i in 0..N {
+            let s = format!("k.{i}");
+            assert_eq!(Some((i + 1) * 100), map.get(&s).cloned());
+        }
+
+        map.finalize()
+    }
+
+    #[test]
+    fn arena_map_iterate() {
+        const N: i32 = 1000;
+
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let mut map = ArenaMap::new(&arena);
+        for i in 0..N {
+            let s = format!("k.{i}");
+            map.insert(s, (i + 1) * 100);
+        }
+        assert_eq!(N as usize, map.len());
+
+        let mut i = 0;
+        for (_, v) in map.iter() {
+            i += 1;
+            assert_eq!(0, v % 100);
+        }
+        assert_eq!(N, i);
+
+        map.finalize();
+    }
+
+    #[test]
+    fn arena_map_remove() {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let mut map = ArenaMap::from_pairs(&arena, [
+            ("aaa", 1),
+            ("bbb", 2),
+            ("ccc", 3)
+        ]);
+        assert_eq!(Some(2), map.remove(&"bbb"));
+        assert_eq!(None, map.remove(&"ddd"));
+    }
+
+    #[test]
+    fn arena_fuzz_insertion() {
+        const N: i32 = 10000;
+
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let mut map = ArenaMap::new(&arena);
+        for i in 0..N {
+            let s = format!("key-{}", rand::random::<i32>());
+            map.insert(s, i);
+        }
     }
 }

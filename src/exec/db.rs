@@ -847,10 +847,10 @@ impl DB {
         }
         for key in &secondary_keys {
             if key.index.unique {
-                lock_group.add(key.new);
+                lock_group.add(&key.new);
             }
-            updates.delete(&table.column_family, key.old);
-            updates.insert(&table.column_family, key.new, row_key);
+            updates.delete(&table.column_family, &key.old);
+            updates.insert(&table.column_family, &key.new, row_key);
         }
 
         let _locking = lock_group.exclusive_lock_all();
@@ -936,11 +936,22 @@ impl DB {
 
     fn rebuild_secondary_index_if_needed<'a>(assignments: &[InternalAssignment],
                                              force: bool,
-                                             table: &TableRef,
-                                             tuple: &'a Tuple,
-                                             origin: &'a Tuple,
+                                             table: &'a TableRef,
+                                             tuple: &Tuple,
+                                             origin: &Tuple,
                                              arena: &ArenaMut<Arena>) -> ArenaVec<InternalSecondaryIndexDesc<'a>> {
-        todo!()
+        let desc = arena_vec!(arena);
+        if force {
+            // TODO:
+        } else {
+            let mut indexes = HashMap::new();
+            for item in assignments {
+                if let Some(idx) = item.index {
+                    indexes.insert(idx.id, idx);
+                }
+            }
+        }
+        desc
     }
 
     fn parse_assignments<'a>(tables: &'a HashMap<ArenaStr, TableRef>, ast: &'a [Assignment])
@@ -1436,8 +1447,8 @@ struct InternalAssignment<'a> {
 
 struct InternalSecondaryIndexDesc<'a> {
     index: &'a SecondaryIndexMetadata,
-    old: &'a [u8],
-    new: &'a [u8],
+    old: ArenaVec<u8>,
+    new: ArenaVec<u8>,
 }
 
 pub struct TableHandle {
