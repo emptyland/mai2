@@ -951,7 +951,7 @@ pub mod map {
             }
         }
 
-        pub(crate) fn from_pairs<const N: usize>(arena: &ArenaMut<Arena>, value: [(K, V); N]) -> Self {
+        pub fn from_pairs<const N: usize>(arena: &ArenaMut<Arena>, value: [(K, V); N]) -> Self {
             let mut this = Self::new(arena);
             for (k, v) in value {
                 this.insert(k, v);

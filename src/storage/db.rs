@@ -870,15 +870,15 @@ impl DBImpl {
         }
         let last_sequence_number =
             if let Some(snapshot) = options.snapshot.as_ref() {
-                SnapshotImpl::from(snapshot).sequence_number
+                SnapshotImpl::from(snapshot).sequence_number()
             } else {
                 versions.last_sequence_number()
             };
-        if options.snapshot.is_some() {
-            if !self.snapshots.borrow().is_snapshot_valid(last_sequence_number) {
-                return Err(Status::corrupted("invalid snapshot, it has been released?"));
-            }
-        }
+        // if let Some(snapshot) = &options.snapshot {
+        //     if !self.snapshots.borrow().is_snapshot_valid(snapshot) {
+        //         return Err(Status::corrupted("invalid snapshot, it has been released?"));
+        //     }
+        // }
 
         let mut memory_tables = Vec::new();
         memory_tables.push(cfi.mutable().clone());
@@ -1275,7 +1275,7 @@ mod tests {
         let db = open_test_db("db4")?;
         let snapshot = db.get_snapshot();
         let snapshot_impl = SnapshotImpl::from(&snapshot);
-        assert_eq!(1, snapshot_impl.sequence_number);
+        assert_eq!(1, snapshot_impl.sequence_number());
         Ok(())
     }
 

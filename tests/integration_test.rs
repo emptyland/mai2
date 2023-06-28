@@ -289,3 +289,49 @@ fn sql_multi_delete_one() -> Result<()> {
     SqlSuite::assert_rows(&data, rs)?;
     Ok(())
 }
+
+#[test]
+fn sql_update_one_column() -> Result<()> {
+    let suite = SqlSuite::new("tests/dbi-010")?;
+    suite.execute_file(Path::new("testdata/t1_with_pk_and_data.sql"), &suite.arena)?;
+
+    suite.execute_str("update t1 set name = \"bbb\" where id = 3", &suite.arena)?;
+
+    let data = [
+        "(1, \"a\", \"xxx\", 200)",
+        "(2, \"aa\", \"xxx\", 300)",
+        "(3, \"bbb\", \"xxx\", 301)",
+        "(4, \"aaa\", \"xxx\", 400)",
+        "(5, \"aaaa\", \"xxx\", 500)",
+        "(6, \"aaaaa\", \"xxx\", 600)",
+        "(7, \"aaaaa\", \"xxx\", 601)",
+        "(8, \"aaaaa\", \"xxx\", 602)",
+        "(9, \"aaaaaa\", \"xxx\", 700)",
+    ];
+    let rs = suite.execute_query_str("select * from t1", &suite.arena)?;
+    SqlSuite::assert_rows(&data, rs)?;
+    Ok(())
+}
+
+#[test]
+fn sql_update_with_primary_key() -> Result<()> {
+    let suite = SqlSuite::new("tests/dbi-011")?;
+    suite.execute_file(Path::new("testdata/t1_with_pk_and_data.sql"), &suite.arena)?;
+
+    suite.execute_str("update t1 set id = 30, name = \"cc\" where id = 3", &suite.arena)?;
+
+    let data = [
+        "(1, \"a\", \"xxx\", 200)",
+        "(2, \"aa\", \"xxx\", 300)",
+        "(4, \"aaa\", \"xxx\", 400)",
+        "(5, \"aaaa\", \"xxx\", 500)",
+        "(6, \"aaaaa\", \"xxx\", 600)",
+        "(7, \"aaaaa\", \"xxx\", 601)",
+        "(8, \"aaaaa\", \"xxx\", 602)",
+        "(9, \"aaaaaa\", \"xxx\", 700)",
+        "(30, \"cc\", \"xxx\", 301)",
+    ];
+    let rs = suite.execute_query_str("select * from t1", &suite.arena)?;
+    SqlSuite::assert_rows(&data, rs)?;
+    Ok(())
+}

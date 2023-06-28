@@ -200,6 +200,7 @@ impl PhysicalPlanOps for RangeScanOps {
         self.iter = None;
         self.storage = None;
         self.cf = None;
+        self.snapshot = None;
         self.col_id_to_order = HashMap::default();
     }
 
@@ -1471,6 +1472,7 @@ impl PhysicalPlanOps for IndexNestedLoopJoinOps {
         self.iter = None;
         self.snapshot = None;
         self.cf = None;
+        self.driver.finalize();
     }
 
     fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {

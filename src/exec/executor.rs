@@ -5,7 +5,7 @@ use std::fmt::{Display, Formatter};
 use std::intrinsics::copy_nonoverlapping;
 use std::io::{Read, Write};
 use std::iter::repeat;
-use std::mem;
+use std::{mem, ptr};
 use std::ops::{AddAssign, DerefMut, Index};
 use std::ptr::{addr_of, NonNull, slice_from_raw_parts_mut};
 use std::sync::{Arc, MutexGuard, Weak};
@@ -19,6 +19,7 @@ use crate::exec::evaluator::{Context, Evaluator, expr_typing_reduce, Value};
 use crate::exec::function::{ExecutionContext, UDF};
 use crate::exec::physical_plan::{ProjectingOps, ReturningOneDummyOps};
 use crate::exec::planning::{PlanMaker, resolve_physical_tables};
+use crate::map::ArenaMap;
 use crate::sql::ast::*;
 use crate::sql::lexer::Token;
 use crate::sql::parser::Parser;
@@ -664,7 +665,7 @@ impl Visitor for Executor {
             return;
         }
         let mut producer = rs.unwrap().clone();
-        match db.delete_rows(&tables_will_be_delete, producer.clone()) {
+        match db.delete_rows(&tables_will_be_delete, producer.clone(), &self.arena) {
             Ok(affected_rows) => self.affected_rows = affected_rows,
             Err(e) => self.rs = e
         }
@@ -721,11 +722,50 @@ impl Visitor for Executor {
         }
 
         let mut producer = rs.unwrap().clone();
-        match db.update_rows(&tables_will_be_update, &this.assignments, producer.clone()) {
+        match db.update_rows(&tables_will_be_update,
+                             &this.assignments,
+                             self.prepared_stmts.back().cloned(),
+                             producer.clone(),
+                             &self.arena) {
             Ok(affected_rows) => self.affected_rows = affected_rows,
             Err(e) => self.rs = e
         }
         producer.finalize();
+    }
+}
+
+pub struct ColumnsAuxResolver {
+    id_to_idx: ArenaMap<(u64, u32), usize>,
+    cols: *const ColumnSet
+}
+
+impl ColumnsAuxResolver {
+    pub fn new(arena: &ArenaMut<Arena>) -> Self {
+        Self {
+            id_to_idx: ArenaMap::new(arena),
+            cols: ptr::null(),
+        }
+    }
+
+    pub fn attach(&mut self, tuple: &Tuple) {
+        if self.cols == tuple.columns_set.as_ptr() {
+            return;
+        }
+        self.id_to_idx.clear();
+        if let Some(tid) = tuple.columns().original_table_id() {
+            for col in &tuple.columns().columns {
+                self.id_to_idx.insert((tid, col.id), col.order);
+            }
+        } else {
+            for col in &tuple.columns().columns {
+                self.id_to_idx.insert((col.original_tid, col.id), col.order);
+            }
+        }
+        self.cols = tuple.columns_set.as_ptr();
+    }
+
+    pub fn get_by_id(&self, tid: u64, id: u32) -> Option<usize> {
+        self.id_to_idx.get(&(tid, id)).cloned()
     }
 }
 

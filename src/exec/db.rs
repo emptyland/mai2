@@ -15,9 +15,10 @@ use crate::{arena_vec, ArenaVec, corrupted_err, Corrupting, log_debug, Status, s
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, Logger};
 use crate::exec::connection::{Connection, FeedbackImpl};
 use crate::exec::evaluator::{Evaluator, Value};
-use crate::exec::executor::{ColumnSet, SecondaryIndexBundle, Tuple, UpstreamContext};
+use crate::exec::executor::{ColumnsAuxResolver, ColumnSet, PreparedStatement, SecondaryIndexBundle, Tuple, UpstreamContext};
 use crate::exec::locking::{LockingInstance, LockingManagement};
 use crate::exec::physical_plan::PhysicalPlanOps;
+use crate::map::ArenaMap;
 use crate::Result;
 use crate::sql::ast::{Assignment, Expression};
 use crate::storage::{ColumnFamily, ColumnFamilyDescriptor, ColumnFamilyOptions, DEFAULT_COLUMN_FAMILY_NAME, Env,
@@ -695,8 +696,10 @@ impl DB {
         Ok(tuples.len() as u64)
     }
 
-    pub fn delete_rows(&self, tables: &[TableRef], mut row_producer: ArenaBox<dyn PhysicalPlanOps>) -> Result<u64> {
+    pub fn delete_rows(&self, tables: &[TableRef], mut row_producer: ArenaBox<dyn PhysicalPlanOps>, region: &ArenaMut<Arena>) -> Result<u64> {
         debug_assert!(tables.len() >= 1);
+        let mut cols = ColumnsAuxResolver::new(region);
+
         self.update_snapshot();
         row_producer.prepare()?;
         let mut zone = Arena::new_ref();
@@ -714,17 +717,18 @@ impl DB {
                 break Ok(affected_rows);
             }
             let tuple = rs.unwrap();
-            let row_key = tuple.row_key();
+            cols.attach(&tuple);
 
+            let row_key = tuple.row_key();
             let arena = zone.get_mut();
             for table in tables {
-                self.delete_row_impl(table, &tuple, &arena)?;
+                self.delete_row_impl(table, &cols, &tuple, &arena)?;
                 affected_rows += 1;
             }
         }
     }
 
-    fn delete_row_impl(&self, table: &TableRef, tuple: &Tuple, arena: &ArenaMut<Arena>) -> Result<()> {
+    fn delete_row_impl(&self, table: &TableRef, cols: &ColumnsAuxResolver, tuple: &Tuple, arena: &ArenaMut<Arena>) -> Result<()> {
         let inst = self.locks.instance(table.metadata.id).unwrap();
         let mut lock_group = inst.group();
 
@@ -753,11 +757,7 @@ impl DB {
             Self::encode_idx_id(index.id, &mut key);
             for col_id in &index.key_parts {
                 let col = table.get_col_by_id(*col_id).unwrap();
-                let pos = if tuple.columns().original_table_id() == Some(table.metadata.id) {
-                    tuple.columns().index_by_id(col.id).unwrap()
-                } else {
-                    tuple.columns().index_by_original_and_id(table.metadata.id, col.id).unwrap()
-                };
+                let pos = cols.get_by_id(table.id(), col.id).unwrap();
                 Self::encode_secondary_index(&tuple[pos], &col.ty, &mut key);
             }
             if index.unique {
@@ -778,10 +778,15 @@ impl DB {
 
     pub fn update_rows(&self, tables: &HashMap<ArenaStr, TableRef>,
                        assignments: &[Assignment],
-                       mut row_producer: ArenaBox<dyn PhysicalPlanOps>) -> Result<u64> {
-        let assignments = Self::parse_assignments(tables, assignments);
-
+                       prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+                       mut row_producer: ArenaBox<dyn PhysicalPlanOps>,
+                       region: &ArenaMut<Arena>) -> Result<u64> {
         debug_assert!(!tables.is_empty());
+
+        let assignments = Self::parse_assignments(tables, assignments);
+        let mut cols = ColumnsAuxResolver::new(region);
+        //drop(arena);
+
         self.update_snapshot();
         row_producer.prepare()?;
         let mut zone = Arena::new_ref();
@@ -800,17 +805,24 @@ impl DB {
             }
 
             let origin = rs.unwrap();
+            cols.attach(&origin);
             let arena = zone.get_mut();
-            let tuple = self.update_tuple_vals(&assignments, origin.dup(&arena), &arena)?;
+            let tuple = self.update_tuple_vals(&assignments, prepared_stmt.clone(), &cols,
+                                               origin.dup(&arena), &arena)?;
             for (_, t) in tables {
-                self.update_row_impl(&assignments, t, &tuple, &origin, &arena)?;
+                self.update_row_impl(&assignments, t, &cols, &tuple, &origin, &arena)?;
                 affected_rows += 1;
             }
         }
     }
 
-    fn update_tuple_vals(&self, assignments: &[InternalAssignment], mut tuple: Tuple, arena: &ArenaMut<Arena>) -> Result<Tuple> {
-        let mut ctx = UpstreamContext::new(None/*TODO*/, arena);
+    fn update_tuple_vals(&self,
+                         assignments: &[InternalAssignment],
+                         prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+                         cols: &ColumnsAuxResolver,
+                         mut tuple: Tuple,
+                         arena: &ArenaMut<Arena>) -> Result<Tuple> {
+        let mut ctx = UpstreamContext::new(prepared_stmt, arena);
         ctx.add(tuple.columns());
         ctx.attach(&tuple);
         let env = Arc::new(ctx);
@@ -820,17 +832,14 @@ impl DB {
         for item in assignments {
             let mut expr = item.value.clone();
             let rv = evaluator.evaluate(expr.deref_mut(), env.clone())?;
-            let pos = if tuple.columns().original_table_id().is_none() {
-                tuple.columns().index_by_original_and_id(item.table.metadata.id, item.dest.id).unwrap()
-            } else {
-                tuple.columns().index_by_id(item.dest.id).unwrap()
-            };
+            let pos = cols.get_by_id(item.table.id(), item.dest.id).unwrap();
             tuple.set(pos, rv);
         }
         Ok(tuple)
     }
 
-    fn update_row_impl(&self, assignments: &[InternalAssignment], table: &TableRef, tuple: &Tuple, origin: &Tuple, arena: &ArenaMut<Arena>) -> Result<()> {
+    fn update_row_impl(&self, assignments: &[InternalAssignment], table: &TableRef, cols: &ColumnsAuxResolver,
+                       tuple: &Tuple, origin: &Tuple, arena: &ArenaMut<Arena>) -> Result<()> {
         let inst = self.locks.instance(table.metadata.id).unwrap();
         let mut lock_group = inst.group();
 
@@ -843,7 +852,9 @@ impl DB {
                                                                      table, tuple, origin, arena);
         let mut updates = WriteBatch::new();
         if has_row_key_changed {
-            self.move_row_to_row_key(&mut updates, row_key, table, tuple, origin, arena)?;
+            self.move_row_to_row_key(&mut updates, row_key, table, cols, tuple, origin, arena)?;
+        } else {
+            self.update_columns_in_row(&mut updates, row_key, assignments, table, cols, tuple, arena);
         }
         for key in &secondary_keys {
             if key.index.unique {
@@ -854,13 +865,53 @@ impl DB {
         }
 
         let _locking = lock_group.exclusive_lock_all();
+        for key in &secondary_keys {
+            if key.index.unique &&
+                self.storage.get_pinnable(&self.rd_opts, &table.column_family, &key.new).is_ok() {
+                corrupted_err!("Duplicated unique secondary index key: {}, in table: {}", key.index.name, table.name())?;
+            }
+        }
+        if has_row_key_changed &&
+            self.storage.get_pinnable(&self.rd_opts, &table.column_family, row_key).is_ok() {
+            corrupted_err!("Duplicated primary key, in table: {}", table.name())?;
+        }
         self.storage.write(&self.wr_opts, updates)
+    }
+
+    fn update_columns_in_row(&self,
+                             updates: &mut WriteBatch,
+                             row_key: &[u8],
+                             assignments: &[InternalAssignment],
+                             table: &TableRef,
+                             cols: &ColumnsAuxResolver,
+                             tuple: &Tuple,
+                             arena: &ArenaMut<Arena>) {
+        let mut buf = arena_vec!(arena);
+        buf.write(row_key).unwrap();
+        let row_key_len = buf.len();
+
+        assignments.iter().filter(|x| {
+            x.table.id() == table.id()
+        }).for_each(|x| {
+            Self::encode_col_id(x.dest.id, &mut buf);
+            let key_len = buf.len();
+
+            let pos = cols.get_by_id(table.id(), x.dest.id).unwrap();
+            Self::encode_column_value(&tuple[pos], &x.dest.ty, &mut buf);
+
+            let k = &buf.as_slice()[..key_len];
+            let v = &buf.as_slice()[key_len..];
+            updates.insert(&table.column_family, k, v);
+
+            buf.truncate(row_key_len);
+        })
     }
 
     fn move_row_to_row_key(&self,
                            updates: &mut WriteBatch,
                            row_key: &[u8],
                            table: &TableRef,
+                           cols: &ColumnsAuxResolver,
                            tuple: &Tuple,
                            origin: &Tuple,
                            arena: &ArenaMut<Arena>) -> Result<()> {
@@ -884,11 +935,7 @@ impl DB {
             updates.delete(&table.column_family, &old_pk);
             old_pk.truncate(old_pk_len);
 
-            let pos = if tuple.columns().original_table_id() == Some(table.metadata.id) {
-                tuple.columns().index_by_id(col.id)
-            } else {
-                tuple.columns().index_by_original_and_id(table.metadata.id, col.id)
-            }.unwrap();
+            let pos = cols.get_by_id(table.id(), col.id).unwrap();
             Self::encode_column_value(&tuple[pos], &col.ty, &mut new_vl);
 
             Self::encode_col_id(col.id, &mut new_pk);
@@ -934,24 +981,57 @@ impl DB {
         Ok((buf, true))
     }
 
-    fn rebuild_secondary_index_if_needed<'a>(assignments: &[InternalAssignment],
+    fn rebuild_secondary_index_if_needed<'a>(assignments: &[InternalAssignment<'a>],
                                              force: bool,
                                              table: &'a TableRef,
                                              tuple: &Tuple,
                                              origin: &Tuple,
                                              arena: &ArenaMut<Arena>) -> ArenaVec<InternalSecondaryIndexDesc<'a>> {
-        let desc = arena_vec!(arena);
+
+        let mut desc = arena_vec!(arena);
         if force {
-            // TODO:
+            for idx in &table.metadata.secondary_indices {
+                let mut item = InternalSecondaryIndexDesc {
+                    index: idx,
+                    old: arena_vec!(arena),
+                    new: arena_vec!(arena),
+                };
+                Self::encode_full_secondary_index(origin, table.id(), idx, &mut item.old);
+                Self::encode_full_secondary_index(tuple, table.id(), idx, &mut item.new);
+                desc.push(item);
+            }
         } else {
-            let mut indexes = HashMap::new();
+            let mut indices = ArenaMap::new(arena);
             for item in assignments {
                 if let Some(idx) = item.index {
-                    indexes.insert(idx.id, idx);
+                    indices.insert(idx.id, idx);
                 }
             }
+            for (_, idx) in indices.iter() {
+                let mut item = InternalSecondaryIndexDesc {
+                    index: *idx,
+                    old: arena_vec!(arena),
+                    new: arena_vec!(arena),
+                };
+                Self::encode_full_secondary_index(origin, table.id(), *idx, &mut item.old);
+                Self::encode_full_secondary_index(tuple, table.id(), *idx, &mut item.new);
+                desc.push(item);
+            }
+
         }
         desc
+    }
+
+    fn encode_full_secondary_index<W: Write>(row: &Tuple, tid: u64, idx: &SecondaryIndexMetadata, w: &mut W) {
+        Self::encode_idx_id(idx.id, w);
+        for col_id in &idx.key_parts {
+            let pos = if row.columns().original_table_id() == Some(tid) {
+                row.columns().index_by_id(*col_id)
+            } else {
+                row.columns().index_by_original_and_id(tid, *col_id)
+            }.unwrap();
+            Self::encode_secondary_index(&row[pos], &row.columns()[pos].ty, w)
+        }
     }
 
     fn parse_assignments<'a>(tables: &'a HashMap<ArenaStr, TableRef>, ast: &'a [Assignment])
@@ -974,7 +1054,7 @@ impl DB {
             if x.lhs.prefix.is_empty() {
                 debug_assert_eq!(1, tables.len());
                 let name = x.lhs.suffix.to_string();
-                let t = tables.get(&x.lhs.suffix).unwrap();
+                let t = tables.values().next().unwrap();
                 build_assignment(t, name, x.rhs.clone())
             } else {
                 let name = x.lhs.suffix.to_string();
@@ -1515,6 +1595,10 @@ impl TableHandle {
         }
         self
     }
+
+    pub fn id(&self) -> u64 { self.metadata.id }
+
+    pub fn name(&self) -> &String { &self.metadata.name }
 
     pub fn get_col_by_name(&self, name: &String) -> Option<&ColumnMetadata> {
         match self.columns_by_name.get(name) {

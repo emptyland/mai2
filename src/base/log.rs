@@ -56,7 +56,9 @@ macro_rules! log_error {
 #[macro_export]
 macro_rules! log_debug {
     ($logger:expr, $($arg:tt)+) => {
-        $crate::log_append!($logger, $crate::base::LoggingLevel::Debug, $($arg)+)
+        if cfg!(test) {
+            $crate::log_append!($logger, $crate::base::LoggingLevel::Debug, $($arg)+)
+        }
     }
 }
 
@@ -107,5 +109,8 @@ mod tests {
     fn writer_log() {
         let log = WriterLogger::new(io::stderr());
         log_warn!(log, "{} = {}", 2, 3);
+        if cfg!(test) {
+            log_info!(log, "{}", 111);
+        }
     }
 }
