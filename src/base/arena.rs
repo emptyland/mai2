@@ -223,9 +223,9 @@ impl Arena {
     fn allocate_large(&mut self, layout: Layout) -> Result<NonNull<[u8]>, ()> {
         self.large = unsafe { LargePage::new(self.large, layout) };
         self.use_in_bytes += layout.size();
-        self.rss_in_bytes += layout.size() + size_of::<LargePage>();
+        self.rss_in_bytes += layout.size() + layout.align() + size_of::<LargePage>();
         let free = {
-            let chunk = self.large.unwrap().as_ptr() as *mut u8;
+            let chunk = unsafe { self.large.unwrap().as_ptr().add(1) as *mut u8 };
             let free = round_up(chunk, layout.align() as i64);
             NonNull::new(slice_from_raw_parts_mut(free, layout.size())).unwrap()
         };
@@ -336,9 +336,8 @@ impl NormalPage {
 impl LargePage {
     pub unsafe fn new(next: Option<NonNull<Self>>, payload_layout: Layout) -> Option<NonNull<Self>> {
         let page_layout = Layout::new::<Self>();
-        let layout = Layout::from_size_align(page_layout.size() +
-                                                 payload_layout.size() +
-                                                 payload_layout.align(), page_layout.align()).unwrap();
+        let layout = Layout::from_size_align(page_layout.size() + payload_layout.size() + payload_layout.align(),
+                                               page_layout.align()).unwrap();
         let page = NonNull::new(alloc(layout) as *mut LargePage);
         if let Some(none_null) = page {
             let mut naked_page = none_null.as_ptr();
