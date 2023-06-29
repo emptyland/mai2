@@ -757,7 +757,7 @@ impl DB {
             Self::encode_idx_id(index.id, &mut key);
             for col_id in &index.key_parts {
                 let col = table.get_col_by_id(*col_id).unwrap();
-                let pos = cols.get_by_id(table.id(), col.id).unwrap();
+                let pos = cols.get_column_by_id(table.id(), col.id).unwrap();
                 Self::encode_secondary_index(&tuple[pos], &col.ty, &mut key);
             }
             if index.unique {
@@ -785,7 +785,6 @@ impl DB {
 
         let assignments = Self::parse_assignments(tables, assignments);
         let mut cols = ColumnsAuxResolver::new(region);
-        //drop(arena);
 
         self.update_snapshot();
         row_producer.prepare()?;
@@ -797,6 +796,7 @@ impl DB {
 
             let rs = row_producer.next(&mut feedback, &zone);
             if feedback.status.is_not_ok() {
+                self.update_snapshot(); // FIXME: rollback
                 break Err(feedback.status);
             }
             if rs.is_none() {
@@ -832,7 +832,7 @@ impl DB {
         for item in assignments {
             let mut expr = item.value.clone();
             let rv = evaluator.evaluate(expr.deref_mut(), env.clone())?;
-            let pos = cols.get_by_id(item.table.id(), item.dest.id).unwrap();
+            let pos = cols.get_column_by_id(item.table.id(), item.dest.id).unwrap();
             tuple.set(pos, rv);
         }
         Ok(tuple)
@@ -896,7 +896,7 @@ impl DB {
             Self::encode_col_id(x.dest.id, &mut buf);
             let key_len = buf.len();
 
-            let pos = cols.get_by_id(table.id(), x.dest.id).unwrap();
+            let pos = cols.get_column_by_id(table.id(), x.dest.id).unwrap();
             Self::encode_column_value(&tuple[pos], &x.dest.ty, &mut buf);
 
             let k = &buf.as_slice()[..key_len];
@@ -935,7 +935,7 @@ impl DB {
             updates.delete(&table.column_family, &old_pk);
             old_pk.truncate(old_pk_len);
 
-            let pos = cols.get_by_id(table.id(), col.id).unwrap();
+            let pos = cols.get_column_by_id(table.id(), col.id).unwrap();
             Self::encode_column_value(&tuple[pos], &col.ty, &mut new_vl);
 
             Self::encode_col_id(col.id, &mut new_pk);
@@ -952,7 +952,10 @@ impl DB {
             x.table.metadata.id == table.metadata.id && x.part_of_key == 'p'
         });
         if rs.is_none() {
-            return Ok((tuple.row_key(), false));
+            let keys = Self::extract_multi_row_keys_from_tuple(tuple, table.id());
+            for key in keys {
+                return Ok((key, false));
+            }
         }
 
         fn rebuild_row_key(table: &TableRef, tuple: &Tuple, buf: &mut ArenaVec<u8>) -> Result<()> {

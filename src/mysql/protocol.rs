@@ -22,12 +22,16 @@ macro_rules! int {
 }
 
 macro_rules! string {
+
+    [nul] => {
+        NullTerminatedString
+    };
+    [lenenc] => {
+        LengthEncodedString<ArenaStr>
+    };
     [$n:expr] => {
         FixedLengthString<$n>
     };
-    [lenenc] => {
-
-    }
 }
 
 
@@ -74,10 +78,54 @@ pub struct ErrPacket {
 /// Initial Handshake
 /// Plain Handshake
 pub struct HandshakeV9 {
-    protocol_version: int![1],
+    pub protocol_version: int![1],
+    pub server_version: string![nul],
+    pub thread_id: int![4],
+    pub scramble: string![nul],
 }
 
+pub struct HandshakeResponse320 {
+    pub client_flag: int![2],
+    pub max_packet_size: int![3],
+    pub username: string![nul],
+    pub auth_response: string![nul],
+    pub database: string![nul],
+}
 
+pub struct HandshakeV10 {
+    pub protocol_version: int![1], // always 10
+    pub server_version: string![nul],
+    pub thread_id: int![4],
+    pub auth_plugin_data_part_1: string![8],
+    pub filter: int![1],
+    pub capability_flags_1: int![2],
+    pub character_set: int![1],
+    pub status_flags: int![2],
+    pub capability_flags_2: int![2],
+    pub auth_plugin_data_len: int![1],
+    pub reserved: string![10], // All 0s
+    pub auth_plugin_data_part_2: string![lenenc],
+    // pub auth_plugin_name: string![nul]
+}
+
+pub struct HandshakeResponse41 {
+    pub client_flag: int![4],
+    pub max_packet_size: int![4],
+    pub character_set: int![1],
+    pub filter: string![32],
+    pub username: string![nul],
+
+    // !> CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA >
+    pub auth_response_length: int![1],
+    pub auth_response: string![lenenc],
+    // !< CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA <
+
+    // > CLIENT_CONNECT_WITH_DB
+    pub database: string![nul],
+    // < CLIENT_CONNECT_WITH_DB
+
+    pub zstd_compression_level: int![1],
+}
 
 // pub struct SessionStateInformation {
 //     ty: FixedLengthInteger<u8, 1>,
@@ -137,6 +185,17 @@ impl Marshal for LengthEncodedInteger<usize> {
 impl Marshal for ArenaStr {
     fn marshal(&self, writer: &mut dyn Write) -> io::Result<usize> {
         writer.write(self.as_bytes())
+    }
+}
+
+pub struct NullTerminatedString {
+    val: ArenaStr
+}
+
+impl Marshal for NullTerminatedString {
+    fn marshal(&self, writer: &mut dyn Write) -> io::Result<usize> {
+        self.val.marshal(writer)?;
+        writer.write(&[0])
     }
 }
 

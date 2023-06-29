@@ -335,3 +335,26 @@ fn sql_update_with_primary_key() -> Result<()> {
     SqlSuite::assert_rows(&data, rs)?;
     Ok(())
 }
+
+#[test]
+fn sql_multi_update_one() -> Result<()> {
+    let suite = SqlSuite::new("tests/dbi-012")?;
+    suite.execute_file(Path::new("testdata/t3_t4_small_data_for_join.sql"), &suite.arena)?;
+
+    let sql = "update t3 \
+    inner join t4 on (t3.id = t4.id) \
+    set \
+        t3.name = \"cc\"\
+        , t4.name = \"dd\" \
+    where t4.df = 101";
+    assert_eq!(4, suite.execute_str(sql, &suite.arena)?);
+
+    let data = [
+        "(1, 100, \"cc\", 1, 101, \"dd\")",
+        "(2, 101, \"cc\", 2, 101, \"dd\")",
+    ];
+    let rs = suite.execute_query_str("select * from t3 inner join t4 on (t3.id = t4.id) where t4.df = 101", &suite.arena)?;
+    SqlSuite::assert_rows(&data, rs)?;
+
+    Ok(())
+}

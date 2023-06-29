@@ -736,6 +736,7 @@ impl Visitor for Executor {
 
 pub struct ColumnsAuxResolver {
     id_to_idx: ArenaMap<(u64, u32), usize>,
+    //row_keys: ArenaMap<u64, (usize, usize)>,
     cols: *const ColumnSet
 }
 
@@ -743,6 +744,7 @@ impl ColumnsAuxResolver {
     pub fn new(arena: &ArenaMut<Arena>) -> Self {
         Self {
             id_to_idx: ArenaMap::new(arena),
+            //row_keys: ArenaMap::new(arena),
             cols: ptr::null(),
         }
     }
@@ -752,6 +754,7 @@ impl ColumnsAuxResolver {
             return;
         }
         self.id_to_idx.clear();
+        //self.row_keys.clear();
         if let Some(tid) = tuple.columns().original_table_id() {
             for col in &tuple.columns().columns {
                 self.id_to_idx.insert((tid, col.id), col.order);
@@ -760,13 +763,42 @@ impl ColumnsAuxResolver {
             for col in &tuple.columns().columns {
                 self.id_to_idx.insert((col.original_tid, col.id), col.order);
             }
+            // Self::iterate_multi_row_key(tuple.row_key(), |tid, slice| {
+            //     self.row_keys.insert(tid, slice);
+            // });
         }
         self.cols = tuple.columns_set.as_ptr();
     }
 
-    pub fn get_by_id(&self, tid: u64, id: u32) -> Option<usize> {
+    pub fn get_column_by_id(&self, tid: u64, id: u32) -> Option<usize> {
         self.id_to_idx.get(&(tid, id)).cloned()
     }
+
+    // pub fn get_row_key<'a>(&self, tid: u64, buf: &'a [u8]) -> &'a [u8] {
+    //     if self.row_keys.is_empty() {
+    //         buf
+    //     } else {
+    //         let (pos, len) = self.row_keys.get(&tid).cloned().unwrap();
+    //         &buf[pos..pos + len]
+    //     }
+    // }
+    //
+    // pub fn iterate_multi_row_key<F>(row_key: &[u8], mut callback: F) where F: FnMut(u64, (usize, usize)) {
+    //     let mut pos = 0;
+    //     while pos < row_key.len() {
+    //         let id_part = &row_key[pos..pos + size_of::<u64>()];
+    //         let id = u64::from_be_bytes(id_part.try_into().unwrap());
+    //         pos += size_of::<u64>();
+    //
+    //         let len_part = &row_key[pos..pos + size_of::<u32>()];
+    //         pos += size_of::<u32>();
+    //         let len = u32::from_be_bytes(len_part.try_into().unwrap()) as usize;
+    //
+    //         //let part = &row_key[pos..pos + len];
+    //         callback(id, (pos, len));
+    //         pos += len;
+    //     }
+    // }
 }
 
 #[derive(Debug)]
