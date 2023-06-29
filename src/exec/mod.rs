@@ -14,6 +14,7 @@ mod relational_plan;
 mod physical_plan;
 mod function;
 mod planning;
+mod interpreter;
 
 #[macro_export]
 macro_rules! zone_limit_guard {

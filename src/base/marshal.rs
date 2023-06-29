@@ -201,7 +201,7 @@ impl FileWriter {
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        self.file.borrow_mut().append(buf)
+        self.file.borrow_mut().write(buf)
     }
 
     pub fn write_pad(&self, n: usize) -> io::Result<usize> {

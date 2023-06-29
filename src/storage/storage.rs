@@ -125,6 +125,7 @@ pub struct Options {
     pub max_open_files: usize,
     pub max_total_wal_size: usize,
     pub block_cache_capacity: usize,
+    pub zstd_compression_level: i32,
 }
 
 impl Options {
@@ -151,6 +152,7 @@ impl Default for Options {
             max_open_files: 1000,
             max_total_wal_size: 80 * 1024 * 1024,
             block_cache_capacity: 10 * 1024 * 1024,
+            zstd_compression_level: 3,
         }
     }
 }
