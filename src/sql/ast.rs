@@ -57,6 +57,7 @@ ast_nodes_impl![
     (FullyQualifiedName, visit_full_qualified_name),
     (UnaryExpression, visit_unary_expression),
     (BinaryExpression, visit_binary_expression),
+    (CaseWhen, visit_case_when),
     (InLiteralSet, visit_in_literal_set),
     (InRelation, visit_in_relation),
     (CallFunction, visit_call_function),
@@ -129,7 +130,7 @@ macro_rules! ast_ops_impl {
             $($name,)+
         }
 
-        static OPS_META: [OpMeta; 20] = [
+        static OPS_META: [OpMeta; 21] = [
             $(OpMeta {name: stringify!($name), literal: $op, priority: $prio},)+
         ];
     }
@@ -137,6 +138,7 @@ macro_rules! ast_ops_impl {
 
 ast_ops_impl![
     (Lit, "<lit>", 110),
+    (Cond, "<cond>", 110),
 
     (In, "in", 110),
     (NotIn, "not in", 110),
@@ -530,6 +532,23 @@ impl Expression for BinaryExpression {
     }
 }
 
+pub struct CaseWhen {
+    pub matching: Option<ArenaBox<dyn Expression>>,
+    pub when_clause: ArenaVec<WhenClause>,
+    pub else_clause: Option<ArenaBox<dyn Expression>>,
+}
+
+pub struct WhenClause {
+    pub expected: ArenaBox<dyn Expression>,
+    pub then: ArenaBox<dyn Expression>,
+}
+
+impl Expression for CaseWhen {
+    fn op(&self) -> &Operator { &Operator::Cond }
+    fn operands(&self) -> &[ArenaBox<dyn Expression>] { &[] }
+    fn operands_mut(&mut self) -> &mut [ArenaBox<dyn Expression>] { &mut [] }
+}
+
 // fully-qualified
 pub struct FullyQualifiedName {
     pub prefix: ArenaStr,
@@ -800,6 +819,15 @@ impl Factory {
         ArenaBox::new(BinaryExpression {
             op,
             operands: [lhs, rhs],
+        }, self.arena.get_mut())
+    }
+
+    pub fn new_case_when(&self, matching: Option<ArenaBox<dyn Expression>>, when_clause: ArenaVec<WhenClause>,
+                         else_clause: Option<ArenaBox<dyn Expression>>) -> ArenaBox<CaseWhen> {
+        ArenaBox::new(CaseWhen {
+            matching,
+            when_clause,
+            else_clause,
         }, self.arena.get_mut())
     }
 

@@ -811,6 +811,34 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
                     Ok(self.factory.new_identifier(symbol).into())
                 }
             }
+            Token::Case => {
+                let matching = if self.peek().token != Token::When {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                let mut when_clause = arena_vec!(&self.factory.arena);
+                loop {
+                    self.match_expected(Token::When)?;
+                    let expected = self.parse_expr()?;
+                    self.match_expected(Token::Then)?;
+                    let then = self.parse_expr()?;
+
+                    when_clause.push(WhenClause{
+                        expected, then
+                    });
+                    if self.peek().token != Token::When {
+                        break;
+                    }
+                }
+
+                let else_clause = if self.test(Token::Else)? {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                Ok(self.factory.new_case_when(matching, when_clause, else_clause).into())
+            }
             _ => {
                 let message = format!("Unexpected primary expression, expected: {:?}",
                                       self.peek().token);

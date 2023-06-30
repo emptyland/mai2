@@ -195,7 +195,7 @@ impl Evaluator {
         }
     }
 
-    fn require_int(origin: &Value) -> Value {
+    pub fn require_int(origin: &Value) -> Value {
         match origin {
             Value::Undefined => Value::Undefined,
             Value::Null => Value::Null,
@@ -227,7 +227,7 @@ impl Evaluator {
         }
     }
 
-    fn eval_compare_number(lhs: &Value, rhs: &Value, op: &Operator) -> Value {
+    pub fn eval_compare_number(lhs: &Value, rhs: &Value, op: &Operator) -> Value {
         match lhs {
             Value::Int(a) => match rhs {
                 Value::Int(b) => Self::eval_compare_op(*a, *b, op),
@@ -246,7 +246,7 @@ impl Evaluator {
         }
     }
 
-    fn eval_compare_op<T: PartialOrd>(lhs: T, rhs: T, op: &Operator) -> Value {
+    pub fn eval_compare_op<T: PartialOrd>(lhs: T, rhs: T, op: &Operator) -> Value {
         match op {
             Operator::Lt => Value::Int(if lhs < rhs { 1 } else { 0 }),
             Operator::Le => Value::Int(if lhs <= rhs { 1 } else { 0 }),

@@ -982,6 +982,9 @@ pub mod map {
         }
 
         pub fn get(&self, k: &K) -> Option<&V> {
+            if self.slots.is_empty() {
+                return None;
+            }
             let (hash_code, slot) = self.locate_slot(&k);
             let mut p = self.slots[slot];
             while p != ptr::null_mut() {

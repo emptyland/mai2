@@ -76,6 +76,10 @@ pub enum Token {
     Delete,
     Update,
     Set,
+    Case,
+    When,
+    Then,
+    Else,
 
     // types:
     Char,
@@ -191,6 +195,10 @@ impl Keywords {
                 Delete,
                 Update,
                 Set,
+                Case,
+                When,
+                Then,
+                Else,
 
                 Char,
                 Varchar,
