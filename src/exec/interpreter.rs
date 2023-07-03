@@ -7,11 +7,13 @@ use crate::{Result};
 use crate::exec::evaluator::{Context, Evaluator, Value};
 use crate::map::ArenaMap;
 use crate::sql::ast;
-use crate::sql::ast::{BinaryExpression, CallFunction, CaseWhen, Expression, FastAccessHint, FullyQualifiedName, Identifier, Literal, Operator, Visitor};
+use crate::sql::ast::*;
 use crate::status::Corrupting;
 
 #[derive(Debug, PartialEq)]
 pub enum Bytecode {
+    // 0x00
+    Nop, // do nothing
     // 0x1x
     Ldn(ArenaStr), // load by name
     Ldfn(ArenaStr, ArenaStr), // load by full-name
@@ -21,6 +23,7 @@ pub enum Bytecode {
     Ldsf(f32), // load const f32
     Lddf(f64), // load const f64
     Ldnul, // load NULL
+    Ldhd(usize), // load plachholder
 
     // 0x2x
     Add,
@@ -46,21 +49,33 @@ pub enum Bytecode {
     //     when e2 then v2
     //     ...
     // else l1
-    Jnz(i32), // jump if true
-    Jz(i32), // jump if false
-    Jne(i32), //
-    Jeq(i32), //
-    Jlt(i32), //
-    Jle(i32), //
-    Jgt(i32), //
-    Jge(i32), //
-    Jmp(i32), // jump always
+    Jnz(isize), // jump if true
+    Jz(isize), // jump if false
+    Jne(isize), //
+    Jeq(isize), //
+    Jlt(isize), //
+    Jle(isize), //
+    Jgt(isize), //
+    Jge(isize), //
+    Jmp(isize), // jump always
 
     // 0xa0
     Call(ArenaStr, usize), // call(callee-name, n-args)
 
     // 0xef
     End,
+}
+
+pub enum Condition {
+    IfTrue = 0,
+    IfFalse = 1,
+    NotEqual = 2,
+    Equal = 3,
+    Less = 4,
+    LessOrEqual = 5,
+    Greater = 6,
+    GreaterOrEqual = 7,
+    Always = 8,
 }
 
 pub struct Interpreter {
@@ -96,20 +111,46 @@ macro_rules! define_arithmetic_op {
 }
 
 impl Interpreter {
+    fn new(arena: &ArenaMut<Arena>) -> Self {
+        Self {
+            stack: arena_vec!(arena),
+            env: arena_vec!(arena),
+            arena: arena.clone(),
+        }
+    }
 
-    fn evaluate(&mut self, bca: &mut BytecodeArray) -> Result<Value> {
+    fn evaluate(&mut self, bca: &mut BytecodeArray, env: Arc<dyn Context>) -> Result<Value> {
+        self.enter(env);
+        let rs = self.evaluate_impl(bca);
+        self.exit();
+        rs
+    }
+
+    fn enter(&mut self, env: Arc<dyn Context>) {
+        self.env.push(env);
+    }
+
+    fn exit(&mut self) -> Arc<dyn Context> {
+        self.env.pop().unwrap()
+    }
+
+    fn evaluate_impl(&mut self, bca: &mut BytecodeArray) -> Result<Value> {
         use Bytecode::*;
         bca.reset();
         loop {
             match bca.pick() {
+                Nop => (), // do nothing
+
                 Ldn(name) => self.stack.push(self.resolve(name.as_str())?),
                 Ldfn(prefix, suffix) =>
                     self.ret(self.resolve_fully_qualified(prefix.as_str(), suffix.as_str())?),
                 Ldfa(i) => self.ret(self.env().fast_access(i).clone()),
+                Ldi(n) => self.ret(Value::Int(n)),
                 Ldsz(s) => self.ret(Value::Str(s)),
                 Ldsf(f) => self.ret(Value::Float(f as f64)),
                 Lddf(f) => self.ret(Value::Float(f)),
                 Ldnul => self.ret(Value::Null),
+                Ldhd(i) => self.ret(self.env().bound_param(i).clone()),
 
                 Add => self.add(),
                 Sub => self.sub(),
@@ -123,12 +164,45 @@ impl Interpreter {
                 Gt => self.cmp(Operator::Gt),
                 Ge => self.cmp(Operator::Ge),
 
+                Jnz(dist) => if self.normalize_to_bool() {
+                    bca.increase_pc(dist);
+                }
+                Jz(dist) => if !self.normalize_to_bool() {
+                    bca.increase_pc(dist);
+                }
+                Jne(dist) => if self.test(Operator::Ne) {
+                    bca.increase_pc(dist);
+                }
+                Jeq(dist) => if self.test(Operator::Eq) {
+                    bca.increase_pc(dist);
+                }
+                Jmp(dist) => bca.increase_pc(dist),
+
+                Call(callee, nargs) => self.call(callee, nargs)?,
+
                 End => break,
                 _ => unreachable!()
             }
         }
 
         Ok(self.stack.pop().unwrap())
+    }
+
+    fn call(&mut self, callee: ArenaStr, nargs: usize) -> Result<()> {
+        let rs = self.env().get_udf(callee.as_str());
+        if rs.is_none() {
+            corrupted_err!("UDF: {} not found in this env.", callee)?
+        }
+        let udf = rs.unwrap();
+        let args = self.stack.len() - nargs;
+        let rv = udf.evaluate(&self.stack.as_slice()[args..], &self.arena)?;
+        self.stack.truncate(args);
+        self.ret(rv);
+        Ok(())
+    }
+
+    fn normalize_to_bool(&mut self) -> bool {
+        Evaluator::normalize_to_bool(&self.stack.pop().unwrap())
     }
 
     fn resolve(&self, name: &str) -> Result<Value> {
@@ -174,6 +248,11 @@ impl Interpreter {
             }
             _ => self.ret(lhs)
         }
+    }
+
+    fn test(&mut self, op: ast::Operator) -> bool {
+        self.cmp(op);
+        self.normalize_to_bool()
     }
 
     fn cmp(&mut self, op: ast::Operator) {
@@ -240,32 +319,31 @@ impl BytecodeBuilder {
         self.pool.clear();
     }
 
-    fn emit_j(&mut self, bc: Bytecode, label: &mut Label) {
+    fn emit_j(&mut self, cond: Condition, label: &mut Label) {
         let dist = label.pc;
-        label.pc = self.bytes.len();
+        label.pc = self.bytes.len() + 3 /* len of jxx code */;
 
-        use Bytecode::*;
-        match bc {
-            Jnz(_) => self.emit_byte(0xd0), // jump if true
-            Jz(_) => self.emit_byte(0xd1), // jump if false
-            Jne(_) => self.emit_byte(0xd2), //
-            Jeq(_) => self.emit_byte(0xd3), //
-            Jlt(_) => self.emit_byte(0xd4), //
-            Jle(_) => self.emit_byte(0xd5), //
-            Jgt(_) => self.emit_byte(0xd6), //
-            Jge(_) => self.emit_byte(0xd7), //
-            Jmp(_) => self.emit_byte(0xd8), // jump always
-            _ => unreachable!()
+        use Condition::*;
+        match cond {
+            IfTrue => self.emit_byte(0xd0), // jump if true
+            IfFalse => self.emit_byte(0xd1), // jump if false
+            NotEqual => self.emit_byte(0xd2), //
+            Equal => self.emit_byte(0xd3), //
+            Less => self.emit_byte(0xd4), //
+            LessOrEqual => self.emit_byte(0xd5), //
+            Greater => self.emit_byte(0xd6), //
+            GreaterOrEqual => self.emit_byte(0xd7), //
+            Always => self.emit_byte(0xd8), // jump always
         }
         self.emit_dist(dist as isize);
     }
 
-    fn bind(&mut self, label: Label) {
+    fn bind(&mut self, label: &mut Label) {
         debug_assert_ne!(0, label.pc);
         let current_pos = self.bytes.len() as isize;
         let mut pc = label.pc;
         loop {
-            let mut buf = &mut self.bytes.as_slice_mut()[pc+1..pc+3];
+            let mut buf = &mut self.bytes.as_slice_mut()[pc-2..pc];
             let off = i16::from_le_bytes(buf.try_into().unwrap()) as isize;
             // fill the distance!
             let dist = current_pos - pc as isize;
@@ -275,6 +353,7 @@ impl BytecodeBuilder {
             }
             pc = off as usize;
         }
+        label.bind = true;
     }
 
     fn emit(&mut self, bc: Bytecode) {
@@ -316,6 +395,11 @@ impl BytecodeBuilder {
             }
             // 0x17 => Bytecode::Ldnul,
             Ldnul => self.emit_byte(0x17),
+            // 0x18 => Bytecode::Ldhd(self.read_hint()),
+            Ldhd(hint) => {
+                self.emit_byte(0x18);
+                self.emit_hint(hint);
+            }
 
             // 0x20 => Bytecode::Add,
             Add => self.emit_byte(0x20),
@@ -493,6 +577,16 @@ impl <'a> BytecodeArray<'a> {
 
     pub fn reset(&mut self) { self.pc = 0; }
 
+    pub fn increase_pc(&mut self, dist: isize) {
+        // debug_assert!(dist as usize >= self.pc);
+        // debug_assert!(self.pc + (dist as usize) < self.bytes.len());
+        if dist >= 0 {
+            self.pc += dist as usize;
+        } else {
+            self.pc -= isize::abs(dist) as usize;
+        }
+    }
+
     pub fn pick(&mut self) -> Bytecode {
         if self.pc >= self.bytes.len() {
             return Bytecode::End;
@@ -512,6 +606,7 @@ impl <'a> BytecodeArray<'a> {
             0x15 => Bytecode::Ldsf(self.read_f32()),
             0x16 => Bytecode::Lddf(self.read_f64()),
             0x17 => Bytecode::Ldnul,
+            0x18 => Bytecode::Ldhd(self.read_hint()),
 
             0x20 => Bytecode::Add,
             0x21 => Bytecode::Sub,
@@ -529,6 +624,16 @@ impl <'a> BytecodeArray<'a> {
             0x2d => Bytecode::Or,
             0x2e => Bytecode::Not,
 
+            0xd0 => Bytecode::Jnz(self.read_dist()),
+            0xd1 => Bytecode::Jz(self.read_dist()),
+            0xd2 => Bytecode::Jne(self.read_dist()),
+            0xd3 => Bytecode::Jeq(self.read_dist()),
+            0xd4 => Bytecode::Jlt(self.read_dist()),
+            0xd5 => Bytecode::Jle(self.read_dist()),
+            0xd6 => Bytecode::Jgt(self.read_dist()),
+            0xd7 => Bytecode::Jge(self.read_dist()),
+            0xd8 => Bytecode::Jmp(self.read_dist()),
+
             0xa0 => Bytecode::Call(self.read_pool_str().1, self.read_hint()),
 
             0xef => Bytecode::End,
@@ -544,6 +649,12 @@ impl <'a> BytecodeArray<'a> {
 
     fn read_hint(&mut self) -> usize {
         let i = u16::from_le_bytes((&self.bytes[self.pc..self.pc + 2]).try_into().unwrap()) as usize;
+        self.pc += 2;
+        i
+    }
+
+    fn read_dist(&mut self) -> isize {
+        let i = i16::from_le_bytes((&self.bytes[self.pc..self.pc + 2]).try_into().unwrap()) as isize;
         self.pc += 2;
         i
     }
@@ -572,6 +683,12 @@ pub struct BytecodeBuildingVisitor {
 }
 
 impl BytecodeBuildingVisitor {
+    pub fn new(arena: &ArenaMut<Arena>) -> Self {
+        Self {
+            builder: BytecodeBuilder::new(arena)
+        }
+    }
+
     pub fn build<W: Write>(&mut self, expr: &mut dyn Expression, w: &mut W) -> io::Result<usize> {
         self.builder.clear();
         expr.accept(self);
@@ -624,23 +741,27 @@ impl Visitor for BytecodeBuildingVisitor {
             for when in this.when_clause.iter_mut() {
                 matching.accept(self);
                 when.expected.accept(self);
-                self.builder.emit_j(Bytecode::Jne(0), &mut otherwise);
+                self.builder.emit_j(Condition::NotEqual, &mut otherwise);
                 when.then.accept(self);
-                self.builder.emit_j(Bytecode::Jmp(0), &mut end);
+                self.builder.emit_j(Condition::Always, &mut end);
             }
         } else {
             for when in this.when_clause.iter_mut() {
                 when.expected.accept(self);
-                self.builder.emit_j(Bytecode::Jz(0), &mut otherwise);
+                self.builder.emit_j(Condition::IfFalse, &mut otherwise);
                 when.then.accept(self);
-                self.builder.emit_j(Bytecode::Jmp(0), &mut end);
+                self.builder.emit_j(Condition::Always, &mut end);
             }
         }
         if let Some(else_clause) = &mut this.else_clause {
-            self.builder.bind(otherwise);
+            self.builder.bind(&mut otherwise);
             else_clause.accept(self);
+        } else {
+            self.builder.bind(&mut otherwise);
+            self.builder.emit(Bytecode::Ldnul);
         }
-        self.builder.bind(end);
+        self.builder.bind(&mut end);
+        self.builder.emit(Bytecode::Nop);
     }
 
     fn visit_call_function(&mut self, this: &mut CallFunction) {
@@ -648,6 +769,10 @@ impl Visitor for BytecodeBuildingVisitor {
             arg.accept(self);
         }
         self.builder.emit(Bytecode::Call(this.callee_name.clone(), this.args.len()));
+    }
+
+    fn visit_int_literal(&mut self, this: &mut Literal<i64>) {
+        self.builder.emit(Bytecode::Ldi(this.data));
     }
 
     fn visit_float_literal(&mut self, this: &mut Literal<f64>) {
@@ -669,9 +794,12 @@ impl Visitor for BytecodeBuildingVisitor {
 
 #[cfg(test)]
 mod tests {
-    use crate::Arena;
+    use std::ops::DerefMut;
+    use crate::{Arena, ArenaRef};
     use super::*;
     use Bytecode::*;
+    use crate::exec::executor::MockContent;
+    use crate::sql::parse_sql_expr_from_content;
 
     #[test]
     fn bytecode_array_build() {
@@ -724,5 +852,252 @@ mod tests {
         assert_eq!(Ldsf(0.2), bca.pick());
         assert_eq!(Lddf(0.1), bca.pick());
         assert_eq!(End, bca.pick());
+    }
+
+    #[test]
+    fn bytecode_jmp_and_bind() {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let mut builder = BytecodeBuilder::new(&arena);
+
+        builder.emit(Ldi(19));
+        builder.emit(Ldi(20));
+
+        let mut label = Label::new();
+        builder.emit_j(Condition::Always, &mut label);
+        builder.emit(Add);
+        builder.bind(&mut label);
+        builder.emit(End);
+
+        let mut chunk = vec![];
+        builder.build(&mut chunk).unwrap();
+
+        assert_eq!(35, chunk.len());
+
+        let mut bca = BytecodeArray::new(&chunk, &arena).unwrap();
+        assert_eq!(Ldi(19), bca.pick());
+        assert_eq!(Ldi(20), bca.pick());
+        assert_eq!(Jmp(1), bca.pick());
+        assert_eq!(Add, bca.pick());
+        assert_eq!(End, bca.pick());
+    }
+
+    #[test]
+    fn bytecode_multi_jmps_bind_once() {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let mut builder = BytecodeBuilder::new(&arena);
+
+        builder.emit(Ldi(19));
+        builder.emit(Ldi(20));
+
+        let mut label = Label::new();
+        builder.emit_j(Condition::Always, &mut label);
+        builder.emit(Add);
+        builder.emit_j(Condition::Equal, &mut label);
+        builder.emit(Sub);
+        builder.emit_j(Condition::NotEqual, &mut label);
+        builder.emit(Mul);
+        builder.bind(&mut label);
+        builder.emit(End);
+
+        let mut chunk = vec![];
+        builder.build(&mut chunk).unwrap();
+
+        assert_eq!(43, chunk.len());
+
+        let mut bca = BytecodeArray::new(&chunk, &arena).unwrap();
+        assert_eq!(Ldi(19), bca.pick());
+        assert_eq!(Ldi(20), bca.pick());
+        assert_eq!(Jmp(9), bca.pick());
+        assert_eq!(Add, bca.pick());
+        assert_eq!(Jeq(5), bca.pick());
+        assert_eq!(Sub, bca.pick());
+        assert_eq!(Jne(1), bca.pick());
+        assert_eq!(Mul, bca.pick());
+        assert_eq!(End, bca.pick());
+    }
+
+    #[test]
+    fn interpreter_sanity() {
+        let mut suite = Suite::new();
+        let rv = suite.eval(|builder| {
+            builder.emit(Ldi(1));
+            builder.emit(Ldi(2));
+            builder.emit(Add);
+        }).unwrap();
+
+        assert_eq!(Value::Int(3), rv);
+    }
+
+    #[test]
+    fn interpreter_ldsz() {
+        let mut suite = Suite::new();
+        let a = ArenaStr::new("a", suite.arena.get_mut());
+        let b = ArenaStr::new("b", suite.arena.get_mut());
+        let c = ArenaStr::new("c", suite.arena.get_mut());
+
+        let rv = suite.eval(|builder| {
+            builder.emit(Ldsz(c.clone()));
+            builder.emit(Ldsz(b.clone()));
+            builder.emit(Ldsz(a.clone()));
+        }).unwrap();
+        assert_eq!(Value::Str(a.clone()), rv);
+    }
+
+    #[test]
+    fn interpreter_ldsf() {
+        let mut suite = Suite::new();
+        let rv = suite.eval(|b| {
+            b.emit(Ldsf(0.0));
+            b.emit(Lddf(0.1));
+        }).unwrap();
+        assert_eq!(Value::Float(0.1), rv);
+
+        let mut suite = Suite::new();
+        let name = ArenaStr::new("xxx", suite.arena.deref_mut());
+        let var = ArenaStr::new("aaa", suite.arena.deref_mut());
+        suite.with_env(|env| {
+            env.with_env([
+                (name.as_str(), Value::Int(99)),
+                (var.as_str(), Value::Float(0.1))
+            ])
+        });
+        let rv = suite.eval(|b| {
+            b.emit(Ldn(var.clone()));
+            b.emit(Ldn(name.clone()));
+        }).unwrap();
+        assert_eq!(Value::Int(99), rv);
+    }
+
+    #[test]
+    fn interpreter_add() {
+        let mut suite = Suite::new();
+        let v100 = ArenaStr::new("100", suite.arena.get_mut());
+        assert_eq!(Value::Int(122), suite.eval(|b| {
+            b.emit(Ldsz(v100.clone()));
+            b.emit(Ldi(22));
+            b.emit(Add);
+        }).unwrap());
+
+        let mut suite = Suite::new();
+        assert_eq!(Value::Float(1.1), suite.eval(|b| {
+            b.emit(Lddf(1.0));
+            b.emit(Lddf(0.1));
+            b.emit(Add);
+        }).unwrap())
+    }
+
+    #[test]
+    fn interpreter_jxx() {
+        let mut suite = Suite::new();
+        assert_eq!(Value::Int(1), suite.eval(|b| {
+            let mut label = Label::new();
+            b.emit(Lddf(1.0));
+            b.emit(Lddf(0.1));
+            b.emit_j(Condition::Always, &mut label);
+            b.emit(Add);
+            b.bind(&mut label);
+            b.emit(Ldi(1));
+        }).unwrap())
+    }
+
+    #[test]
+    fn interpreter_calling() -> Result<()> {
+        let mut suite = Suite::new();
+        suite.with_env(|x|{x});
+        let parts = [
+            ArenaStr::new("hello", suite.arena.deref_mut()),
+            ArenaStr::new(",", suite.arena.deref_mut()),
+            ArenaStr::new("world", suite.arena.deref_mut()),
+        ];
+        let all_of_parts = ArenaStr::new("hello,world", suite.arena.deref_mut());
+        let concat = ArenaStr::new("concat", suite.arena.deref_mut());
+        assert_eq!(Value::Str(all_of_parts), suite.eval(|b| {
+            b.emit(Ldsz(parts[0].clone()));
+            b.emit(Ldsz(parts[1].clone()));
+            b.emit(Ldsz(parts[2].clone()));
+            b.emit(Call(concat.clone(), 3));
+        })?);
+        Ok(())
+    }
+
+    #[test]
+    fn simple_expr() -> Result<()> {
+        let mut suite = Suite::new();
+        assert_eq!(Value::Int(1), suite.eval_ast("2 - 1")?);
+        Ok(())
+    }
+
+    struct Suite<'a> {
+        zone: ArenaRef<Arena>,
+        arena: ArenaMut<Arena>,
+        builder: BytecodeBuilder,
+        chunk: Vec<u8>,
+        bca: Option<BytecodeArray<'a>>,
+        env: Option<Arc<dyn Context>>,
+        interpreter: Interpreter,
+    }
+
+    impl <'a> Suite<'a> {
+        fn new() -> Self {
+            let zone = Arena::new_ref();
+            let arena = zone.get_mut();
+            let chunk = vec![];
+            Self {
+                zone,
+                builder: BytecodeBuilder::new(&arena),
+                bca: None,
+                env: None,
+                interpreter: Interpreter::new(&arena),
+                chunk,
+                arena,
+            }
+        }
+
+        fn with_env<F>(&mut self, build: F)
+            where F: Fn(MockContent) -> MockContent {
+            let ctx = build(MockContent::new(&self.arena));
+            self.env = Some(Arc::new(ctx));
+        }
+
+        fn build<F>(&'a mut self, build: F) -> &mut BytecodeArray where F: Fn(&mut BytecodeBuilder) {
+            build(&mut self.builder);
+            self.chunk.clear();
+            self.builder.build(&mut self.chunk).unwrap();
+            self.bca = Some(BytecodeArray::new(&self.chunk, &self.arena).unwrap());
+            self.bca.as_mut().unwrap()
+        }
+
+        fn eval_ast(&'a mut self, expr: &str) -> Result<Value> {
+            let mut ast = parse_sql_expr_from_content(expr, &self.arena)?;
+            let mut visitor = BytecodeBuildingVisitor::new(&self.arena);
+
+            visitor.build(ast.deref_mut(), &mut self.chunk).unwrap();
+            self.bca = Some(BytecodeArray::new(&self.chunk, &self.arena).unwrap());
+            if let Some(env) = self.env.as_ref() {
+                self.interpreter.enter(env.clone());
+            }
+            let rs = self.interpreter.evaluate_impl(self.bca.as_mut().unwrap());
+            if self.env.is_some() {
+                self.interpreter.exit();
+            }
+            rs
+        }
+
+        fn eval<F>(&'a mut self, build: F) -> Result<Value> where F: Fn(&mut BytecodeBuilder) {
+            build(&mut self.builder);
+            self.chunk.clear();
+            self.builder.build(&mut self.chunk).unwrap();
+            self.bca = Some(BytecodeArray::new(&self.chunk, &self.arena).unwrap());
+            if let Some(env) = self.env.as_ref() {
+                self.interpreter.enter(env.clone());
+            }
+            let rs = self.interpreter.evaluate_impl(self.bca.as_mut().unwrap());
+            if self.env.is_some() {
+                self.interpreter.exit();
+            }
+            rs
+        }
     }
 }

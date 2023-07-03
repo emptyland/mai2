@@ -16,7 +16,8 @@ use crate::exec::{from_sql_result, function};
 use crate::exec::connection::ResultSet;
 use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata};
 use crate::exec::evaluator::{Context, Evaluator, expr_typing_reduce, Value};
-use crate::exec::function::{ExecutionContext, UDF};
+use crate::exec::function::{ExecutionContext, new_udf, UDF};
+use crate::exec::interpreter::BytecodeBuildingVisitor;
 use crate::exec::physical_plan::{ProjectingOps, ReturningOneDummyOps};
 use crate::exec::planning::{PlanMaker, resolve_physical_tables};
 use crate::map::ArenaMap;
@@ -344,12 +345,20 @@ impl Visitor for Executor {
         };
 
         let mut col_name_to_id = HashMap::new();
+        let mut bc_visitor = BytecodeBuildingVisitor::new(&self.arena);
         for i in 0..this.columns.len() {
             let col_decl = &this.columns[i];
             let ty = Self::convert_to_type(&col_decl.type_decl);
             if ty.is_err() {
                 self.rs = ty.err().unwrap();
                 return;
+            }
+            let mut def_val = vec![];
+            match col_decl.default_val.clone() {
+                Some(mut expr) => {
+                    bc_visitor.build(expr.deref_mut(), &mut def_val).unwrap();
+                }
+                None => ()
             }
             let col = ColumnMetadata {
                 name: col_decl.name.to_string(),
@@ -359,7 +368,7 @@ impl Visitor for Executor {
                 primary_key: col_decl.primary_key,
                 auto_increment: col_decl.auto_increment,
                 not_null: col_decl.not_null,
-                default_value: "".to_string(),
+                default_value: def_val,
             };
             if col_decl.primary_key {
                 table.primary_keys.push(col.id);
@@ -566,14 +575,34 @@ impl Visitor for Executor {
                                      &mut self.arena);
             ArenaBox::new(tmp, self.arena.deref_mut())
         };
+
+        let mut ignore_cols = ArenaMap::new(&self.arena);
+        for col in &table.metadata.columns {
+            ignore_cols.insert(col.name.as_str(), col.id);
+            columns.append_physical(col.name.as_str(), table.metadata.id, col.id, col.ty.clone());
+        }
+
         for col_name in &this.columns_name {
             match table.get_col_by_name(&col_name.to_string()) {
-                Some(col) => insertion_cols.push(col.id),
+                Some(col) => {
+                    ignore_cols.remove(&col.name.as_str());
+                    insertion_cols.push(col.id);
+                },
                 None => visit_fatal!(self, "Column: `{}` not found in table: `{}`", col_name.as_str(), this.table_name)
             }
         }
-        for col in &table.metadata.columns {
-            columns.append_physical(col.name.as_str(), table.metadata.id, col.id, col.ty.clone());
+
+        for (_, col_id) in ignore_cols.iter() {
+            let col = table.get_col_by_id(*col_id).unwrap();
+            if col.not_null {
+                if col.auto_increment {
+                    // ok: has auto increment value
+                } else if !col.default_value.is_empty() {
+                    // ok: has default value
+                } else {
+                    visit_fatal!(self, "Column: `{}` is not null, but no default value", col.name);
+                }
+            }
         }
 
         let use_anonymous_row_key = table.metadata.primary_keys.is_empty();
@@ -1229,6 +1258,80 @@ impl UniversalContext {
 impl Context for UniversalContext {
     fn bound_param(&self, order: usize) -> &Value {
         bound_param_impl!(self, order)
+    }
+}
+
+pub struct MockContent {
+    vals: ArenaVec<Value>,
+    bind_vals: ArenaVec<Value>,
+    names: ArenaMap<(ArenaStr, ArenaStr), usize>,
+    arena: ArenaMut<Arena>,
+}
+
+impl MockContent {
+    pub fn new(arena: &ArenaMut<Arena>) -> Self {
+        Self {
+            vals: arena_vec!(arena),
+            bind_vals: arena_vec!(arena),
+            names: ArenaMap::new(arena),
+            arena: arena.clone(),
+        }
+    }
+
+    pub fn with_env<const N: usize>(mut self, env: [(&str, Value); N]) -> Self {
+        for (name, value) in env {
+            let i = self.vals.len();
+            self.vals.push(value);
+            let name = if let Some(pos) = name.find(".") {
+                let (prefix, part) =  name.split_at(pos);
+                let suffix = std::str::from_utf8(&part.as_bytes()[1..]).unwrap();
+                (
+                    ArenaStr::new(prefix, self.arena.deref_mut()),
+                    ArenaStr::new(suffix, self.arena.deref_mut()),
+                )
+            } else {
+                (
+                    ArenaStr::default(),
+                    ArenaStr::new(name, self.arena.deref_mut())
+                )
+            };
+            self.names.insert(name, i);
+        }
+        self
+    }
+
+    pub fn with_binds<const N: usize>(mut self, binds: [Value; N]) -> Self {
+        for val in binds {
+            self.bind_vals.push(val);
+        }
+        self
+    }
+}
+
+impl Context for MockContent {
+    fn fast_access(&self, i: usize) -> &Value {
+        &self.vals[i]
+    }
+
+    fn resolve(&self, name: &str) -> Value {
+        self.resolve_fully_qualified("", name)
+    }
+
+    fn resolve_fully_qualified(&self, prefix: &str, suffix: &str) -> Value {
+        let a = ArenaStr::new(prefix, self.arena.get_mut());
+        let b = ArenaStr::new(suffix, self.arena.get_mut());
+        self.names.get(&(a, b)).map_or(Value::Undefined, |x| {
+            self.vals[*x].clone()
+        })
+    }
+
+    fn bound_param(&self, order: usize) -> &Value {
+        &self.bind_vals[order]
+    }
+
+    fn get_udf(&self, name: &str) -> Option<ArenaBox<dyn UDF>> {
+        let ctx = ExecutionContext::new(false, &self.arena);
+        new_udf(name, &ctx)
     }
 }
 

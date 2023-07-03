@@ -142,7 +142,10 @@ mod udf {
         } else {
             let mut buf = String::new();
             for arg in args {
-                buf.push_str(format!("{arg}").as_str());
+                match arg {
+                    Value::Str(s) => buf.push_str(format!("{s}").as_str()),
+                    _ => buf.push_str(format!("{arg}").as_str()),
+                }
             }
             Ok(Value::Str(ArenaStr::new(buf.as_str(), arena.get_mut())))
         }

@@ -1689,7 +1689,7 @@ pub struct ColumnMetadata {
     pub primary_key: bool,
     pub auto_increment: bool,
     pub not_null: bool,
-    pub default_value: String,
+    pub default_value: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
