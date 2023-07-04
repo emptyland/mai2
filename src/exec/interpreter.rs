@@ -119,7 +119,7 @@ impl Interpreter {
         }
     }
 
-    fn evaluate(&mut self, bca: &mut BytecodeArray, env: Arc<dyn Context>) -> Result<Value> {
+    fn evaluate<T: BytecodeChunk>(&mut self, bca: &mut T, env: Arc<dyn Context>) -> Result<Value> {
         self.enter(env);
         let rs = self.evaluate_impl(bca);
         self.exit();
@@ -134,7 +134,7 @@ impl Interpreter {
         self.env.pop().unwrap()
     }
 
-    fn evaluate_impl(&mut self, bca: &mut BytecodeArray) -> Result<Value> {
+    fn evaluate_impl<T: BytecodeChunk>(&mut self, bca: &mut T) -> Result<Value> {
         use Bytecode::*;
         bca.reset();
         loop {
@@ -533,67 +533,22 @@ impl BytecodeBuilder {
 }
 
 
+pub trait BytecodeChunk {
+    fn eof(&self) -> bool;
+    fn reset(&mut self);
+    fn increase_pc(&mut self, dist: isize);
+    fn pc(&self) -> u8 { self.peek(1)[0] }
+    fn peek(&self, len: usize) -> &[u8];
 
-// [bytecode-offset][bytecode-len] | [const-len][const-idx][const-idx].. | [bytecodes....] | [const-pool....] | [eof]
-pub struct BytecodeArray<'a> {
-    bytes: &'a [u8],
-    pc: usize,
-    const_pool: ArenaVec<(ArenaStr, ArenaStr)>
-}
+    fn constant_at(&self, i: usize) -> &(ArenaStr, ArenaStr);
 
-impl <'a> BytecodeArray<'a> {
-    pub fn new(chunk: &'a [u8], arena: &ArenaMut<Arena>) -> Result<Self> {
-        if chunk.len() < 12 {
-            corrupted_err!("Bytecode chunk is too samll, {}", chunk.len())?;
-        }
-        let offset = u32::from_le_bytes((&chunk[0..4]).try_into().unwrap()) as usize;
-        let len = u32::from_le_bytes((&chunk[4..8]).try_into().unwrap()) as usize;
-        let bytes = &chunk[offset..offset+len];
-
-        let mut pool = arena_vec!(arena);
-        let len = u32::from_le_bytes((&chunk[8..12]).try_into().unwrap()) as usize;
-        for i in 0..len {
-            let begin = 12 + i * 4;
-            let end = begin + 4;
-            let offset = u32::from_le_bytes((&chunk[begin..end]).try_into().unwrap()) as usize;
-            let n = u16::from_le_bytes((&chunk[offset..offset + 2]).try_into().unwrap()) as usize;
-            let s = std::str::from_utf8(&chunk[offset + 2..offset + 2 + n]).unwrap();
-            let full_name = if let Some(dot) = s.find(".") {
-                let (p, u) = s.split_at(dot);
-                (p, std::str::from_utf8(&u.as_bytes()[1..]).unwrap())
-            } else {
-                ("", s)
-            };
-            pool.push((ArenaStr::new(full_name.0, arena.get_mut()),
-                       ArenaStr::new(full_name.1, arena.get_mut())));
-        }
-
-        Ok(Self {
-            bytes,
-            pc: 0,
-            const_pool: pool
-        })
-    }
-
-    pub fn reset(&mut self) { self.pc = 0; }
-
-    pub fn increase_pc(&mut self, dist: isize) {
-        // debug_assert!(dist as usize >= self.pc);
-        // debug_assert!(self.pc + (dist as usize) < self.bytes.len());
-        if dist >= 0 {
-            self.pc += dist as usize;
-        } else {
-            self.pc -= isize::abs(dist) as usize;
-        }
-    }
-
-    pub fn pick(&mut self) -> Bytecode {
-        if self.pc >= self.bytes.len() {
+    fn pick(&mut self) -> Bytecode {
+        if self.eof() {
             return Bytecode::End;
         }
 
-        let opcode = self.bytes[self.pc];
-        self.pc += 1;
+        let opcode = self.pc();
+        self.increase_pc(1);
         match opcode {
             0x10 => Bytecode::Ldn(self.read_pool_str().1),
             0x11 => {
@@ -641,40 +596,173 @@ impl <'a> BytecodeArray<'a> {
         }
     }
 
-    fn read_pool_str(&mut self) -> (ArenaStr, ArenaStr) {
-        let i = u16::from_le_bytes((&self.bytes[self.pc..self.pc + 2]).try_into().unwrap()) as usize;
-        self.pc += 2;
-        self.const_pool[i].clone()
-    }
-
     fn read_hint(&mut self) -> usize {
-        let i = u16::from_le_bytes((&self.bytes[self.pc..self.pc + 2]).try_into().unwrap()) as usize;
-        self.pc += 2;
+        let i = u16::from_le_bytes(self.peek(2).try_into().unwrap()) as usize;
+        self.increase_pc(2);
         i
     }
 
     fn read_dist(&mut self) -> isize {
-        let i = i16::from_le_bytes((&self.bytes[self.pc..self.pc + 2]).try_into().unwrap()) as isize;
-        self.pc += 2;
+        let i = i16::from_le_bytes(self.peek(2).try_into().unwrap()) as isize;
+        self.increase_pc(2);
         i
     }
 
     fn read_i64(&mut self) -> i64 {
-        let n = i64::from_le_bytes((&self.bytes[self.pc..self.pc + 8]).try_into().unwrap());
-        self.pc += 8;
+        let n = i64::from_le_bytes(self.peek(8).try_into().unwrap());
+        self.increase_pc(8);
         n
     }
 
     fn read_f32(&mut self) -> f32 {
-        let n = f32::from_le_bytes((&self.bytes[self.pc..self.pc + 4]).try_into().unwrap());
-        self.pc += 4;
+        let n = f32::from_le_bytes(self.peek(4).try_into().unwrap());
+        self.increase_pc(4);
         n
     }
 
     fn read_f64(&mut self) -> f64 {
-        let n = f64::from_le_bytes((&self.bytes[self.pc..self.pc + 8]).try_into().unwrap());
-        self.pc += 8;
+        let n = f64::from_le_bytes(self.peek(8).try_into().unwrap());
+        self.increase_pc(8);
         n
+    }
+
+    fn read_pool_str(&mut self) -> (ArenaStr, ArenaStr) {
+        let i = u16::from_le_bytes(self.peek(2).try_into().unwrap()) as usize;
+        self.increase_pc(2);
+        self.constant_at(i).clone()
+    }
+}
+
+
+// [bytecode-offset][bytecode-len] | [const-len][const-idx][const-idx].. | [bytecodes....] | [const-pool....] | [eof]
+pub struct BytecodeArray<'a> {
+    core: BytecodeSequence<&'a [u8]>
+}
+
+impl <'a> BytecodeArray<'a> {
+    pub fn new(chunk: &'a [u8], arena: &ArenaMut<Arena>) -> Result<Self> {
+        let mut core = BytecodeSequence::<&[u8]> {
+            bytes: &[],
+            pc: 0,
+            const_pool: arena_vec!(arena),
+        };
+        let (offset, len) = core.parse(chunk, arena)?;
+        core.bytes = &chunk[offset..offset + len];
+        Ok(Self { core })
+    }
+}
+
+impl <'a> BytecodeChunk for BytecodeArray<'a> {
+    fn eof(&self) -> bool {
+        self.core.pc >= self.core.bytes.len()
+    }
+
+    fn reset(&mut self) { self.core.reset(); }
+
+    fn increase_pc(&mut self, dist: isize) { self.core.increase_pc(dist); }
+
+    fn peek(&self, len: usize) -> &[u8] {
+        &self.core.bytes[self.core.pc..self.core.pc + len]
+    }
+
+    fn constant_at(&self, i: usize) -> &(ArenaStr, ArenaStr) {
+        &self.core.const_pool[i]
+    }
+}
+
+pub struct BytecodeVector {
+    core: BytecodeSequence<ArenaVec<u8>>,
+    code_offset: usize,
+    code_len: usize,
+}
+
+impl BytecodeVector {
+    pub fn new(chunk: ArenaVec<u8>, arena: &ArenaMut<Arena>) -> Self {
+        let mut core = BytecodeSequence {
+            bytes: arena_vec!(arena),
+            pc: 0,
+            const_pool: arena_vec!(arena),
+        };
+        let (code_offset, code_len) = core.parse(&chunk, arena).unwrap();
+        core.bytes = chunk;
+        Self {
+            core,
+            code_offset,
+            code_len,
+        }
+    }
+}
+
+impl BytecodeChunk for BytecodeVector {
+    fn eof(&self) -> bool {
+        self.core.pc >= self.code_len
+    }
+
+    fn reset(&mut self) {
+        self.core.reset();
+    }
+
+    fn increase_pc(&mut self, dist: isize) {
+        self.core.increase_pc(dist)
+    }
+
+    fn peek(&self, len: usize) -> &[u8] {
+        let bytes = &self.core.bytes.as_slice()[self.code_offset..self.code_offset + self.code_len];
+        &bytes[self.core.pc..self.core.pc + len]
+    }
+
+    fn constant_at(&self, i: usize) -> &(ArenaStr, ArenaStr) {
+        &self.core.const_pool[i]
+    }
+}
+
+struct BytecodeSequence<T> {
+    bytes: T,
+    pc: usize,
+    const_pool: ArenaVec<(ArenaStr, ArenaStr)>
+}
+
+impl <T> BytecodeSequence<T> {
+    pub fn parse(&mut self, chunk: &[u8], arena: &ArenaMut<Arena>) -> Result<(usize, usize)> {
+        if chunk.len() < 12 {
+            corrupted_err!("Bytecode chunk is too samll, {}", chunk.len())?;
+        }
+        let offset = u32::from_le_bytes((&chunk[0..4]).try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes((&chunk[4..8]).try_into().unwrap()) as usize;
+        let bytes = &chunk[offset..offset+len];
+        let bytes_range = (offset, len);
+
+        //let mut pool = arena_vec!(arena);
+        let len = u32::from_le_bytes((&chunk[8..12]).try_into().unwrap()) as usize;
+        for i in 0..len {
+            let begin = 12 + i * 4;
+            let end = begin + 4;
+            let offset = u32::from_le_bytes((&chunk[begin..end]).try_into().unwrap()) as usize;
+            let n = u16::from_le_bytes((&chunk[offset..offset + 2]).try_into().unwrap()) as usize;
+            let s = std::str::from_utf8(&chunk[offset + 2..offset + 2 + n]).unwrap();
+            let full_name = if let Some(dot) = s.find(".") {
+                let (p, u) = s.split_at(dot);
+                (p, std::str::from_utf8(&u.as_bytes()[1..]).unwrap())
+            } else {
+                ("", s)
+            };
+            self.const_pool.push((ArenaStr::new(full_name.0, arena.get_mut()),
+                       ArenaStr::new(full_name.1, arena.get_mut())));
+        }
+        self.pc = 0;
+        Ok(bytes_range)
+    }
+
+    fn reset(&mut self) { self.pc = 0; }
+
+    fn increase_pc(&mut self, dist: isize) {
+        // debug_assert!(dist as usize >= self.pc);
+        // debug_assert!(self.pc + (dist as usize) < self.bytes.len());
+        if dist >= 0 {
+            self.pc += dist as usize;
+        } else {
+            self.pc -= isize::abs(dist) as usize;
+        }
     }
 }
 
