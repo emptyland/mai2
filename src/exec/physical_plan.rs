@@ -12,7 +12,8 @@ use crate::exec::db::{ColumnType, DB};
 use crate::exec::evaluator::{Evaluator, Value};
 use crate::exec::executor::{ColumnSet, PreparedStatement, Tuple, UpstreamContext};
 use crate::exec::function::{Aggregator, Writable};
-use crate::sql::ast::{Expression, JoinOp};
+use crate::exec::interpreter::{BytecodeBuildingVisitor, BytecodeVector, Interpreter};
+use crate::sql::ast::{Expression, JoinOp, SqlOrdering};
 use crate::storage::{ColumnFamily, ColumnFamilyOptions, config, IteratorArc, ReadOptions, WriteOptions};
 
 pub trait PhysicalPlanOps {
@@ -419,27 +420,29 @@ impl PhysicalPlanOps for DistinctOps {
 }
 
 pub struct FilteringOps {
-    expr: ArenaBox<dyn Expression>,
+    expr: BytecodeVector,
     child: ArenaBox<dyn PhysicalPlanOps>,
     arena: ArenaMut<Arena>,
     projected_columns: ArenaBox<ColumnSet>,
     prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+    interpreter: Interpreter,
 
     context: Option<Arc<UpstreamContext>>,
 }
 
 impl FilteringOps {
-    pub fn new(expr: &ArenaBox<dyn Expression>,
+    pub fn new(expr: BytecodeVector,
                child: &ArenaBox<dyn PhysicalPlanOps>,
                projected_columns: &ArenaBox<ColumnSet>,
                prepared_stmt: Option<ArenaBox<PreparedStatement>>,
                arena: &ArenaMut<Arena>) -> Self {
         Self {
-            expr: expr.clone(),
+            expr,
             child: child.clone(),
             arena: arena.clone(),
             projected_columns: projected_columns.clone(),
             prepared_stmt,
+            interpreter: Interpreter::new(arena),
             context: None,
         }
     }
@@ -460,7 +463,7 @@ impl PhysicalPlanOps for FilteringOps {
     }
 
     fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
-        let mut arena = zone.get_mut();
+        //let mut arena = zone.get_mut();
 
         loop {
             let prev = self.child.next(feedback, zone);
@@ -468,12 +471,12 @@ impl PhysicalPlanOps for FilteringOps {
                 break None;
             }
             let tuple = prev.unwrap();
-            let mut evaluator = Evaluator::new(&mut arena);
 
             let context = self.context.as_ref().unwrap().clone();
             context.attach(&tuple);
 
-            let rs = evaluator.evaluate(self.expr.deref_mut(), context);
+            //let rs = evaluator.evaluate(self.expr.deref_mut(), context);
+            let rs = self.interpreter.evaluate(&mut self.expr, context);
             match rs {
                 Err(e) => {
                     feedback.catch_error(e);
@@ -492,17 +495,18 @@ impl PhysicalPlanOps for FilteringOps {
 }
 
 pub struct ProjectingOps {
-    columns: ArenaVec<ArenaBox<dyn Expression>>,
+    columns: ArenaVec<BytecodeVector>,
     child: ArenaBox<dyn PhysicalPlanOps>,
     arena: ArenaMut<Arena>,
     projected_columns: ArenaBox<ColumnSet>,
     prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+    interpreter: Interpreter,
 
     context: Option<Arc<UpstreamContext>>,
 }
 
 impl ProjectingOps {
-    pub fn new(columns: ArenaVec<ArenaBox<dyn Expression>>,
+    pub fn new(columns: ArenaVec<BytecodeVector>,
                child: ArenaBox<dyn PhysicalPlanOps>,
                arena: ArenaMut<Arena>,
                projected_columns: ArenaBox<ColumnSet>,
@@ -511,9 +515,11 @@ impl ProjectingOps {
         Self {
             columns,
             child,
+            interpreter: Interpreter::new(&arena),
             arena,
             projected_columns,
             prepared_stmt,
+
             context: None,
         }
     }
@@ -537,11 +543,11 @@ impl PhysicalPlanOps for ProjectingOps {
     }
 
     fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
-        let mut arena = zone.get_mut();
+        let arena = zone.get_mut();
 
         match self.child.next(feedback, zone) {
             Some(tuple) => {
-                let mut evaluator = Evaluator::new(&mut arena);
+                //let mut evaluator = Evaluator::new(&mut arena);
 
                 let context = self.context.as_ref().unwrap();
                 context.attach(&tuple);
@@ -549,8 +555,9 @@ impl PhysicalPlanOps for ProjectingOps {
                 let mut rv = Tuple::with(&self.projected_columns, &arena);
                 for i in 0..self.projected_columns.len() {
                     let expr = &mut self.columns[i];
-                    let rs = evaluator.evaluate(expr.deref_mut(),
-                                                context.clone());
+                    // let rs = evaluator.evaluate(expr.deref_mut(),
+                    //                             context.clone());
+                    let rs = self.interpreter.evaluate(expr, context.clone());
                     match rs {
                         Ok(value) => rv.set(i, value),
                         Err(e) => {
@@ -653,7 +660,8 @@ impl PhysicalPlanOps for RenamingOps {
 
 pub struct AggregatorBundle {
     acc: ArenaBox<dyn Aggregator>,
-    args: ArenaVec<ArenaBox<dyn Expression>>,
+    args: ArenaVec<BytecodeVector>,
+    args_expr: ArenaVec<ArenaBox<dyn Expression>>,
     rets: ArenaBox<dyn Writable>,
     rets_ty: Option<ColumnType>,
     bufs: ArenaVec<ArenaBox<dyn Writable>>,
@@ -661,20 +669,15 @@ pub struct AggregatorBundle {
 
 impl AggregatorBundle {
     pub fn new(acc: &ArenaBox<dyn Aggregator>,
-               params: &[ArenaBox<dyn Expression>],
+               args_expr: &[ArenaBox<dyn Expression>],
                arena: &ArenaMut<Arena>) -> Self {
-        let mut args = ArenaVec::new(arena);
-        let mut bufs = ArenaVec::new(arena);
-        for arg in params {
-            args.push(arg.clone());
-            bufs.push(acc.new_buf(&arena));
-        }
         Self {
             acc: acc.clone(),
-            args,
+            args: BytecodeBuildingVisitor::build_arena_boxes(args_expr, arena),
+            args_expr: ArenaVec::with_data(arena, args_expr),
             rets: acc.new_buf(arena),
             rets_ty: None,
-            bufs,
+            bufs: ArenaVec::with_init(arena, |_| { acc.new_buf(&arena) }, args_expr.len()),
         }
     }
 
@@ -686,11 +689,11 @@ impl AggregatorBundle {
 
     pub fn args_len(&self) -> usize { self.args.len() }
 
-    pub fn args_mut(&mut self) -> &mut [ArenaBox<dyn Expression>] { &mut self.args }
+    pub fn args_mut(&mut self) -> &mut [ArenaBox<dyn Expression>] { &mut self.args_expr }
 }
 
 pub struct GroupingAggregatorOps {
-    group_keys: ArenaVec<ArenaBox<dyn Expression>>,
+    group_keys: ArenaVec<BytecodeVector>,
     aggregators: ArenaVec<AggregatorBundle>,
     child: ArenaBox<dyn PhysicalPlanOps>,
     arena: ArenaMut<Arena>,
@@ -698,6 +701,7 @@ pub struct GroupingAggregatorOps {
     upstream_columns: Option<ArenaBox<ColumnSet>>,
     eof: bool,
     current_key: ArenaVec<u8>,
+    interpreter: Interpreter,
 
     context: Option<Arc<UpstreamContext>>,
     storage: Option<Arc<dyn storage::DB>>,
@@ -706,7 +710,7 @@ pub struct GroupingAggregatorOps {
 }
 
 impl GroupingAggregatorOps {
-    pub fn new(group_keys: ArenaVec<ArenaBox<dyn Expression>>,
+    pub fn new(group_keys: ArenaVec<BytecodeVector>,
                aggregators: ArenaVec<AggregatorBundle>,
                child: ArenaBox<dyn PhysicalPlanOps>,
                arena: ArenaMut<Arena>,
@@ -717,11 +721,13 @@ impl GroupingAggregatorOps {
             group_keys,
             aggregators,
             child,
+            interpreter: Interpreter::new(&arena),
             arena,
             projected_columns,
             upstream_columns: None,
             eof: false,
             current_key,
+
             context: None,
             storage: Some(storage),
             cf: None,
@@ -729,7 +735,7 @@ impl GroupingAggregatorOps {
         }
     }
 
-    fn group_by_keys(&self, cf: &Arc<dyn ColumnFamily>,
+    fn group_by_keys(&mut self, cf: &Arc<dyn ColumnFamily>,
                      upstream: &mut dyn PhysicalPlanOps) -> Result<u64> {
         let mut count = 0u64;
         let context = self.context.as_ref().unwrap();
@@ -738,7 +744,7 @@ impl GroupingAggregatorOps {
         let arena = zone.get_mut();
         let mut feedback = FeedbackImpl::default();
 
-        let mut evaluator = Evaluator::new(&arena);
+        //let mut evaluator = Evaluator::new(&arena);
         let wr_opts = WriteOptions::default();
         loop {
             if zone.rss_in_bytes > 10 * config::MB {
@@ -750,10 +756,11 @@ impl GroupingAggregatorOps {
                     let mut key = ArenaVec::new(&arena);
                     let mut row = ArenaVec::new(&arena);
                     context.attach(&tuple);
-                    for expr_box in &self.group_keys {
-                        let mut expr = expr_box.clone();
-                        let value = evaluator.evaluate(expr.deref_mut(), context.clone())?;
-                        DB::encode_key(&value, &mut key);
+                    for expr in self.group_keys.iter_mut() {
+                        // let mut expr = expr_box.clone();
+                        // let value = evaluator.evaluate(expr.deref_mut(), context.clone())?;
+                        let value = self.interpreter.evaluate(expr, context.clone())?;
+                        DB::encode_same_key(&value, &mut key);
                     }
                     key.write(&count.to_be_bytes()).unwrap();
 
@@ -770,14 +777,15 @@ impl GroupingAggregatorOps {
     fn aggregators_iterate(&mut self, tuple: &Tuple, context: &Arc<UpstreamContext>,
                            zone: &ArenaRef<Arena>) -> Result<()> {
         context.attach(tuple);
-        let arena = zone.get_mut();
-        let mut evaluator = Evaluator::new(&arena);
+        // let arena = zone.get_mut();
+        // let mut evaluator = Evaluator::new(&arena);
 
         debug_assert!(self.aggregators.len() <= self.projected_columns.len());
         for agg in self.aggregators.iter_mut() {
             for i in 0..agg.args.len() {
-                let mut expr = agg.args[i].clone();
-                let value = evaluator.evaluate(expr.deref_mut(), context.clone())?;
+                //let mut expr = agg.args[i].clone();
+                //let value = evaluator.evaluate(expr.deref_mut(), context.clone())?;
+                let value = self.interpreter.evaluate(&mut agg.args[i], context.clone())?;
                 agg.bufs[i].recv(&value);
             }
             agg.acc.iterate(agg.rets.deref_mut(), &agg.bufs)?;
@@ -973,10 +981,11 @@ impl PhysicalPlanOps for GroupingAggregatorOps {
 pub struct SimpleNestedLoopJoinOps {
     driver: ArenaBox<dyn PhysicalPlanOps>,
     matcher: ArenaBox<dyn PhysicalPlanOps>,
-    matching: ArenaBox<dyn Expression>,
+    matching: BytecodeVector,
     projected_columns: ArenaBox<ColumnSet>,
     arena: ArenaMut<Arena>,
     join_op: JoinOp,
+    interpreter: Interpreter,
 
     context: Option<Arc<UpstreamContext>>,
 }
@@ -984,7 +993,7 @@ pub struct SimpleNestedLoopJoinOps {
 impl SimpleNestedLoopJoinOps {
     pub fn new(driver: ArenaBox<dyn PhysicalPlanOps>,
                matcher: ArenaBox<dyn PhysicalPlanOps>,
-               matching: ArenaBox<dyn Expression>,
+               matching: BytecodeVector,
                projected_columns: ArenaBox<ColumnSet>,
                arena: ArenaMut<Arena>,
                join_op: JoinOp) -> Self {
@@ -993,8 +1002,10 @@ impl SimpleNestedLoopJoinOps {
             matcher,
             matching,
             projected_columns,
+            interpreter: Interpreter::new(&arena),
             arena,
             join_op,
+
             context: None,
         }
     }
@@ -1033,9 +1044,10 @@ impl SimpleNestedLoopJoinOps {
                 tuple.set(i, match_[i - drive.len()].clone());
             }
 
-            let mut evaluator = Evaluator::new(&arena);
+            //let mut evaluator = Evaluator::new(&arena);
             env.attach(&tuple);
-            let rv = evaluator.evaluate(self.matching.deref_mut(), env.clone())?;
+            //let rv = evaluator.evaluate(self.matching.deref_mut(), env.clone())?;
+            let rv = self.interpreter.evaluate(&mut self.matching, env.clone())?;
             if Evaluator::normalize_to_bool(&rv) {
                 break Ok(Self::finalize_tuple(tuple, drive, match_, feedback.need_row_key(), owns));
             }
@@ -1074,9 +1086,10 @@ impl SimpleNestedLoopJoinOps {
                 tuple.set(i, drive[i].clone());
             }
 
-            let mut evaluator = Evaluator::new(&arena);
+            //let mut evaluator = Evaluator::new(&arena);
             env.attach(&tuple);
-            let rv = evaluator.evaluate(self.matching.deref_mut(), env.clone())?;
+            //let rv = evaluator.evaluate(self.matching.deref_mut(), env.clone())?;
+            let rv = self.interpreter.evaluate(&mut self.matching, env.clone())?;
             if Evaluator::normalize_to_bool(&rv) {
                 break Ok(Self::finalize_tuple(tuple, drive, match_, feedback.need_row_key(), owns));
             }
@@ -1158,11 +1171,12 @@ pub struct IndexNestedLoopJoinOps {
     driving_vals: ArenaVec<u8>,
     driving_columns: ArenaBox<ColumnSet>,
     // expr -> ty
-    matching_key_bundle: ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>,
+    matching_key_bundle: RefCell<ArenaVec<(BytecodeVector, ColumnType)>>,
     matching_columns: ArenaBox<ColumnSet>,
     matching_key_id: u64,
     matching_key: RefCell<ArenaVec<u8>>,
     need_produce_row_key: bool,
+    //interpreter: Interpreter,
 
     storage: Option<Arc<dyn storage::DB>>,
     iter: Option<IteratorArc>,
@@ -1176,7 +1190,7 @@ impl IndexNestedLoopJoinOps {
                projected_columns: ArenaBox<ColumnSet>,
                join_op: JoinOp,
                driving_columns: ArenaBox<ColumnSet>,
-               matching_key_bundle: ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>,
+               matching_key_bundle: ArenaVec<(BytecodeVector, ColumnType)>,
                matching_columns: ArenaBox<ColumnSet>,
                matching_key_id: u64,
                prepared_stmt: Option<ArenaBox<PreparedStatement>>,
@@ -1192,11 +1206,12 @@ impl IndexNestedLoopJoinOps {
             join_op,
             driving_vals: arena_vec!(&arena),
             driving_columns,
-            matching_key_bundle,
+            matching_key_bundle: RefCell::new(matching_key_bundle),
             matching_columns,
             matching_key_id,
             matching_key: RefCell::new(arena_vec!(&arena)),
             need_produce_row_key: false,
+            //interpreter: Interpreter::new(&arena),
             arena,
             storage: Some(storage),
             iter: None,
@@ -1241,7 +1256,7 @@ impl IndexNestedLoopJoinOps {
     }
 
     fn match_tuple_from_pk(&mut self, drive: &Tuple, arena: &ArenaMut<Arena>) -> Result<Tuple> {
-        let iter_box = self.iter.as_ref().unwrap();
+        let iter_box = self.iter.clone().unwrap();
         let mut iter = iter_box.borrow_mut(); // iter in primary key
         let key_prefix = self.matching_key.borrow();
         match self.next_matching_tuple_directly(&key_prefix, &self.matching_columns, iter.deref_mut(), arena) {
@@ -1302,10 +1317,9 @@ impl IndexNestedLoopJoinOps {
 
         let env = self.context.as_ref().unwrap();
         env.attach(drive);
-        let mut evaluator = Evaluator::new(arena);
-        for (expr, ty) in &self.matching_key_bundle {
-            let e = unsafe { &mut *expr.ptr().as_ptr() };
-            let rv = evaluator.evaluate(e, env.clone())?;
+        let mut interpreter = Interpreter::new(arena);
+        for (expr, ty) in self.matching_key_bundle.borrow_mut().iter_mut() {
+            let rv = interpreter.evaluate(expr, env.clone())?;
 
             if DB::is_primary_key(self.matching_key_id) {
                 DB::encode_row_key(&rv, ty, key_buf.deref_mut())?;
@@ -1512,6 +1526,163 @@ impl PhysicalPlanOps for IndexNestedLoopJoinOps {
     }
 }
 
+pub struct OrderingInStorageOps {
+    ordering_key_bundle: ArenaVec<(BytecodeVector, SqlOrdering)>,
+    child: ArenaBox<dyn PhysicalPlanOps>,
+    projected_columns: ArenaBox<ColumnSet>,
+    prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+    //interpreter: Interpreter,
+    arena: ArenaMut<Arena>,
+
+    storage: Option<Arc<dyn storage::DB>>,
+    iter: Option<IteratorArc>,
+    cf: Option<Arc<dyn ColumnFamily>>,
+}
+
+impl OrderingInStorageOps {
+    pub fn new(ordering_key_bundle: ArenaVec<(BytecodeVector, SqlOrdering)>,
+               child: ArenaBox<dyn PhysicalPlanOps>,
+               projected_columns: ArenaBox<ColumnSet>,
+               prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+               arena: ArenaMut<Arena>,
+               storage: Arc<dyn storage::DB>) -> Self {
+        Self {
+            ordering_key_bundle,
+            child,
+            projected_columns,
+            prepared_stmt,
+            //interpreter: Interpreter::new(&arena),
+            arena,
+            storage: Some(storage),
+            iter: None,
+            cf: None,
+        }
+    }
+
+    fn ordering_insert(&mut self, up_cols: &ColumnSet, storage: &Arc<dyn storage::DB>, cf: &Arc<dyn ColumnFamily>) -> Result<()> {
+        let mut env = UpstreamContext::new(self.prepared_stmt.clone(), &self.arena);
+        env.add(up_cols);
+        let context = Arc::new(env);
+
+        let mut zone = Arena::new_ref();
+        let mut feedback = FeedbackImpl::new(true);
+        let mut interpreter = Interpreter::new(&self.arena);
+        let mut sequence = 0u64;
+        let wr_opts = WriteOptions::default();
+        loop {
+            zone_limit_guard!(zone, 1);
+            let rs = self.child.next(&mut feedback, &zone);
+            if rs.is_none() {
+                break;
+            }
+            let tuple = rs.unwrap();
+            context.attach(&tuple);
+
+            let mut ordering_key = arena_vec!(&self.arena);
+
+            for (bcv, ordering) in self.ordering_key_bundle.iter_mut() {
+                let value = interpreter.evaluate(bcv, context.clone())?;
+                match ordering {
+                    SqlOrdering::Asc => DB::encode_same_key(&value, &mut ordering_key),
+                    SqlOrdering::Desc => DB::encode_inverse_key(&value, &mut ordering_key),
+                }
+            }
+            // write row key
+            if tuple.row_key().is_empty() {
+                ordering_key.write(&sequence.to_be_bytes()).unwrap();
+                ordering_key.write(&0u32.to_be_bytes()).unwrap();
+            } else {
+                ordering_key.write(tuple.row_key()).unwrap();
+                let len = tuple.row_key().len() as u32;
+                ordering_key.write(&len.to_be_bytes()).unwrap();
+            }
+
+            sequence += 1;
+
+            let mut row = arena_vec!(&self.arena);
+            DB::encode_tuple(&tuple, &mut row);
+
+            storage.insert(&wr_opts, &cf, &ordering_key, &row)?;
+        }
+        Ok(())
+    }
+
+    fn get_row_key(key: &[u8]) -> &[u8] {
+        let tail = &key[key.len() - 4..];
+        let len = u32::from_be_bytes(tail.try_into().unwrap()) as usize;
+        &key[key.len() - 4 - len..key.len() - 4]
+    }
+}
+
+impl PhysicalPlanOps for OrderingInStorageOps {
+    fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
+        let cols = self.child.prepare()?;
+        if let Some(cf) = self.cf.as_ref() {
+            let _ = self.storage.as_ref().unwrap().drop_column_family(cf.clone());
+            self.cf = None;
+        }
+
+        let storage = self.storage.clone().unwrap();
+        let opts = ColumnFamilyOptions::with()
+            .temporary(true)
+            .build();
+        let cf = storage.new_column_family("mai::sql::ordering", opts)?;
+
+        self.ordering_insert(cols.deref(), &storage, &cf)?;
+
+        let rd_opts = ReadOptions::default();
+        let iter_box = storage.new_iterator(&rd_opts, &cf)?;
+        let mut iter = iter_box.borrow_mut();
+        if iter.status().is_not_ok() {
+            return Err(iter.status().clone());
+        }
+        iter.seek_to_first();
+        if !iter.valid() && iter.status().is_not_ok() {
+            return Err(iter.status().clone());
+        }
+
+        drop(iter);
+        self.iter = Some(iter_box);
+        self.cf = Some(cf);
+        Ok(self.projected_columns.clone())
+    }
+
+    fn finalize(&mut self) {
+        self.child.finalize();
+        if let Some(cf) = self.cf.as_ref() {
+            let _ = self.storage.as_ref().unwrap().drop_column_family(cf.clone());
+        }
+        self.storage = None;
+        self.cf = None;
+        self.iter = None;
+    }
+
+    fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        let iter_box = self.iter.as_ref().unwrap();
+        let mut iter = iter_box.borrow_mut();
+        if !iter.valid() {
+            return None;
+        }
+        let arena = zone.get_mut();
+        let mut tuple = DB::decode_tuple(&self.projected_columns, iter.value(), &arena);
+        if feedback.need_row_key() {
+            let row_key = Self::get_row_key(iter.key());
+            tuple.attach_row_key(ArenaVec::with_data(&arena, row_key));
+        }
+        iter.move_next();
+        if iter.status().is_not_ok() {
+            feedback.catch_error(iter.status().clone());
+            None
+        } else {
+            Some(tuple)
+        }
+    }
+
+    fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
+        arena_vec!(&self.arena, [self.child.clone()])
+    }
+}
+
 pub struct MockingProducerOps {
     data: ArenaVec<Tuple>,
     current: usize,
@@ -1687,8 +1858,9 @@ mod tests {
         let tt = ArenaBox::new(tt_cols, arena.get_mut());
 
         let expr = parse_sql_expr_from_content("t1.a = t2.d", &arena)?;
+        let bcv = BytecodeBuildingVisitor::build_arena_box(&expr, &arena);
         let mut plan = SimpleNestedLoopJoinOps::new(plan_t1.into(),
-                                                    plan_t2.into(), expr,
+                                                    plan_t2.into(), bcv,
                                                     tt, arena.clone(),
                                                     JoinOp::LeftOuterJoin);
         let data = [

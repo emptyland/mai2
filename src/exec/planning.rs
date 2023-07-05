@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::mem::replace;
@@ -12,6 +13,7 @@ use crate::exec::evaluator::{Evaluator, TypingReducer, Value};
 use crate::exec::executor::{ColumnSet, PreparedStatement, TypingStubContext, UniversalContext};
 use crate::exec::function;
 use crate::exec::function::{Aggregator, ExecutionContext};
+use crate::exec::interpreter::{BytecodeBuildingVisitor, BytecodeVector};
 use crate::exec::physical_plan::*;
 use crate::sql::ast::*;
 use crate::storage::storage;
@@ -24,6 +26,7 @@ pub struct PlanMaker {
     rs: Status,
     schemas: ArenaVec<ArenaBox<ColumnSet>>,
     current: ArenaVec<ArenaBox<dyn PhysicalPlanOps>>,
+    bytecode_builder: RefCell<BytecodeBuildingVisitor>,
 }
 
 impl PlanMaker {
@@ -39,6 +42,7 @@ impl PlanMaker {
             rs: Status::Ok,
             schemas: ArenaVec::new(arena),
             current: ArenaVec::new(arena),
+            bytecode_builder: RefCell::new(BytecodeBuildingVisitor::new(arena)),
         }
     }
 
@@ -74,8 +78,11 @@ impl PlanMaker {
 
             let cols = self.schemas.pop().unwrap();
             if let Some(filter) = where_clause {
-                let filtering = FilteringOps::new(filter, &plan, &cols,
-                                                  self.prepared_stmt.clone(), &self.arena);
+                let filtering = FilteringOps::new(self.build_bytecode_box(filter),
+                                                  &plan,
+                                                  &cols,
+                                                  self.prepared_stmt.clone(),
+                                                  &self.arena);
                 plan = ArenaBox::new(filtering, self.arena.get_mut()).into();
             }
             if limit.is_some() {
@@ -212,7 +219,7 @@ impl PlanMaker {
     fn make_filtering(&self, expr: &ArenaBox<dyn Expression>, columns: &ArenaBox<ColumnSet>,
                       child: &ArenaBox<dyn PhysicalPlanOps>,
                       limit: Option<u64>, offset: Option<u64>) -> ArenaBox<dyn PhysicalPlanOps> {
-        let ops = FilteringOps::new(expr, child, columns,
+        let ops = FilteringOps::new(self.build_bytecode_box(expr), child, columns,
                                     self.prepared_stmt.clone(), &self.arena);
         let child = ArenaBox::new(ops, self.arena.get_mut());
         if limit.is_some() || offset.is_some() {
@@ -285,6 +292,20 @@ impl PlanMaker {
             receiver.push(ArenaBox::new(ops, self.arena.get_mut()).into())
         }
         Ok(())
+    }
+
+    fn make_ordering(&self, cols: &ArenaBox<ColumnSet>, child: &ArenaBox<dyn PhysicalPlanOps>,
+                     order_by_clause: &[OrderClause]) -> ArenaBox<dyn PhysicalPlanOps> {
+        let mut ordering_key_bundle = arena_vec!(&self.arena);
+        for clause in order_by_clause {
+            ordering_key_bundle.push((self.build_bytecode_box(&clause.key), clause.ordering.clone()));
+        }
+        let ordering = OrderingInStorageOps::new(ordering_key_bundle, child.clone(),
+                                                 cols.clone(),
+                                                 self.prepared_stmt.clone(),
+                                                 self.arena.clone(),
+                                                 self.db.storage.clone());
+        ArenaBox::new(ordering, self.arena.get_mut()).into()
     }
 
     fn build_column_set(&self, table: &TableRef, alias: &ArenaStr, names: &[(ArenaStr, ArenaStr)])
@@ -403,8 +424,9 @@ impl PlanMaker {
                                     rhs_cols: &ColumnSet, rhs_plan: ArenaBox<dyn PhysicalPlanOps>, join_op: JoinOp,
                                     on_clause: ArenaBox<dyn Expression>) {
         let cols = self.merge_joining_columns_set(lhs_cols, rhs_cols);
+        let bcv = self.build_bytecode_box(&on_clause);
         let join_plan = SimpleNestedLoopJoinOps::new(lhs_plan, rhs_plan,
-                                                     on_clause, cols.clone(),
+                                                     bcv, cols.clone(),
                                                      self.arena.clone(), join_op);
         let plan = ArenaBox::new(join_plan, self.arena.get_mut());
         self.schemas.push(cols);
@@ -416,8 +438,12 @@ impl PlanMaker {
                                    matching_key_bundle: ArenaVec<(ArenaBox<dyn Expression>, ColumnType)>,
                                    join_op: JoinOp) {
         let cols = self.merge_joining_columns_set(lhs_cols.deref(), rhs_cols.deref());
+        let mut matching_bcv_bundle = arena_vec!(&self.arena);
+        for (expr, ty) in matching_key_bundle.iter() {
+            matching_bcv_bundle.push((self.build_bytecode_box(expr), ty.clone()));
+        }
         let join_plan = IndexNestedLoopJoinOps::new(lhs_plan, cols.clone(),
-                                                    join_op, lhs_cols, matching_key_bundle,
+                                                    join_op, lhs_cols, matching_bcv_bundle,
                                                     rhs_cols, matching_key_id,
                                                     self.prepared_stmt.clone(), self.arena.clone(),
                                                     self.db.storage.clone(), self.snapshot.clone(),
@@ -481,7 +507,8 @@ impl PlanMaker {
         }
 
         let projected_cols = ArenaBox::new(cols, self.arena.get_mut());
-        let plan = ProjectingOps::new(exprs,
+        let bcs = self.build_bytecode_boxes(&exprs);
+        let plan = ProjectingOps::new(bcs,
                                       up_plan,
                                       self.arena.clone(),
                                       projected_cols.clone(),
@@ -535,6 +562,26 @@ impl PlanMaker {
         } else {
             None
         }
+    }
+
+    fn build_bytecode_boxes(&self, boxes: &[ArenaBox<dyn Expression>]) -> ArenaVec<BytecodeVector> {
+        let mut rv = arena_vec!(&self.arena);
+        for it in boxes {
+            rv.push(self.build_bytecode_box(it));
+        }
+        rv
+    }
+
+    fn build_bytecode_box(&self, expr: &ArenaBox<dyn Expression>) -> BytecodeVector {
+        let mut copied = expr.clone();
+        self.build_bytecode(copied.deref_mut())
+    }
+
+    fn build_bytecode(&self, expr: &mut dyn Expression) -> BytecodeVector {
+        let mut chunk = arena_vec!(&self.arena);
+        let mut builder = self.bytecode_builder.borrow_mut();
+        builder.build(expr, &mut chunk).unwrap();
+        BytecodeVector::new(chunk, &self.arena)
     }
 }
 
@@ -638,7 +685,8 @@ impl Visitor for PlanMaker {
             if let Some(filter) = &mut this.where_clause {
                 let up_cols = self.schemas.pop().unwrap();
                 let up_plan = self.current.pop().unwrap();
-                let filtering = FilteringOps::new(filter, &up_plan, &up_cols,
+                let filtering = FilteringOps::new(self.build_bytecode_box(filter),
+                                                  &up_plan, &up_cols,
                                                   self.prepared_stmt.clone(), &self.arena);
                 self.schemas.push(up_cols);
                 self.current.push(ArenaBox::new(filtering, self.arena.get_mut()).into());
@@ -671,8 +719,9 @@ impl Visitor for PlanMaker {
             let cols =
                 self.merge_aggregators_columns_set(&aggregators, &up_cols);
 
+            let group_keys = self.build_bytecode_boxes(&this.group_by_clause);
             let grouping_plan =
-                GroupingAggregatorOps::new(this.group_by_clause.dup(&self.arena),
+                GroupingAggregatorOps::new(group_keys,
                                            aggregators,
                                            up_plan,
                                            self.arena.clone(),
@@ -691,7 +740,7 @@ impl Visitor for PlanMaker {
 
             debug_assert!(!this.group_by_clause.is_empty());
             let filtering_plan = FilteringOps::new(
-                having,
+                self.build_bytecode_box(having),
                 &up_plan,
                 &up_cols,
                 self.prepared_stmt.clone(),
@@ -701,7 +750,13 @@ impl Visitor for PlanMaker {
             self.current.push(ArenaBox::new(filtering_plan, self.arena.get_mut()).into());
         }
 
-        // TODO: Order by:
+        if !this.order_by_clause.is_empty() {
+            let up_cols = self.schemas.pop().unwrap();
+            let up_plan = self.current.pop().unwrap();
+            let plan = self.make_ordering(&up_cols, &up_plan, &this.order_by_clause);
+            self.schemas.push(up_cols);
+            self.current.push(plan);
+        }
 
         match self.make_projecting(&this.columns, this.alias.as_str()) {
             Err(e) => {
@@ -1904,7 +1959,7 @@ impl ProjectionColumnsVisitor {
 pub fn resolve_physical_tables(rel: &ArenaBox<dyn Relation>) -> Result<HashMap<ArenaStr, ArenaBox<FromClause>>> {
     let mut resolver = PhysicalTablesResolver {
         tables: HashMap::default(),
-        rs: Status::Ok
+        rs: Status::Ok,
     };
     let mut node = rel.clone();
     node.accept(&mut resolver);
@@ -1922,7 +1977,6 @@ struct PhysicalTablesResolver {
 
 impl Visitor for PhysicalTablesResolver {
     fn visit_from_clause(&mut self, this: &mut FromClause) {
-
         let key = if this.alias.is_empty() {
             this.name.clone()
         } else {

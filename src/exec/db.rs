@@ -1139,7 +1139,11 @@ impl DB {
             | ColumnType::Int(_)
             | ColumnType::BigInt(_) => {
                 match value {
-                    Value::Int(n) => { wr.write(&n.to_be_bytes()).unwrap(); }
+                    Value::Int(n) => {
+                        let mut bytes = n.to_be_bytes();
+                        bytes[0] ^= 128;
+                        wr.write(&bytes).unwrap();
+                    }
                     Value::NegativeInf => (), // ignore
                     Value::PositiveInf => (), // ignore
                     _ => unreachable!()
@@ -1188,14 +1192,30 @@ impl DB {
         &index[..index.len() - row_key_len]
     }
 
-    pub fn encode_key<W: Write>(value: &Value, wr: &mut W) {
+    pub fn encode_same_key<W: Write>(value: &Value, wr: &mut W) {
         if Self::encode_null_bytes(value, wr) {
             return;
         }
         match value {
-            Value::Int(n) => { wr.write(&n.to_be_bytes()).unwrap(); }
-            Value::Float(n) => { wr.write(&n.to_be_bytes()).unwrap(); }
+            Value::Int(n) => {
+                let mut bytes = n.to_be_bytes();
+                bytes[0] ^= 128;
+                wr.write(&bytes).unwrap();
+            }
+            Value::Float(n) => { wr.write(&n.to_ne_bytes()).unwrap(); }
             Value::Str(s) => { Self::encode_varchar_ty_for_key(s, wr); }
+            _ => unreachable!()
+        }
+    }
+
+    pub fn encode_inverse_key<W: Write>(value: &Value, wr: &mut W) {
+        if Self::encode_null_bytes(value, wr) {
+            return;
+        }
+        match value {
+            Value::Int(n) => Self::encode_same_key(&Value::Int(-*n), wr),
+            Value::Float(n) => Self::encode_same_key(&Value::Float(-*n), wr),
+            Value::Str(s) => { Self::encode_varchar_ty_for_inverse_key(s, wr); }
             _ => unreachable!()
         }
     }
@@ -1306,7 +1326,11 @@ impl DB {
             | ColumnType::Int(_)
             | ColumnType::BigInt(_) => {
                 match value {
-                    Value::Int(n) => wr.write(&n.to_be_bytes()).unwrap(),
+                    Value::Int(n) => {
+                        let mut bytes = n.to_be_bytes();
+                        bytes[0] ^= 128;
+                        wr.write(&bytes).unwrap()
+                    }
                     Value::NegativeInf | Value::PositiveInf => 0, // ignore
                     _ => unreachable!()
                 };
@@ -1353,29 +1377,55 @@ impl DB {
     fn encode_varchar_ty_for_key<W: Write>(s: &ArenaStr, wr: &mut W) {
         let part_len = Self::VARCHAR_SEGMENT_LEN - 1;
         let n_parts = (s.len() + (part_len - 1)) / (part_len);
+
         for i in 0..n_parts {
             let part = s.bytes_part(i * part_len, (i + 1) * part_len);
             wr.write(part).unwrap();
             if part.len() < part_len {
-                Self::encode_varchar_ty_filling(part_len - part.len(), wr);
+                Self::encode_varchar_ty_filling(part_len - part.len(), Self::CHAR_FILLING_BYTE, wr);
                 break;
             }
             let ch = *part.last().unwrap();
             let successor = s.as_bytes()[(i + 1) * part_len];
-            if successor > ch {
-                wr.write(&[Self::VARCHAR_CMP_GREATER_THAN_SPACES]).unwrap();
-            } else if successor < ch {
-                wr.write(&[Self::VARCHAR_CMP_LESS_THAN_SPACES]).unwrap();
-            } else {
-                wr.write(&[Self::VARCHAR_CMP_EQUAL_TO_SPACES]).unwrap();
+            Self::encode_varchar_cmp_tag(successor, ch, wr);
+        }
+    }
+
+    fn encode_varchar_ty_for_inverse_key<W: Write>(s: &ArenaStr, wr: &mut W) {
+        let mut buf: [u8;Self::VARCHAR_SEGMENT_LEN] = [0;Self::VARCHAR_SEGMENT_LEN];
+        let part_len = Self::VARCHAR_SEGMENT_LEN - 1;
+        let n_parts = (s.len() + (part_len - 1)) / (part_len);
+
+        for i in 0..n_parts {
+            let part = s.bytes_part(i * part_len, (i + 1) * part_len);
+            for j in 0..part.len() {
+                buf[j] = 255 - part[j];
             }
+            wr.write(&buf[..part.len()]).unwrap();
+            if part.len() < part_len {
+                Self::encode_varchar_ty_filling(part_len - part.len(), 255 - Self::CHAR_FILLING_BYTE, wr);
+                break;
+            }
+            let ch = 255 - *part.last().unwrap();
+            let successor = 255 - s.as_bytes()[(i + 1) * part_len];
+            Self::encode_varchar_cmp_tag(successor, ch, wr);
+        }
+    }
+
+    fn encode_varchar_cmp_tag<W: Write>(successor: u8, ch: u8, wr: &mut W) {
+        if successor > ch {
+            wr.write(&[Self::VARCHAR_CMP_GREATER_THAN_SPACES]).unwrap();
+        } else if successor < ch {
+            wr.write(&[Self::VARCHAR_CMP_LESS_THAN_SPACES]).unwrap();
+        } else {
+            wr.write(&[Self::VARCHAR_CMP_EQUAL_TO_SPACES]).unwrap();
         }
     }
 
     #[inline]
-    fn encode_varchar_ty_filling<W: Write>(n: usize, wr: &mut W) {
+    fn encode_varchar_ty_filling<W: Write>(n: usize, b: u8, wr: &mut W) {
         for _ in 0..n {
-            wr.write(&Self::CHAR_FILLING_BYTES).unwrap();
+            wr.write(&[b]).unwrap();
         }
         wr.write(&[Self::VARCHAR_CMP_EQUAL_TO_SPACES]).unwrap();
     }
@@ -1861,6 +1911,66 @@ mod tests {
             2,
         ];
         assert_eq!(raw, buf.as_slice());
+    }
+
+    #[test]
+    fn encode_same_key() {
+        let mut k1 = vec![];
+        DB::encode_same_key(&Value::Int(1), &mut k1);
+
+        let mut k2 = vec![];
+        DB::encode_same_key(&Value::Int(2), &mut k2);
+
+        assert!(k1 < k2);
+
+        k1.clear();
+        k2.clear();
+        DB::encode_same_key(&Value::Int(-1), &mut k1);
+        DB::encode_same_key(&Value::Int(0), &mut k2);
+        assert!(k1 < k2);
+
+        k1.clear();
+        k2.clear();
+        DB::encode_same_key(&Value::Float(0.01), &mut k1);
+        DB::encode_same_key(&Value::Float(0.001), &mut k2);
+        assert!(k1 > k2);
+    }
+
+    #[test]
+    fn encode_inverse_key() {
+        let mut k1 = vec![];
+        DB::encode_inverse_key(&Value::Int(1), &mut k1);
+
+        let mut k2 = vec![];
+        DB::encode_inverse_key(&Value::Int(2), &mut k2);
+
+        assert!(k1.as_slice() > k2.as_slice());
+
+        k1.clear();
+        k2.clear();
+
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let aaa = ArenaStr::new("aaa", arena.get_mut());
+        DB::encode_varchar_ty_for_inverse_key(&aaa, &mut k1);
+
+        let bbb = ArenaStr::new("bbb", arena.get_mut());
+        DB::encode_varchar_ty_for_inverse_key(&bbb, &mut k2);
+
+        assert!(k1 > k2);
+
+        k2.clear();
+        let aaaa = ArenaStr::new("aaaa", arena.get_mut());
+        DB::encode_varchar_ty_for_inverse_key(&aaaa, &mut k2);
+
+        assert!(k1 > k2);
+
+        k1.clear();
+        k2.clear();
+        DB::encode_inverse_key(&Value::Float(0.01), &mut k1);
+        DB::encode_inverse_key(&Value::Float(0.001), &mut k2);
+
+        assert!(k1 < k2);
     }
 
     #[test]

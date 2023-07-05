@@ -1,8 +1,8 @@
 use std::io;
 use std::io::Write;
-use std::ops::{Add, Sub, Mul, Deref};
+use std::ops::{Add, Sub, Mul, Deref, DerefMut};
 use std::sync::Arc;
-use crate::{Arena, arena_vec, ArenaMut, ArenaStr, ArenaVec, corrupted_err};
+use crate::{Arena, arena_vec, ArenaBox, ArenaMut, ArenaStr, ArenaVec, corrupted_err};
 use crate::{Result};
 use crate::exec::evaluator::{Context, Evaluator, Value};
 use crate::map::ArenaMap;
@@ -781,6 +781,26 @@ impl BytecodeBuildingVisitor {
         self.builder.clear();
         expr.accept(self);
         self.builder.build(w)
+    }
+
+    pub fn build_arena_boxes(boxes: &[ArenaBox<dyn Expression>], arena: &ArenaMut<Arena>) -> ArenaVec<BytecodeVector> {
+        let mut this = BytecodeBuildingVisitor::new(arena);
+        let mut rv = arena_vec!(arena);
+        for it in boxes {
+            let mut expr = it.clone();
+            let mut chunk = arena_vec!(arena);
+            this.build(expr.deref_mut(), &mut chunk).unwrap();
+            rv.push(BytecodeVector::new(chunk, arena));
+        }
+        rv
+    }
+
+    pub fn build_arena_box(expr: &ArenaBox<dyn Expression>, arena: &ArenaMut<Arena>) -> BytecodeVector {
+        let mut this = BytecodeBuildingVisitor::new(arena);
+        let mut copied = expr.clone();
+        let mut chunk = arena_vec!(arena);
+        this.build(copied.deref_mut(), &mut chunk).unwrap();
+        BytecodeVector::new(chunk, arena)
     }
 }
 

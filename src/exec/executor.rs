@@ -250,7 +250,9 @@ impl Executor {
         let stub = ArenaBox::new(ReturningOneDummyOps::new(&self.arena),
                                  self.arena.deref_mut());
         let projected_columns = ArenaBox::new(columns, self.arena.deref_mut());
-        let plan = ProjectingOps::new(columns_expr, stub.into(),
+
+        let bcs = BytecodeBuildingVisitor::build_arena_boxes(&columns_expr, &self.arena);
+        let plan = ProjectingOps::new(bcs, stub.into(),
                                       self.arena.clone(), projected_columns,
                                       self.prepared_stmts.back().cloned());
         ResultSet::from_dcl_stmt(ArenaBox::new(plan, self.arena.deref_mut()).into())
