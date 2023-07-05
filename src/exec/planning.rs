@@ -515,7 +515,7 @@ impl PlanMaker {
         match may_expr {
             Some(expr) => {
                 let mut evaluator = Evaluator::new(&self.arena);
-                let context = Arc::new(UniversalContext::new(self.prepared_stmt.clone()));
+                let context = Arc::new(UniversalContext::new(self.prepared_stmt.clone(), &self.arena));
                 let mut owned_expr = expr.clone();
                 let val = evaluator.evaluate(owned_expr.deref_mut(), context)?;
                 match val {

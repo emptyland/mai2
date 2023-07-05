@@ -111,7 +111,7 @@ macro_rules! define_arithmetic_op {
 }
 
 impl Interpreter {
-    fn new(arena: &ArenaMut<Arena>) -> Self {
+    pub fn new(arena: &ArenaMut<Arena>) -> Self {
         Self {
             stack: arena_vec!(arena),
             env: arena_vec!(arena),
@@ -119,18 +119,18 @@ impl Interpreter {
         }
     }
 
-    fn evaluate<T: BytecodeChunk>(&mut self, bca: &mut T, env: Arc<dyn Context>) -> Result<Value> {
+    pub fn evaluate<T: BytecodeChunk>(&mut self, bca: &mut T, env: Arc<dyn Context>) -> Result<Value> {
         self.enter(env);
         let rs = self.evaluate_impl(bca);
         self.exit();
         rs
     }
 
-    fn enter(&mut self, env: Arc<dyn Context>) {
+    pub fn enter(&mut self, env: Arc<dyn Context>) {
         self.env.push(env);
     }
 
-    fn exit(&mut self) -> Arc<dyn Context> {
+    pub fn exit(&mut self) -> Arc<dyn Context> {
         self.env.pop().unwrap()
     }
 
@@ -1003,6 +1003,28 @@ mod tests {
         assert_eq!(Sub, bca.pick());
         assert_eq!(Jne(1), bca.pick());
         assert_eq!(Mul, bca.pick());
+        assert_eq!(End, bca.pick());
+    }
+
+    #[test]
+    fn bytecode_vector() {
+        let zone = Arena::new_val();
+        let arena = zone.get_mut();
+        let mut builder = BytecodeBuilder::new(&arena);
+
+        builder.emit(Ldi(19));
+        builder.emit(Ldi(20));
+
+        let demo = ArenaStr::new("demo", arena.get_mut());
+        builder.emit(Ldsz(demo.clone()));
+
+        let mut chunk = arena_vec!(&arena);
+        builder.build(&mut chunk).unwrap();
+
+        let mut bca = BytecodeVector::new(chunk, &arena);
+        assert_eq!(Ldi(19), bca.pick());
+        assert_eq!(Ldi(20), bca.pick());
+        assert_eq!(Ldsz(demo), bca.pick());
         assert_eq!(End, bca.pick());
     }
 

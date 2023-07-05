@@ -997,6 +997,22 @@ pub mod map {
             None
         }
 
+        pub fn get_mut(&self, k: &K) -> Option<&mut V> {
+            if self.slots.is_empty() {
+                return None;
+            }
+            let (hash_code, slot) = self.locate_slot(&k);
+            let mut p = self.slots[slot];
+            while p != ptr::null_mut() {
+                let n = unsafe {&mut *p};
+                if n.hash_code == hash_code && n.pair.0.eq(k) {
+                    return Some(&mut n.pair.1);
+                }
+                p = n.next;
+            }
+            None
+        }
+
         pub fn remove(&mut self, k: &K) -> Option<V> {
             let (hash_code, slot) = self.locate_slot(&k);
             let mut prev = ptr::null_mut() as *mut Entry<K, V>;

@@ -2455,4 +2455,17 @@ mod tests {
         SqlSuite::assert_rows(&data, rs)?;
         Ok(())
     }
+
+    #[test]
+    fn insert_default_values() -> Result<()> {
+        let suite = SqlSuite::new("tests/db123")?;
+        suite.execute_file(Path::new("testdata/t1_cols_with_default_value.sql"), &suite.arena)?;
+
+        suite.execute_str("insert into t1 (name) values (\"aaa\"),(\"ccc\"),(\"bbb\")", &suite.arena)?;
+
+        let rs = suite.execute_query_str("select * from t1;", &suite.arena)?;
+        SqlSuite::print_rows(rs)?;
+
+        Ok(())
+    }
 }

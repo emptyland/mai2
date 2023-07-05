@@ -301,8 +301,9 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
 
     fn parse_insert_into_table(&mut self) -> Result<ArenaBox<InsertIntoTable>> {
         self.match_expected(Token::Insert)?;
-        self.test(Token::Into)?;
-        self.match_expected(Token::Table)?;
+        self.match_expected(Token::Into)?;
+        //self.match_expected(Token::Table)?;
+        self.test(Token::Table)?;
 
         let table_name = self.match_id()?;
         let mut node = self.factory.new_insert_into_table(table_name);

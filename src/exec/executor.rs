@@ -17,7 +17,7 @@ use crate::exec::connection::ResultSet;
 use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata};
 use crate::exec::evaluator::{Context, Evaluator, expr_typing_reduce, Value};
 use crate::exec::function::{ExecutionContext, new_udf, UDF};
-use crate::exec::interpreter::BytecodeBuildingVisitor;
+use crate::exec::interpreter::{BytecodeArray, BytecodeBuildingVisitor, Interpreter};
 use crate::exec::physical_plan::{ProjectingOps, ReturningOneDummyOps};
 use crate::exec::planning::{PlanMaker, resolve_physical_tables};
 use crate::map::ArenaMap;
@@ -135,16 +135,18 @@ impl Executor {
         }
     }
 
-    fn build_insertion_tuples(&self,
-                              table: &Arc<TableHandle>,
-                              values: &mut ArenaVec<ArenaVec<ArenaBox<dyn Expression>>>,
-                              columns: &ArenaBox<ColumnSet>,
-                              anonymous_row_key_counter: &mut Option<MutexGuard<u64>>,
-                              auto_increment_counter: &mut Option<MutexGuard<u64>>,
-                              name_to_order: &HashMap<&str, usize>)
-                              -> Result<(ArenaVec<Tuple>, ArenaVec<SecondaryIndexBundle>)> {
+    fn build_insertion_tuples<'a>(&self,
+                                  table: &'a Arc<TableHandle>,
+                                  values: &mut ArenaVec<ArenaVec<ArenaBox<dyn Expression>>>,
+                                  columns: &ArenaBox<ColumnSet>,
+                                  anonymous_row_key_counter: &mut Option<MutexGuard<u64>>,
+                                  auto_increment_counter: &mut Option<MutexGuard<u64>>,
+                                  name_to_order: ArenaMap<&'a str, usize>,
+                                  ignore_cols_bca: ArenaMap<u32, BytecodeArray>)
+                                  -> Result<(ArenaVec<Tuple>, ArenaVec<SecondaryIndexBundle>)> {
         let mut evaluator = Evaluator::new(&self.arena);
-        let context = Arc::new(UniversalContext::new(self.prepared_stmts.back().cloned()));
+        let mut interpreter = Interpreter::new(&self.arena);
+        let context = Arc::new(UniversalContext::new(self.prepared_stmts.back().cloned(), &self.arena));
         let mut tuples = ArenaVec::new(&self.arena); // Vec::new();
         let mut secondary_indices = ArenaVec::new(&self.arena);
         let mut unique_row_keys = HashSet::new();
@@ -161,14 +163,19 @@ impl Executor {
             }
             let mut tuple = Tuple::with(columns, &self.arena);
             for col in &table.metadata.columns {
-                if let Some(order) = name_to_order.get(col.name.as_str()) {
+                if let Some(order) = name_to_order.get(&col.name.as_str()) {
                     let expr = &mut row[*order];
                     let value = evaluator.evaluate(expr.deref_mut(), context.clone())?;
                     tuple.set(col.order, value);
                 } else if col.auto_increment {
                     let value = auto_increment_counter.as_ref().unwrap();
                     tuple.set(col.order, Value::Int(**value.clone() as i64));
+                } else if !col.default_value.is_empty() {
+                    let bca = ignore_cols_bca.get_mut(&col.id).unwrap();
+                    let value = interpreter.evaluate(bca, context.clone())?;
+                    tuple.set(col.order, value);
                 } else {
+                    debug_assert!(!col.not_null);
                     tuple.set(col.order, Value::Null);
                 }
             }
@@ -221,7 +228,7 @@ impl Executor {
         let mut columns_expr = ArenaVec::new(&self.arena);
         let mut columns = ColumnSet::new("", 0, &self.arena);
         let mut i = 0;
-        let context = Arc::new(UniversalContext::new(self.prepared_stmts.back().cloned()));
+        let context = Arc::new(UniversalContext::new(self.prepared_stmts.back().cloned(), &self.arena));
         for col in this.columns.iter_mut() {
             match col.expr {
                 SelectColumn::Expr(ref mut expr) => {
@@ -587,11 +594,12 @@ impl Visitor for Executor {
                 Some(col) => {
                     ignore_cols.remove(&col.name.as_str());
                     insertion_cols.push(col.id);
-                },
+                }
                 None => visit_fatal!(self, "Column: `{}` not found in table: `{}`", col_name.as_str(), this.table_name)
             }
         }
 
+        let mut ignore_cols_bca = ArenaMap::new(&self.arena);
         for (_, col_id) in ignore_cols.iter() {
             let col = table.get_col_by_id(*col_id).unwrap();
             if col.not_null {
@@ -602,6 +610,10 @@ impl Visitor for Executor {
                 } else {
                     visit_fatal!(self, "Column: `{}` is not null, but no default value", col.name);
                 }
+            }
+            if !col.default_value.is_empty() {
+                let bca = BytecodeArray::new(&col.default_value, &self.arena).unwrap();
+                ignore_cols_bca.insert(col.id, bca);
             }
         }
 
@@ -626,16 +638,17 @@ impl Visitor for Executor {
         };
 
         let name_to_order = {
-            let mut tmp = HashMap::new();
+            let mut tmp = ArenaMap::new(&self.arena);
             for i in 0..this.columns_name.len() {
                 tmp.insert(this.columns_name[i].as_str(), i);
             }
             tmp
         };
 
+        let interpreter = Interpreter::new(&self.arena);
         let rs = self.build_insertion_tuples(&table, &mut this.values, &columns,
-                                             &mut anonymous_row_key_counter,
-                                             &mut auto_increment_counter, &name_to_order);
+                                             &mut anonymous_row_key_counter, &mut auto_increment_counter,
+                                             name_to_order, ignore_cols_bca);
         if let Err(e) = rs {
             self.rs = e;
             return;
@@ -766,7 +779,7 @@ impl Visitor for Executor {
 pub struct ColumnsAuxResolver {
     id_to_idx: ArenaMap<(u64, u32), usize>,
     //row_keys: ArenaMap<u64, (usize, usize)>,
-    cols: *const ColumnSet
+    cols: *const ColumnSet,
 }
 
 impl ColumnsAuxResolver {
@@ -1245,12 +1258,14 @@ impl Context for UpstreamContext {
 
 pub struct UniversalContext {
     prepared_stmt: Option<ArenaBox<PreparedStatement>>,
+    arena: ArenaMut<Arena>,
 }
 
 impl UniversalContext {
-    pub fn new(prepared_stmt: Option<ArenaBox<PreparedStatement>>) -> Self {
+    pub fn new(prepared_stmt: Option<ArenaBox<PreparedStatement>>, arena: &ArenaMut<Arena>) -> Self {
         Self {
-            prepared_stmt
+            prepared_stmt,
+            arena: arena.clone()
         }
     }
 }
@@ -1258,6 +1273,10 @@ impl UniversalContext {
 impl Context for UniversalContext {
     fn bound_param(&self, order: usize) -> &Value {
         bound_param_impl!(self, order)
+    }
+    fn get_udf(&self, name: &str) -> Option<ArenaBox<dyn UDF>> {
+        let ctx = ExecutionContext::new(false, &self.arena);
+        new_udf(name, &ctx)
     }
 }
 
@@ -1283,7 +1302,7 @@ impl MockContent {
             let i = self.vals.len();
             self.vals.push(value);
             let name = if let Some(pos) = name.find(".") {
-                let (prefix, part) =  name.split_at(pos);
+                let (prefix, part) = name.split_at(pos);
                 let suffix = std::str::from_utf8(&part.as_bytes()[1..]).unwrap();
                 (
                     ArenaStr::new(prefix, self.arena.deref_mut()),
