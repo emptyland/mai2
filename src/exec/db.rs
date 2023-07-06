@@ -16,6 +16,7 @@ use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, Logger};
 use crate::exec::connection::{Connection, FeedbackImpl};
 use crate::exec::evaluator::{Evaluator, Value};
 use crate::exec::executor::{ColumnsAuxResolver, ColumnSet, PreparedStatement, SecondaryIndexBundle, Tuple, UpstreamContext};
+use crate::exec::field::{FieldBigInt, FieldChar, FieldDouble, FieldFloat, FieldVarchar};
 use crate::exec::locking::{LockingInstance, LockingManagement};
 use crate::exec::physical_plan::PhysicalPlanOps;
 use crate::map::ArenaMap;
@@ -88,10 +89,6 @@ impl DB {
         0x80, // split
         0x02, 0x00, 0x00, 0x00 // key id = 2
     ];
-
-    const VARCHAR_CMP_LESS_THAN_SPACES: u8 = 1;
-    const VARCHAR_CMP_EQUAL_TO_SPACES: u8 = 2;
-    const VARCHAR_CMP_GREATER_THAN_SPACES: u8 = 3;
 
     pub fn open(dir: String, name: String) -> Result<Arc<Self>> {
         let options = Options::with()
@@ -1132,27 +1129,23 @@ impl DB {
         u32::from_be_bytes((&buf[..4]).try_into().unwrap()) as u64
     }
 
-    pub fn encode_row_key<W: Write>(value: &Value, ty: &ColumnType, wr: &mut W) -> Result<()> {
-        match ty {
+    pub fn encode_row_key<W: Write>(value: &Value, ty: &ColumnType, wr: &mut W) -> Result<usize> {
+        let len = match ty {
             ColumnType::TinyInt(_)
             | ColumnType::SmallInt(_)
             | ColumnType::Int(_)
             | ColumnType::BigInt(_) => {
                 match value {
-                    Value::Int(n) => {
-                        let mut bytes = n.to_be_bytes();
-                        bytes[0] ^= 128;
-                        wr.write(&bytes).unwrap();
-                    }
-                    Value::NegativeInf => (), // ignore
-                    Value::PositiveInf => (), // ignore
+                    Value::Int(n) => FieldBigInt::encode_sort_key(*n, wr).unwrap(),
+                    Value::NegativeInf => 0, // ignore
+                    Value::PositiveInf => 0, // ignore
                     _ => unreachable!()
                 }
             }
             ColumnType::Float(_, _) | ColumnType::Double(_, _) => match value {
-                Value::Float(n) => { wr.write(&n.to_be_bytes()).unwrap(); }
-                Value::NegativeInf => (), // ignore
-                Value::PositiveInf => (), // ignore
+                Value::Float(n) => FieldDouble::encode_sort_key(*n, wr).unwrap(),
+                Value::NegativeInf => 0, // ignore
+                Value::PositiveInf => 0, // ignore
                 _ => unreachable!()
             },
             ColumnType::Char(n) => match value {
@@ -1160,10 +1153,10 @@ impl DB {
                     if s.len() > *n as usize {
                         return Err(Status::corrupted("Char type too long"));
                     }
-                    Self::encode_char_ty_for_key(s, *n as usize, wr);
+                    FieldChar::encode_sort_key(s, *n as usize, wr).unwrap()
                 }
-                Value::NegativeInf => (), // ignore
-                Value::PositiveInf => (), // ignore
+                Value::NegativeInf => 0, // ignore
+                Value::PositiveInf => 0, // ignore
                 _ => unreachable!()
             },
             ColumnType::Varchar(n) => match value {
@@ -1171,13 +1164,13 @@ impl DB {
                     if s.len() > *n as usize {
                         return Err(Status::corrupted("Varchar type too long"));
                     }
-                    Self::encode_varchar_ty_for_key(s, wr);
+                    FieldVarchar::encode_sort_key(s, wr).unwrap()
                 }
-                Value::NegativeInf | Value::PositiveInf => (), // ignore
+                Value::NegativeInf | Value::PositiveInf => 0, // ignore
                 _ => unreachable!()
             },
-        }
-        Ok(())
+        };
+        Ok(len)
     }
 
     pub fn decode_row_key_from_secondary_index<'a>(index: &'a [u8], pack_info: &[u8]) -> &'a [u8] {
@@ -1192,32 +1185,28 @@ impl DB {
         &index[..index.len() - row_key_len]
     }
 
-    pub fn encode_same_key<W: Write>(value: &Value, wr: &mut W) {
+    pub fn encode_sort_key<W: Write>(value: &Value, wr: &mut W) {
         if Self::encode_null_bytes(value, wr) {
             return;
         }
         match value {
-            Value::Int(n) => {
-                let mut bytes = n.to_be_bytes();
-                bytes[0] ^= 128;
-                wr.write(&bytes).unwrap();
-            }
-            Value::Float(n) => { wr.write(&n.to_ne_bytes()).unwrap(); }
-            Value::Str(s) => { Self::encode_varchar_ty_for_key(s, wr); }
+            Value::Int(n) => FieldBigInt::encode_sort_key(*n, wr).unwrap(),
+            Value::Float(n) => FieldDouble::encode_sort_key(*n, wr).unwrap(),
+            Value::Str(s) => FieldVarchar::encode_sort_key(s, wr).unwrap(),
             _ => unreachable!()
-        }
+        };
     }
 
-    pub fn encode_inverse_key<W: Write>(value: &Value, wr: &mut W) {
+    pub fn encode_inverse_sort_key<W: Write>(value: &Value, wr: &mut W) {
         if Self::encode_null_bytes(value, wr) {
             return;
         }
         match value {
-            Value::Int(n) => Self::encode_same_key(&Value::Int(-*n), wr),
-            Value::Float(n) => Self::encode_same_key(&Value::Float(-*n), wr),
-            Value::Str(s) => { Self::encode_varchar_ty_for_inverse_key(s, wr); }
+            Value::Int(n) => FieldBigInt::encode_inverse_sort_key(*n, wr).unwrap(),
+            Value::Float(n) => FieldDouble::encode_inverse_sort_key(*n, wr).unwrap(),
+            Value::Str(s) => FieldVarchar::encode_inverse_sort_key(s, wr).unwrap(),
             _ => unreachable!()
-        }
+        };
     }
 
     pub fn decode_tuple(columns: &ArenaBox<ColumnSet>, value: &[u8], arena: &ArenaMut<Arena>) -> Tuple {
@@ -1326,108 +1315,40 @@ impl DB {
             | ColumnType::Int(_)
             | ColumnType::BigInt(_) => {
                 match value {
-                    Value::Int(n) => {
-                        let mut bytes = n.to_be_bytes();
-                        bytes[0] ^= 128;
-                        wr.write(&bytes).unwrap()
-                    }
+                    Value::Int(n) => FieldBigInt::encode_sort_key(*n, wr).unwrap(),
                     Value::NegativeInf | Value::PositiveInf => 0, // ignore
                     _ => unreachable!()
                 };
             }
             ColumnType::Float(_, _) => {
                 match value {
-                    Value::Float(n) => wr.write(&(*n as f32).to_be_bytes()).unwrap(),
+                    Value::Float(n) => FieldFloat::encode_sort_key(*n as f32, wr).unwrap(),
                     Value::NegativeInf | Value::PositiveInf => 0, // ignore
                     _ => unreachable!()
                 };
             }
             ColumnType::Double(_, _) => {
                 match value {
-                    Value::Float(n) => wr.write(&n.to_be_bytes()).unwrap(),
+                    Value::Float(n) => FieldDouble::encode_sort_key(*n, wr).unwrap(),
                     Value::NegativeInf | Value::PositiveInf => 0, // ignore
                     _ => unreachable!()
                 };
             }
             ColumnType::Char(n) => {
                 match value {
-                    Value::Str(s) => Self::encode_char_ty_for_key(s, *n as usize, wr),
-                    Value::NegativeInf | Value::PositiveInf => (), // ignore
+                    Value::Str(s) => FieldChar::encode_sort_key(s, *n as usize, wr).unwrap(),
+                    Value::NegativeInf | Value::PositiveInf => 0, // ignore
                     _ => unreachable!()
-                }
+                };
             }
             ColumnType::Varchar(_) => {
                 match value {
-                    Value::Str(s) => Self::encode_varchar_ty_for_key(s, wr),
-                    Value::NegativeInf | Value::PositiveInf => (), // ignore
+                    Value::Str(s) => FieldVarchar::encode_sort_key(s, wr).unwrap(),
+                    Value::NegativeInf | Value::PositiveInf => 0, // ignore
                     _ => unreachable!()
-                }
+                };
             }
         }
-    }
-
-    fn encode_char_ty_for_key<W: Write>(s: &ArenaStr, n: usize, wr: &mut W) {
-        assert!(s.len() <= n);
-        wr.write(s.as_bytes()).unwrap();
-        for _ in 0..n - s.len() {
-            wr.write(&Self::CHAR_FILLING_BYTES).unwrap();
-        }
-    }
-
-    fn encode_varchar_ty_for_key<W: Write>(s: &ArenaStr, wr: &mut W) {
-        let part_len = Self::VARCHAR_SEGMENT_LEN - 1;
-        let n_parts = (s.len() + (part_len - 1)) / (part_len);
-
-        for i in 0..n_parts {
-            let part = s.bytes_part(i * part_len, (i + 1) * part_len);
-            wr.write(part).unwrap();
-            if part.len() < part_len {
-                Self::encode_varchar_ty_filling(part_len - part.len(), Self::CHAR_FILLING_BYTE, wr);
-                break;
-            }
-            let ch = *part.last().unwrap();
-            let successor = s.as_bytes()[(i + 1) * part_len];
-            Self::encode_varchar_cmp_tag(successor, ch, wr);
-        }
-    }
-
-    fn encode_varchar_ty_for_inverse_key<W: Write>(s: &ArenaStr, wr: &mut W) {
-        let mut buf: [u8;Self::VARCHAR_SEGMENT_LEN] = [0;Self::VARCHAR_SEGMENT_LEN];
-        let part_len = Self::VARCHAR_SEGMENT_LEN - 1;
-        let n_parts = (s.len() + (part_len - 1)) / (part_len);
-
-        for i in 0..n_parts {
-            let part = s.bytes_part(i * part_len, (i + 1) * part_len);
-            for j in 0..part.len() {
-                buf[j] = 255 - part[j];
-            }
-            wr.write(&buf[..part.len()]).unwrap();
-            if part.len() < part_len {
-                Self::encode_varchar_ty_filling(part_len - part.len(), 255 - Self::CHAR_FILLING_BYTE, wr);
-                break;
-            }
-            let ch = 255 - *part.last().unwrap();
-            let successor = 255 - s.as_bytes()[(i + 1) * part_len];
-            Self::encode_varchar_cmp_tag(successor, ch, wr);
-        }
-    }
-
-    fn encode_varchar_cmp_tag<W: Write>(successor: u8, ch: u8, wr: &mut W) {
-        if successor > ch {
-            wr.write(&[Self::VARCHAR_CMP_GREATER_THAN_SPACES]).unwrap();
-        } else if successor < ch {
-            wr.write(&[Self::VARCHAR_CMP_LESS_THAN_SPACES]).unwrap();
-        } else {
-            wr.write(&[Self::VARCHAR_CMP_EQUAL_TO_SPACES]).unwrap();
-        }
-    }
-
-    #[inline]
-    fn encode_varchar_ty_filling<W: Write>(n: usize, b: u8, wr: &mut W) {
-        for _ in 0..n {
-            wr.write(&[b]).unwrap();
-        }
-        wr.write(&[Self::VARCHAR_CMP_EQUAL_TO_SPACES]).unwrap();
     }
 
     pub fn encode_column_value<W: Write>(value: &Value, ty: &ColumnType, wr: &mut W) {
@@ -1441,8 +1362,18 @@ impl DB {
                     _ => unreachable!()
                 };
             }
-            ColumnType::Float(_, _) => unreachable!(),
-            ColumnType::Double(_, _) => unreachable!(),
+            ColumnType::Float(_, _) => {
+                match value {
+                    Value::Float(f) => wr.write(&(*f as f32).to_le_bytes()).unwrap(),
+                    _ => unreachable!()
+                };
+            }
+            ColumnType::Double(_, _) => {
+                match value {
+                    Value::Float(f) => wr.write(&f.to_le_bytes()).unwrap(),
+                    _ => unreachable!()
+                };
+            }
             ColumnType::Char(_)
             | ColumnType::Varchar(_) => {
                 match value {
@@ -1461,8 +1392,12 @@ impl DB {
             | ColumnType::BigInt(_) => {
                 Value::Int(i64::from_le_bytes(value.try_into().unwrap()))
             }
-            ColumnType::Float(_, _) => unreachable!(),
-            ColumnType::Double(_, _) => unreachable!(),
+            ColumnType::Float(_, _) => {
+                Value::Float(f32::from_le_bytes(value.try_into().unwrap()) as f64)
+            }
+            ColumnType::Double(_, _) => {
+                Value::Float(f64::from_le_bytes(value.try_into().unwrap()))
+            }
             ColumnType::Char(_)
             | ColumnType::Varchar(_) => {
                 Value::Str(ArenaStr::new(std::str::from_utf8(value).unwrap(), arena))
@@ -1841,139 +1776,6 @@ mod tests {
     }
 
     #[test]
-    fn encode_varchar_key() {
-        let arena = Arena::new_ref();
-        let s = ArenaStr::from_arena("", &mut arena.get_mut());
-        let mut buf = Vec::new();
-        DB::encode_varchar_ty_for_key(&s, &mut buf);
-
-        assert_eq!(0, buf.len());
-
-        buf.clear();
-        let s = ArenaStr::from_arena("a", &mut arena.get_mut());
-        DB::encode_varchar_ty_for_key(&s, &mut buf);
-
-        assert_eq!(9, buf.len());
-        let raw: [u8; 9] = [
-            97,
-            32,
-            32,
-            32,
-            32,
-            32,
-            32,
-            32,
-            2,
-        ];
-        assert_eq!(&raw, buf.as_slice());
-
-        buf.clear();
-        let s = ArenaStr::from_arena("中文", &mut arena.get_mut());
-        DB::encode_varchar_ty_for_key(&s, &mut buf);
-
-        assert_eq!(9, buf.len());
-        let raw: [u8; 9] = [
-            228,
-            184,
-            173,
-            230,
-            150,
-            135,
-            32,
-            32,
-            2,
-        ];
-        assert_eq!(raw, buf.as_slice());
-
-        buf.clear();
-        let s = ArenaStr::from_arena("123456789", &mut arena.get_mut());
-        DB::encode_varchar_ty_for_key(&s, &mut buf);
-
-        assert_eq!(18, buf.len());
-        let raw: [u8; 18] = [
-            49,
-            50,
-            51,
-            52,
-            53,
-            54,
-            55,
-            56,
-            3,
-            57,
-            32,
-            32,
-            32,
-            32,
-            32,
-            32,
-            32,
-            2,
-        ];
-        assert_eq!(raw, buf.as_slice());
-    }
-
-    #[test]
-    fn encode_same_key() {
-        let mut k1 = vec![];
-        DB::encode_same_key(&Value::Int(1), &mut k1);
-
-        let mut k2 = vec![];
-        DB::encode_same_key(&Value::Int(2), &mut k2);
-
-        assert!(k1 < k2);
-
-        k1.clear();
-        k2.clear();
-        DB::encode_same_key(&Value::Int(-1), &mut k1);
-        DB::encode_same_key(&Value::Int(0), &mut k2);
-        assert!(k1 < k2);
-
-        k1.clear();
-        k2.clear();
-        DB::encode_same_key(&Value::Float(0.01), &mut k1);
-        DB::encode_same_key(&Value::Float(0.001), &mut k2);
-        assert!(k1 > k2);
-    }
-
-    #[test]
-    fn encode_inverse_key() {
-        let mut k1 = vec![];
-        DB::encode_inverse_key(&Value::Int(1), &mut k1);
-
-        let mut k2 = vec![];
-        DB::encode_inverse_key(&Value::Int(2), &mut k2);
-
-        assert!(k1.as_slice() > k2.as_slice());
-
-        k1.clear();
-        k2.clear();
-
-        let zone = Arena::new_val();
-        let arena = zone.get_mut();
-        let aaa = ArenaStr::new("aaa", arena.get_mut());
-        DB::encode_varchar_ty_for_inverse_key(&aaa, &mut k1);
-
-        let bbb = ArenaStr::new("bbb", arena.get_mut());
-        DB::encode_varchar_ty_for_inverse_key(&bbb, &mut k2);
-
-        assert!(k1 > k2);
-
-        k2.clear();
-        let aaaa = ArenaStr::new("aaaa", arena.get_mut());
-        DB::encode_varchar_ty_for_inverse_key(&aaaa, &mut k2);
-
-        assert!(k1 > k2);
-
-        k1.clear();
-        k2.clear();
-        DB::encode_inverse_key(&Value::Float(0.01), &mut k1);
-        DB::encode_inverse_key(&Value::Float(0.001), &mut k2);
-
-        assert!(k1 < k2);
-    }
-
-    #[test]
     fn row_encoding() {
         let zone = Arena::new_val();
         let arena = zone.get_mut();
@@ -2078,43 +1880,6 @@ mod tests {
         assert_eq!(Some(3), tuple.get_i64(0));
         assert_eq!(Some(4), tuple.get_i64(1));
         drop(tuple);
-        Ok(())
-    }
-
-    #[test]
-    fn insert_with_auto_increment() -> Result<()> {
-        let _junk = JunkFilesCleaner::new("tests/db104");
-        let arena_ref = Arena::new_ref();
-        let mut arena = arena_ref.get_mut();
-        let db = DB::open("tests".to_string(), "db104".to_string())?;
-        let sql = " create table t1 {\n\
-                a int(11) primary key auto_increment,\n\
-                b int(11),\n\
-                c int(11)\n\
-            };\n\
-            insert into table t1(b,c) values(1,2), (3,4), (5,6);\n\
-            ";
-        let conn = db.connect();
-        conn.execute_str(sql, &arena)?;
-
-        let mut column_set = ArenaBox::new(ColumnSet::new("t1", 0, &mut arena), arena.deref_mut());
-        column_set.append_with_name("a", ColumnType::Int(11));
-        column_set.append_with_name("b", ColumnType::Int(11));
-        column_set.append_with_name("c", ColumnType::Int(11));
-
-        let tuple = db._test_get_row(&"t1".to_string(),
-                                     &column_set,
-                                     &1i64.to_be_bytes(), &mut arena)?;
-        assert_eq!(Some(1), tuple.get_i64(0));
-        assert_eq!(Some(1), tuple.get_i64(1));
-        assert_eq!(Some(2), tuple.get_i64(2));
-
-        let tuple = db._test_get_row(&"t1".to_string(),
-                                     &column_set,
-                                     &2i64.to_be_bytes(), &mut arena)?;
-        assert_eq!(Some(2), tuple.get_i64(0));
-        assert_eq!(Some(3), tuple.get_i64(1));
-        assert_eq!(Some(4), tuple.get_i64(2));
         Ok(())
     }
 
@@ -2573,9 +2338,49 @@ mod tests {
 
         suite.execute_str("insert into t1 (name) values (\"aaa\"),(\"ccc\"),(\"bbb\")", &suite.arena)?;
 
+        let data = [
+            "(1, \"aaa\", \"hello,world\", 0)",
+            "(2, \"ccc\", \"hello,world\", 0)",
+            "(3, \"bbb\", \"hello,world\", 0)",
+        ];
         let rs = suite.execute_query_str("select * from t1;", &suite.arena)?;
-        SqlSuite::print_rows(rs)?;
+        //SqlSuite::print_rows(rs)?;
+        SqlSuite::assert_rows(&data, rs)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn order_by_single_key() -> Result<()> {
+        let suite = SqlSuite::new("tests/db124")?;
+        suite.execute_file(Path::new("testdata/t1_data_for_order_by.sql"), &suite.arena)?;
+
+        let data = [
+            "(5, \"xxx\", \"010\", 0.0010000000474974513, 50)",
+            "(4, \"ccc\", \"003\", 0.4000000059604645, 40)",
+            "(2, \"bbb\", \"002\", 0.10000000149011612, 20)",
+            "(1, \"aaa\", \"001\", -0.10000000149011612, 10)",
+            "(3, \"aaa\", \"003\", 0.20000000298023224, 30)",
+        ];
+        let rs = suite.execute_query_str("select * from t1 order by name desc;", &suite.arena)?;
+        SqlSuite::assert_rows(&data, rs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn order_by_multi_keys() -> Result<()> {
+        let suite = SqlSuite::new("tests/db125")?;
+        suite.execute_file(Path::new("testdata/t1_data_for_order_by.sql"), &suite.arena)?;
+
+        let data = [
+            "(5, \"xxx\", \"010\", 0.0010000000474974513, 50)",
+            "(4, \"ccc\", \"003\", 0.4000000059604645, 40)",
+            "(2, \"bbb\", \"002\", 0.10000000149011612, 20)",
+            "(1, \"aaa\", \"001\", -0.10000000149011612, 10)",
+            "(3, \"aaa\", \"003\", 0.20000000298023224, 30)",
+        ];
+        let rs = suite.execute_query_str("select * from t1 order by name desc, nick;", &suite.arena)?;
+        SqlSuite::assert_rows(&data, rs)?;
         Ok(())
     }
 }

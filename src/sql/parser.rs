@@ -261,7 +261,18 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
                 }
                 Ok(self.factory.new_type_decl(part.token, 11, 0))
             }
-            _ => Err(self.current_syntax_error("Unexpected type".to_string()))
+            Token::Float => {
+                self.move_next()?;
+                Ok(self.factory.new_type_decl(part.token, 0, 0))
+            }
+            Token::Double => {
+                self.move_next()?;
+                Ok(self.factory.new_type_decl(part.token, 0, 0))
+            }
+            _ => {
+                let err = format!("Unexpected type, expected: {:?}", part.token);
+                Err(self.current_syntax_error(err))
+            }
         }
     }
 

@@ -760,7 +760,7 @@ impl GroupingAggregatorOps {
                         // let mut expr = expr_box.clone();
                         // let value = evaluator.evaluate(expr.deref_mut(), context.clone())?;
                         let value = self.interpreter.evaluate(expr, context.clone())?;
-                        DB::encode_same_key(&value, &mut key);
+                        DB::encode_sort_key(&value, &mut key);
                     }
                     key.write(&count.to_be_bytes()).unwrap();
 
@@ -1583,8 +1583,8 @@ impl OrderingInStorageOps {
             for (bcv, ordering) in self.ordering_key_bundle.iter_mut() {
                 let value = interpreter.evaluate(bcv, context.clone())?;
                 match ordering {
-                    SqlOrdering::Asc => DB::encode_same_key(&value, &mut ordering_key),
-                    SqlOrdering::Desc => DB::encode_inverse_key(&value, &mut ordering_key),
+                    SqlOrdering::Asc => DB::encode_sort_key(&value, &mut ordering_key),
+                    SqlOrdering::Desc => DB::encode_inverse_sort_key(&value, &mut ordering_key),
                 }
             }
             // write row key
@@ -1626,7 +1626,7 @@ impl PhysicalPlanOps for OrderingInStorageOps {
         let opts = ColumnFamilyOptions::with()
             .temporary(true)
             .build();
-        let cf = storage.new_column_family("mai::sql::ordering", opts)?;
+        let cf = storage.new_column_family("ordering", opts)?;
 
         self.ordering_insert(cols.deref(), &storage, &cf)?;
 

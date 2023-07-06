@@ -131,6 +131,8 @@ impl Executor {
             Token::BigInt => Ok(ColumnType::BigInt(ast.len as u32)),
             Token::Char => Ok(ColumnType::Char(ast.len as u32)),
             Token::Varchar => Ok(ColumnType::Varchar(ast.len as u32)),
+            Token::Float => Ok(ColumnType::Float(ast.len as u32, ast.len_part as u32)),
+            Token::Double => Ok(ColumnType::Double(ast.len as u32, ast.len_part as u32)),
             _ => Err(Status::corrupted("Bad type token!"))
         }
     }

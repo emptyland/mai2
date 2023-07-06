@@ -274,6 +274,7 @@ impl<'a, R: Read + ?Sized> Lexer<'a, R> {
                 '\"' => return self.parse_str_literal('\"'),
                 '`' => {
                     let start_pos = self.current_position();
+                    self.move_next()?;
                     return self.parse_id_or_keyword('`', start_pos);
                 }
                 '_' => {
@@ -347,8 +348,11 @@ impl<'a, R: Read + ?Sized> Lexer<'a, R> {
                 break;
             }
         }
-        let token = KEYWORDS.keyword_or_else(id.as_str(),
-                                             || { Token::Id(self.string(&id)) });
+        let token = if quote == '`' {
+            Token::Id(self.string(&id))
+        } else {
+            KEYWORDS.keyword_or_else(id.as_str(), || { Token::Id(self.string(&id)) })
+        };
         Ok(self.to_concat_token(token, start_pos))
     }
 
