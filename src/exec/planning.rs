@@ -69,9 +69,19 @@ impl PlanMaker {
             // Maybe fast path
             let cols = self.schemas.pop().unwrap();
             let mut wc = where_clause.clone();
-            self.make_selecting(&table, cols, &mut wc, limit, None)?;
-            self.schemas.pop();
-            Ok(self.current.pop().unwrap())
+
+            if !order_by_clause.is_empty() {
+                self.make_selecting(&table, cols, &mut wc, None, None)?;
+            } else {
+                self.make_selecting(&table, cols, &mut wc, limit, None)?;
+            }
+
+            let cols = self.schemas.pop().unwrap();
+            let mut plan = self.current.pop().unwrap();
+            if !order_by_clause.is_empty() {
+                plan = self.make_ordering(&cols, &plan, order_by_clause, limit, None);
+            }
+            Ok(plan)
         } else {
             // Fallback (slow) path
             let mut plan = self.make(rel.deref_mut())?;
@@ -95,11 +105,17 @@ impl PlanMaker {
 
     pub fn make_rows_simple_producer(&mut self, name: &str,
                                      where_clause: &Option<ArenaBox<dyn Expression>>,
+                                     order_by_clause: &[OrderClause],
                                      limit: &Option<ArenaBox<dyn Expression>>) -> Result<ArenaBox<dyn PhysicalPlanOps>> {
         let (table, cols) = self.resolve_physical_table(name, "")?;
         let limit = self.eval_require_u64_literal(limit)?;
         if where_clause.is_none() {
-            return self.make_scan_table(&table, &cols, limit, None);
+            let mut plan = self.make_scan_table(&table, &cols,
+                                                switch!(!order_by_clause.is_empty(), None, limit), None)?;
+            if !order_by_clause.is_empty() {
+                plan = self.make_ordering(&cols, &plan, order_by_clause, limit, None);
+            }
+            return Ok(plan);
         }
 
         let mut expr = where_clause.clone().unwrap().clone();
@@ -112,14 +128,20 @@ impl PlanMaker {
             }
             Ok(analyzed_val) => {
                 match self.make_by_physical_selection_analyzed_val(analyzed_val, &table, &cols,
-                                                                   limit, None) {
+                                                                   switch!(!order_by_clause.is_empty(), None, limit),
+                                                                   None) {
                     Err(e) => {
                         self.rs = e.clone();
                         Err(e)
                     }
                     Ok(_) => {
-                        self.schemas.pop().unwrap();
-                        Ok(self.current.pop().unwrap())
+                        let cols = self.schemas.pop().unwrap();
+                        let plan = self.current.pop().unwrap();
+                        if !order_by_clause.is_empty() {
+                            Ok(self.make_ordering(&cols, &plan, order_by_clause, limit, None))
+                        } else {
+                            Ok(plan)
+                        }
                     }
                 }
             }
@@ -205,14 +227,14 @@ impl PlanMaker {
         let mut end_key = ArenaVec::new(&self.arena);
         DB::encode_idx_id(DB::PRIMARY_KEY_ID as u64 + 1, &mut end_key);
 
-        let ops = RangeScanOps::new(columns.clone(),
-                                    begin_key, true,
-                                    end_key, true,
-                                    limit, offset,
-                                    self.arena.clone(),
-                                    self.db.storage.clone(),
-                                    self.snapshot.clone(),
-                                    table.column_family.clone());
+        let ops = RangeScanningOps::new(columns.clone(),
+                                        begin_key, true,
+                                        end_key, true,
+                                        limit, offset,
+                                        self.arena.clone(),
+                                        self.db.storage.clone(),
+                                        self.snapshot.clone(),
+                                        table.column_family.clone());
         Ok(ArenaBox::new(ops, self.arena.get_mut()).into())
     }
 
@@ -280,28 +302,34 @@ impl PlanMaker {
                 DB::encode_secondary_index(&range.max, &col.ty, &mut end_key);
             }
 
-            let ops = RangeScanOps::new(columns.clone(),
-                                        begin_key, range.left_close,
-                                        end_key, range.right_close,
-                                        switch!(set.segments.len() == 1, limit, None),
-                                        switch!(set.segments.len() == 1, offset, None),
-                                        self.arena.clone(),
-                                        self.db.storage.clone(),
-                                        self.snapshot.clone(),
-                                        table.column_family.clone());
+            let ops = RangeScanningOps::new(columns.clone(),
+                                            begin_key, range.left_close,
+                                            end_key, range.right_close,
+                                            switch!(set.segments.len() == 1, limit, None),
+                                            switch!(set.segments.len() == 1, offset, None),
+                                            self.arena.clone(),
+                                            self.db.storage.clone(),
+                                            self.snapshot.clone(),
+                                            table.column_family.clone());
             receiver.push(ArenaBox::new(ops, self.arena.get_mut()).into())
         }
         Ok(())
     }
 
-    fn make_ordering(&self, cols: &ArenaBox<ColumnSet>, child: &ArenaBox<dyn PhysicalPlanOps>,
-                     order_by_clause: &[OrderClause]) -> ArenaBox<dyn PhysicalPlanOps> {
+    fn make_ordering(&self,
+                     cols: &ArenaBox<ColumnSet>,
+                     child: &ArenaBox<dyn PhysicalPlanOps>,
+                     order_by_clause: &[OrderClause],
+                     limit: Option<u64>,
+                     offset: Option<u64>) -> ArenaBox<dyn PhysicalPlanOps> {
         let mut ordering_key_bundle = arena_vec!(&self.arena);
         for clause in order_by_clause {
             ordering_key_bundle.push((self.build_bytecode_box(&clause.key), clause.ordering.clone()));
         }
         let ordering = OrderingInStorageOps::new(ordering_key_bundle, child.clone(),
                                                  cols.clone(),
+                                                 limit,
+                                                 offset,
                                                  self.prepared_stmt.clone(),
                                                  self.arena.clone(),
                                                  self.db.storage.clone());
@@ -668,11 +696,18 @@ impl Visitor for PlanMaker {
             Ok(val) => offset = val,
         }
 
+        let outer_limit = !this.order_by_clause.is_empty() ||
+            this.distinct ||
+            !this.group_by_clause.is_empty() ||
+            maybe_table.is_none();
+
         if let Some(table) = &maybe_table {
             let low_columns =
                 self.build_column_set(&table, this.from_clause.as_ref().unwrap().alias(),
                                       &projection_col_visitor.projection_fields);
-            match self.make_selecting(table, low_columns, &mut this.where_clause, limit, offset) {
+            match self.make_selecting(table, low_columns, &mut this.where_clause,
+                                      if outer_limit { None } else { limit },
+                                      if outer_limit { None } else { offset }) {
                 Err(e) => {
                     self.rs = e;
                     return;
@@ -753,7 +788,8 @@ impl Visitor for PlanMaker {
         if !this.order_by_clause.is_empty() {
             let up_cols = self.schemas.pop().unwrap();
             let up_plan = self.current.pop().unwrap();
-            let plan = self.make_ordering(&up_cols, &up_plan, &this.order_by_clause);
+            let plan = self.make_ordering(&up_cols, &up_plan, &this.order_by_clause,
+                                          None, None);
             self.schemas.push(up_cols);
             self.current.push(plan);
         }
@@ -768,6 +804,14 @@ impl Visitor for PlanMaker {
 
         if this.distinct {
             todo!()
+        }
+
+        if outer_limit && limit.is_some() {
+            let up_plan = self.current.pop().unwrap();
+
+            let merging = MergingOps::new(ArenaVec::of(up_plan, &self.arena), limit, offset);
+            let plan = ArenaBox::new(merging, self.arena.get_mut());
+            self.current.push(plan.into());
         }
     }
 

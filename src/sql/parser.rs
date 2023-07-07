@@ -474,7 +474,7 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
             node.where_clause = Some(self.parse_expr()?);
         }
 
-        if node.relation.as_any().is::<FromClause>() {
+        if !node.relation.as_any().is::<FromClause>() {
             return Ok(node.into());
         }
 

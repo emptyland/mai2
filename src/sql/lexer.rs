@@ -80,6 +80,8 @@ pub enum Token {
     When,
     Then,
     Else,
+    Truncate,
+    Explain,
 
     // types:
     Char,
@@ -199,6 +201,8 @@ impl Keywords {
                 When,
                 Then,
                 Else,
+                Truncate,
+                Explain,
 
                 Char,
                 Varchar,

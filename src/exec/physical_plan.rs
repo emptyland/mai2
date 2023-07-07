@@ -34,12 +34,23 @@ pub trait Feedback {
     fn need_row_key(&self) -> bool { false }
 }
 
-pub struct RangeScanOps {
+// TODO:
+pub struct RowsGettingOps {
+    projected_columns: ArenaBox<ColumnSet>,
+    keys: ArenaVec<ArenaVec<u8>>,
+    arena: ArenaMut<Arena>,
+    key_id: u64,
+    current: usize,
+
+    storage: Option<Arc<dyn storage::DB>>,
+    snapshot: Option<Arc<dyn storage::Snapshot>>,
+    cf: Option<Arc<dyn ColumnFamily>>,
+}
+
+pub struct RangeScanningOps {
     projected_columns: ArenaBox<ColumnSet>,
     // (col_id, ty)
-    pulled_rows: u64,
-    limit: Option<u64>,
-    offset: Option<u64>,
+    limit: LimitingState,
     range_begin: ArenaVec<u8>,
     left_close: bool,
     range_end: ArenaVec<u8>,
@@ -55,7 +66,7 @@ pub struct RangeScanOps {
     col_id_to_order: HashMap<u32, usize>,
 }
 
-impl RangeScanOps {
+impl RangeScanningOps {
     pub fn new(projected_columns: ArenaBox<ColumnSet>,
                range_begin: ArenaVec<u8>,
                left_close: bool,
@@ -76,9 +87,7 @@ impl RangeScanOps {
         let key_id = DB::parse_key_id(&range_begin);
         Self {
             projected_columns,
-            pulled_rows: 0,
-            limit,
-            offset,
+            limit: LimitingState::new(limit, offset),
             range_begin,
             left_close,
             range_end,
@@ -166,7 +175,7 @@ impl RangeScanOps {
     }
 }
 
-impl PhysicalPlanOps for RangeScanOps {
+impl PhysicalPlanOps for RangeScanningOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
         let rd_opts = ReadOptions::with()
             .option_snapshot(self.snapshot.clone())
@@ -187,11 +196,9 @@ impl PhysicalPlanOps for RangeScanOps {
             }
         }
 
-        // skip offset
-        if let Some(offset) = self.offset {
-            while self.pulled_rows < offset {
+        if self.limit.offset.is_some() {
+            while self.limit.apply_offset_should_skip(1) {
                 self.next_row(iter.deref_mut(), |_, _| {}, &mut self.arena.clone())?;
-                self.pulled_rows += 1;
             }
         }
         Ok(self.projected_columns.clone())
@@ -210,10 +217,8 @@ impl PhysicalPlanOps for RangeScanOps {
             return None;
         }
 
-        if let Some(limit) = self.limit {
-            if self.pulled_rows >= limit {
-                return None;
-            }
+        if self.limit.exceeding() {
+            return None;
         }
 
         let iter_box = self.iter.as_ref().cloned().unwrap();
@@ -226,7 +231,8 @@ impl PhysicalPlanOps for RangeScanOps {
         }
 
         let arena = zone.get_mut();
-        let mut tuple = Tuple::with(&self.projected_columns, &arena);
+        //let mut tuple = Tuple::with(&self.projected_columns, &arena);
+        let mut tuple = Tuple::with_filling(&self.projected_columns, |x|{Value::Null}, arena.get_mut());
         let rs = self.next_row(iter.deref_mut(), |key, v| {
             if feedback.need_row_key() && tuple.row_key().is_empty() {
                 tuple.attach_row_key(ArenaVec::with_data(&arena, &key[..key.len() - DB::COL_ID_LEN]));
@@ -248,7 +254,8 @@ impl PhysicalPlanOps for RangeScanOps {
             for i in 0..tuple.len() {
                 debug_assert!(!tuple[i].is_undefined());
             }
-            self.pulled_rows += 1;
+            //self.pulled_rows += 1;
+            assert!(!self.limit.apply_offset_should_skip(1));
             Some(tuple)
         }
     }
@@ -261,10 +268,7 @@ impl PhysicalPlanOps for RangeScanOps {
 pub struct MergingOps {
     current: usize,
     children: ArenaVec<ArenaBox<dyn PhysicalPlanOps>>,
-    pulled_rows: u64,
-    delta_rows: u64,
-    limit: Option<u64>,
-    offset: Option<u64>,
+    limit: LimitingState,
 }
 
 impl MergingOps {
@@ -272,10 +276,11 @@ impl MergingOps {
         Self {
             current: 0,
             children,
-            pulled_rows: 0,
-            delta_rows: offset.map_or(0, |x| { x }),
-            limit,
-            offset,
+            limit: LimitingState::new(limit, offset),
+            // pulled_rows: 0,
+            // delta_rows: offset.map_or(0, |x| { x }),
+            // limit,
+            // offset,
         }
     }
 }
@@ -287,30 +292,30 @@ impl PhysicalPlanOps for MergingOps {
             columns = Some(child.prepare()?)
         }
         self.current = 0;
-        self.pulled_rows = 0;
+        self.limit.pulled_rows = 0;
         Ok(columns.unwrap())
     }
 
     fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        if self.limit.exceeding() {
+            return None;
+        }
         while self.current < self.children.len() {
             match self.children[self.current].next(feedback, zone) {
                 Some(row) => {
-                    self.pulled_rows += 1;
-                    if let Some(offset) = &self.offset {
-                        if self.pulled_rows < *offset {
-                            continue;
-                        }
+                    // self.pulled_rows += 1;
+                    // if let Some(offset) = &self.offset {
+                    //     if self.pulled_rows < *offset {
+                    //         continue;
+                    //     }
+                    // }
+                    if self.limit.apply_offset_should_skip(1) {
+                        continue;
                     }
                     return Some(row);
                 }
                 None => {
                     self.current += 1;
-                }
-            }
-
-            if let Some(limit) = &self.limit {
-                if self.pulled_rows - self.delta_rows >= *limit {
-                    break;
                 }
             }
         }
@@ -1462,6 +1467,43 @@ impl IndexNestedLoopJoinOps {
     }
 }
 
+struct LimitingState {
+    pulled_rows: u64,
+    delta_rows: u64,
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
+impl LimitingState {
+    fn new(limit: Option<u64>, offset: Option<u64>) -> Self {
+        Self {
+            pulled_rows: 0,
+            delta_rows: offset.map_or(0, |x| {x}),
+            limit,
+            offset,
+        }
+    }
+
+    fn apply_offset_should_skip(&mut self, n: u64) -> bool {
+        self.pulled_rows += n;
+        if let Some(offset) = &self.offset {
+            if self.pulled_rows < *offset {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn exceeding(&self) -> bool {
+        if let Some(limit) = &self.limit {
+            if self.pulled_rows - self.delta_rows >= *limit {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 impl PhysicalPlanOps for IndexNestedLoopJoinOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
         self.driver.prepare()?;
@@ -1531,7 +1573,7 @@ pub struct OrderingInStorageOps {
     child: ArenaBox<dyn PhysicalPlanOps>,
     projected_columns: ArenaBox<ColumnSet>,
     prepared_stmt: Option<ArenaBox<PreparedStatement>>,
-    //interpreter: Interpreter,
+    limit: LimitingState,
     arena: ArenaMut<Arena>,
 
     storage: Option<Arc<dyn storage::DB>>,
@@ -1543,6 +1585,8 @@ impl OrderingInStorageOps {
     pub fn new(ordering_key_bundle: ArenaVec<(BytecodeVector, SqlOrdering)>,
                child: ArenaBox<dyn PhysicalPlanOps>,
                projected_columns: ArenaBox<ColumnSet>,
+               limit: Option<u64>,
+               offset: Option<u64>,
                prepared_stmt: Option<ArenaBox<PreparedStatement>>,
                arena: ArenaMut<Arena>,
                storage: Arc<dyn storage::DB>) -> Self {
@@ -1551,7 +1595,7 @@ impl OrderingInStorageOps {
             child,
             projected_columns,
             prepared_stmt,
-            //interpreter: Interpreter::new(&arena),
+            limit: LimitingState::new(limit, offset),
             arena,
             storage: Some(storage),
             iter: None,
@@ -1621,6 +1665,7 @@ impl PhysicalPlanOps for OrderingInStorageOps {
             let _ = self.storage.as_ref().unwrap().drop_column_family(cf.clone());
             self.cf = None;
         }
+        self.limit.pulled_rows = 0;
 
         let storage = self.storage.clone().unwrap();
         let opts = ColumnFamilyOptions::with()
@@ -1637,8 +1682,17 @@ impl PhysicalPlanOps for OrderingInStorageOps {
             return Err(iter.status().clone());
         }
         iter.seek_to_first();
-        if !iter.valid() && iter.status().is_not_ok() {
+        if !iter.valid() && iter.status().is_corruption() {
             return Err(iter.status().clone());
+        }
+
+        if self.limit.offset.is_some() {
+            while iter.valid() && self.limit.apply_offset_should_skip(1) {
+                iter.move_next();
+                if iter.status().is_corruption() {
+                    return Err(iter.status().clone());
+                }
+            }
         }
 
         drop(iter);
@@ -1660,7 +1714,7 @@ impl PhysicalPlanOps for OrderingInStorageOps {
     fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
         let iter_box = self.iter.as_ref().unwrap();
         let mut iter = iter_box.borrow_mut();
-        if !iter.valid() {
+        if !iter.valid() || self.limit.exceeding() {
             return None;
         }
         let arena = zone.get_mut();
@@ -1674,6 +1728,8 @@ impl PhysicalPlanOps for OrderingInStorageOps {
             feedback.catch_error(iter.status().clone());
             None
         } else {
+            assert!(!self.limit.apply_offset_should_skip(1));
+            //println!("tuple={}", tuple.to_string());
             Some(tuple)
         }
     }
@@ -1788,12 +1844,12 @@ mod tests {
         columns.append("id", "", 0, 1, ColumnType::Int(11));
         columns.append("name", "", 0, 2, ColumnType::Varchar(64));
 
-        let mut plan = RangeScanOps::new(columns,
-                                         begin_key, true,
-                                         end_key, true, None, None,
-                                         arena.clone(), db.clone(),
-                                         db.get_snapshot(),
-                                         db.default_column_family().clone());
+        let mut plan = RangeScanningOps::new(columns,
+                                             begin_key, true,
+                                             end_key, true, None, None,
+                                             arena.clone(), db.clone(),
+                                             db.get_snapshot(),
+                                             db.default_column_family().clone());
         plan.prepare()?;
         let mut feedback = FeedbackImpl::default();
         let mut i = 0i64;

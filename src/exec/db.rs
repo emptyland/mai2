@@ -2361,9 +2361,13 @@ mod tests {
             "(2, \"bbb\", \"002\", 0.10000000149011612, 20)",
             "(1, \"aaa\", \"001\", -0.10000000149011612, 10)",
             "(3, \"aaa\", \"003\", 0.20000000298023224, 30)",
+            "(6, \"aaa\", NULL, 0.3400000035762787, 60)",
+            "(7, NULL, \"009\", 0.6700000166893005, 70)",
+            "(8, NULL, \"007\", NULL, 80)",
         ];
         let rs = suite.execute_query_str("select * from t1 order by name desc;", &suite.arena)?;
         SqlSuite::assert_rows(&data, rs)?;
+        //SqlSuite::print_rows(rs)?;
         Ok(())
     }
 
@@ -2378,9 +2382,57 @@ mod tests {
             "(2, \"bbb\", \"002\", 0.10000000149011612, 20)",
             "(1, \"aaa\", \"001\", -0.10000000149011612, 10)",
             "(3, \"aaa\", \"003\", 0.20000000298023224, 30)",
+            "(6, \"aaa\", NULL, 0.3400000035762787, 60)",
+            "(8, NULL, \"007\", NULL, 80)",
+            "(7, NULL, \"009\", 0.6700000166893005, 70)",
         ];
         let rs = suite.execute_query_str("select * from t1 order by name desc, nick;", &suite.arena)?;
         SqlSuite::assert_rows(&data, rs)?;
+        //SqlSuite::print_rows(rs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn delete_with_order_by() -> Result<()> {
+        let suite = SqlSuite::new("tests/db126")?;
+        suite.execute_file(Path::new("testdata/t1_data_for_order_by.sql"), &suite.arena)?;
+
+        assert_eq!(2, suite.execute_str("delete from t1 order by id desc limit 2", &suite.arena)?);
+
+        let data = [
+            "(1, \"aaa\", \"001\", -0.10000000149011612, 10)",
+            "(2, \"bbb\", \"002\", 0.10000000149011612, 20)",
+            "(3, \"aaa\", \"003\", 0.20000000298023224, 30)",
+            "(4, \"ccc\", \"003\", 0.4000000059604645, 40)",
+            "(5, \"xxx\", \"010\", 0.0010000000474974513, 50)",
+            "(6, \"aaa\", NULL, 0.3400000035762787, 60)",
+        ];
+        let rs = suite.execute_query_str("select * from t1", &suite.arena)?;
+        SqlSuite::assert_rows(&data, rs)?;
+        //SqlSuite::print_rows(rs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn update_with_order_by() -> Result<()> {
+        let suite = SqlSuite::new("tests/db127")?;
+        suite.execute_file(Path::new("testdata/t1_data_for_order_by.sql"), &suite.arena)?;
+
+        assert_eq!(2, suite.execute_str("update t1 set factor = 0.0 order by id desc limit 2", &suite.arena)?);
+
+        let data = [
+            "(1, \"aaa\", \"001\", -0.10000000149011612, 10)",
+            "(2, \"bbb\", \"002\", 0.10000000149011612, 20)",
+            "(3, \"aaa\", \"003\", 0.20000000298023224, 30)",
+            "(4, \"ccc\", \"003\", 0.4000000059604645, 40)",
+            "(5, \"xxx\", \"010\", 0.0010000000474974513, 50)",
+            "(6, \"aaa\", NULL, 0.3400000035762787, 60)",
+            "(7, NULL, \"009\", 0, 70)",
+            "(8, NULL, \"007\", 0, 80)",
+        ];
+        let rs = suite.execute_query_str("select * from t1", &suite.arena)?;
+        SqlSuite::assert_rows(&data, rs)?;
+        //SqlSuite::print_rows(rs)?;
         Ok(())
     }
 }

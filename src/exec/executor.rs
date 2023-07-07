@@ -701,7 +701,8 @@ impl Visitor for Executor {
         let mut maker = PlanMaker::new(&db, db.get_snapshot(), self.prepared_stmts.back().cloned(), &self.arena);
         let rs = if this.names.len() == 1 && this.relation.is_none() {
             // Simple delete
-            maker.make_rows_simple_producer(this.names[0].as_str(), &this.where_clause, &this.limit_clause)
+            maker.make_rows_simple_producer(this.names[0].as_str(), &this.where_clause, &this.order_by_clause,
+                                            &this.limit_clause)
         } else {
             maker.make_rows_multi_producer(this.relation.as_ref().unwrap(), &this.where_clause,
                                            &this.order_by_clause, &this.limit_clause)
@@ -1269,7 +1270,7 @@ impl UniversalContext {
     pub fn new(prepared_stmt: Option<ArenaBox<PreparedStatement>>, arena: &ArenaMut<Arena>) -> Self {
         Self {
             prepared_stmt,
-            arena: arena.clone()
+            arena: arena.clone(),
         }
     }
 }
