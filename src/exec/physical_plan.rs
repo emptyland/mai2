@@ -39,12 +39,122 @@ pub struct RowsGettingOps {
     projected_columns: ArenaBox<ColumnSet>,
     keys: ArenaVec<ArenaVec<u8>>,
     arena: ArenaMut<Arena>,
-    key_id: u64,
+    // key_id: u64,
     current: usize,
 
     storage: Option<Arc<dyn storage::DB>>,
     snapshot: Option<Arc<dyn storage::Snapshot>>,
     cf: Option<Arc<dyn ColumnFamily>>,
+}
+
+impl RowsGettingOps {
+    pub fn new(projected_columns: ArenaBox<ColumnSet>,
+               keys: ArenaVec<ArenaVec<u8>>,
+               arena: ArenaMut<Arena>,
+               storage: Arc<dyn storage::DB>,
+               snapshot: Arc<dyn storage::Snapshot>,
+               cf: Arc<dyn ColumnFamily>) -> Self {
+        Self {
+            projected_columns,
+            keys,
+            arena,
+            current: 0,
+            storage: Some(storage),
+            snapshot: Some(snapshot),
+            cf: Some(cf),
+        }
+    }
+
+    fn get_row_by_pk(&self, storage: &Arc<dyn storage::DB>, cf: &Arc<dyn ColumnFamily>, rd_ops: &ReadOptions,
+                     row_key: &[u8], arena: &ArenaMut<Arena>) -> Result<Tuple> {
+        let mut tuple =
+            Tuple::with_filling(&self.projected_columns, |_| { Value::Null }, arena.get_mut());
+
+        let mut key = ArenaVec::with_data(arena, row_key);
+        for i in 0..self.projected_columns.len() {
+            let col = &self.projected_columns[i];
+            DB::encode_col_id(col.id, &mut key);
+
+            match storage.get_pinnable(rd_ops, cf, &key) {
+                Err(e) => {
+                    if e.is_not_found() {
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Ok(value) =>
+                    tuple.set(i, DB::decode_column_value(&col.ty, &value, arena.get_mut()))
+            }
+
+            key.truncate(row_key.len());
+        }
+
+        Ok(tuple)
+    }
+}
+
+impl PhysicalPlanOps for RowsGettingOps {
+    fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
+        self.current = 0;
+
+        Ok(self.projected_columns.clone())
+    }
+
+    fn finalize(&mut self) {
+        self.storage = None;
+        self.snapshot = None;
+        self.cf = None;
+    }
+
+    fn next(&mut self, feedback: &mut dyn Feedback, zone: &ArenaRef<Arena>) -> Option<Tuple> {
+        if self.current >= self.keys.len() {
+            return None;
+        }
+        let arena = zone.get_mut();
+
+        let storage = self.storage.as_ref().unwrap();
+        let snapshot = self.snapshot.as_ref().unwrap();
+        let cf = self.cf.as_ref().unwrap();
+
+        let key = &self.keys[self.current];
+        let key_id = DB::decode_idx_id(key);
+
+        let rs;
+        let rd_opts = ReadOptions::with()
+            .snapshot(snapshot.clone())
+            .build();
+        if !DB::is_primary_key(key_id) {
+            match storage.get_pinnable(&rd_opts, cf, key) {
+                Ok(value) =>
+                    rs = self.get_row_by_pk(storage, cf, &rd_opts, &value, &arena),
+                Err(e) => {
+                    if !e.is_not_found() {
+                        feedback.catch_error(e);
+                    }
+                    return None;
+                }
+            }
+        } else {
+            rs = self.get_row_by_pk(storage, cf, &rd_opts, &key, &arena);
+        }
+
+        let rv = match rs {
+            Err(e) => {
+                if !e.is_not_found() {
+                    feedback.catch_error(e);
+                }
+                None
+            }
+            Ok(tuple) => Some(tuple)
+        };
+
+        self.current += 1;
+        rv
+    }
+
+    fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {
+        arena_vec!(&self.arena)
+    }
 }
 
 pub struct RangeScanningOps {
@@ -232,7 +342,7 @@ impl PhysicalPlanOps for RangeScanningOps {
 
         let arena = zone.get_mut();
         //let mut tuple = Tuple::with(&self.projected_columns, &arena);
-        let mut tuple = Tuple::with_filling(&self.projected_columns, |x|{Value::Null}, arena.get_mut());
+        let mut tuple = Tuple::with_filling(&self.projected_columns, |x| { Value::Null }, arena.get_mut());
         let rs = self.next_row(iter.deref_mut(), |key, v| {
             if feedback.need_row_key() && tuple.row_key().is_empty() {
                 tuple.attach_row_key(ArenaVec::with_data(&arena, &key[..key.len() - DB::COL_ID_LEN]));
@@ -1478,7 +1588,7 @@ impl LimitingState {
     fn new(limit: Option<u64>, offset: Option<u64>) -> Self {
         Self {
             pulled_rows: 0,
-            delta_rows: offset.map_or(0, |x| {x}),
+            delta_rows: offset.map_or(0, |x| { x }),
             limit,
             offset,
         }

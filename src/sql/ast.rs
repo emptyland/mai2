@@ -60,6 +60,7 @@ ast_nodes_impl![
     (CaseWhen, visit_case_when),
     (InLiteralSet, visit_in_literal_set),
     (InRelation, visit_in_relation),
+    (BetweenAnd, visit_between_and),
     (CallFunction, visit_call_function),
     (Literal<i64>, visit_int_literal),
     (Literal<f64>, visit_float_literal),
@@ -610,7 +611,7 @@ impl Expression for InLiteralSet {
 pub struct InRelation {
     pub not_in: bool,
     pub lhs: ArenaBox<dyn Expression>,
-    pub set: ArenaVec<ArenaBox<dyn Relation>>,
+    pub set: ArenaBox<dyn Relation>,
 }
 
 impl Expression for InRelation {
@@ -623,6 +624,27 @@ impl Expression for InRelation {
     fn operands_mut(&mut self) -> &mut [ArenaBox<dyn Expression>] {
         &mut []
     }
+}
+
+pub struct BetweenAnd {
+    operands: [ArenaBox<dyn Expression>;3]
+}
+
+impl BetweenAnd {
+    pub fn matched(&self) -> &ArenaBox<dyn Expression> { &self.operands()[0] }
+    pub fn matched_mut(&mut self) -> &mut ArenaBox<dyn Expression> { &mut self.operands_mut()[0] }
+
+    pub fn lower(&self) -> &ArenaBox<dyn Expression> { &self.operands()[1] }
+    pub fn lower_mut(&mut self) -> &mut ArenaBox<dyn Expression> { &mut self.operands_mut()[1] }
+
+    pub fn upper(&self) -> &ArenaBox<dyn Expression> { &self.operands()[2] }
+    pub fn upper_mut(&mut self) -> &mut ArenaBox<dyn Expression> { &mut self.operands_mut()[2] }
+}
+
+impl Expression for BetweenAnd {
+    fn op(&self) -> &Operator { &Operator::Cond }
+    fn operands(&self) -> &[ArenaBox<dyn Expression>] { &self.operands }
+    fn operands_mut(&mut self) -> &mut [ArenaBox<dyn Expression>] { &mut self.operands }
 }
 
 pub struct Placeholder {
@@ -822,6 +844,13 @@ impl Factory {
         }, self.arena.get_mut())
     }
 
+    // pub fn new_unary_expr(&self, op: Operator, operand: ArenaBox<dyn Expression>) -> ArenaBox<UnaryExpression> {
+    //     ArenaBox::new(UnaryExpression {
+    //         op,
+    //         operand,
+    //     }, self.arena.get_mut())
+    // }
+
     pub fn new_case_when(&self, matching: Option<ArenaBox<dyn Expression>>, when_clause: ArenaVec<WhenClause>,
                          else_clause: Option<ArenaBox<dyn Expression>>) -> ArenaBox<CaseWhen> {
         ArenaBox::new(CaseWhen {
@@ -837,6 +866,28 @@ impl Factory {
             distinct,
             in_args_star: false,
             args: ArenaVec::new(&self.arena),
+        }, self.arena.get_mut())
+    }
+
+    pub fn new_in_literal_set(&self, lhs: ArenaBox<dyn Expression>, not: bool) -> ArenaBox<InLiteralSet> {
+        ArenaBox::new(InLiteralSet {
+            not_in: not,
+            lhs,
+            set: arena_vec!(&self.arena),
+        }, self.arena.get_mut())
+    }
+
+    pub fn new_in_relation(&self, lhs: ArenaBox<dyn Expression>, set: ArenaBox<dyn Relation>, not: bool) -> ArenaBox<InRelation> {
+        ArenaBox::new(InRelation {
+            not_in: not,
+            lhs,
+            set,
+        }, self.arena.get_mut())
+    }
+
+    pub fn new_between_and(&self, matched: ArenaBox<dyn Expression>, lower: ArenaBox<dyn Expression>, upper: ArenaBox<dyn Expression>) -> ArenaBox<BetweenAnd> {
+        ArenaBox::new(BetweenAnd {
+            operands: [matched, lower, upper],
         }, self.arena.get_mut())
     }
 

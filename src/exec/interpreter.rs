@@ -24,6 +24,8 @@ pub enum Bytecode {
     Lddf(f64), // load const f64
     Ldnul, // load NULL
     Ldhd(usize), // load plachholder
+    Dup, // clone a value to top
+    Pop(usize), // pop N value from top
 
     // 0x2x
     Add,
@@ -151,6 +153,11 @@ impl Interpreter {
                 Lddf(f) => self.ret(Value::Float(f)),
                 Ldnul => self.ret(Value::Null),
                 Ldhd(i) => self.ret(self.env().bound_param(i).clone()),
+                Dup => {
+                    let val = self.stack.back().unwrap().clone();
+                    self.ret(val);
+                }
+                Pop(n) => self.stack.truncate(self.stack.len() - n),
 
                 Add => self.add(),
                 Sub => self.sub(),
@@ -250,29 +257,34 @@ impl Interpreter {
         }
     }
 
-    fn test(&mut self, op: ast::Operator) -> bool {
-        self.cmp(op);
-        self.normalize_to_bool()
-    }
-
     fn cmp(&mut self, op: ast::Operator) {
         let rhs = self.stack.pop().unwrap();
         let lhs = self.stack.pop().unwrap();
-        let rv = match &lhs {
+        let rv = self.test_vals(op, &lhs, &rhs);
+        self.ret(rv);
+    }
+
+    fn test(&mut self, op: ast::Operator) -> bool {
+        let rhs = &self.stack[self.stack.len() - 1];
+        let lhs = &self.stack[self.stack.len() - 2];
+        Evaluator::normalize_to_bool(&self.test_vals(op, lhs, rhs))
+    }
+
+    fn test_vals(&self, op: ast::Operator, lhs: &Value, rhs: &Value) -> Value {
+        match lhs {
             Value::Int(_) =>
-                Evaluator::eval_compare_number(&lhs, &Evaluator::require_number(&rhs), &op),
+                Evaluator::eval_compare_number(lhs, &Evaluator::require_number(rhs), &op),
             Value::Float(_) =>
-                Evaluator::eval_compare_number(&lhs, &Evaluator::require_number(&rhs), &op),
+                Evaluator::eval_compare_number(lhs, &Evaluator::require_number(rhs), &op),
             Value::Str(s) => match &rhs {
                 Value::Str(b) =>
                     Evaluator::eval_compare_op(s, b, &op),
                 _ =>
-                    Evaluator::eval_compare_number(&Evaluator::require_number(&lhs), &rhs, &op),
+                    Evaluator::eval_compare_number(&Evaluator::require_number(lhs), rhs, &op),
             }
             Value::Null => Value::Null,
             _ => unreachable!()
-        };
-        self.ret(rv);
+        }
     }
 
     fn ret(&mut self, value: Value) { self.stack.push(value); }
@@ -360,6 +372,8 @@ impl BytecodeBuilder {
         use Bytecode::*;
 
         match bc {
+            Nop => self.emit_byte(0),
+
             Ldn(name) => {
                 self.emit_byte(0x10);
                 self.emit_str(name);
@@ -399,6 +413,13 @@ impl BytecodeBuilder {
             Ldhd(hint) => {
                 self.emit_byte(0x18);
                 self.emit_hint(hint);
+            }
+            // 0x19 => Bytecode::Dup,
+            Dup => self.emit_byte(0x19),
+            // 0x1a => Bytecode::Pop(self.read_hint()),
+            Pop(n) => {
+                self.emit_byte(0x1a);
+                self.emit_hint(n);
             }
 
             // 0x20 => Bytecode::Add,
@@ -440,7 +461,10 @@ impl BytecodeBuilder {
             }
 
             End => self.emit_byte(0xef),
-            _ => unreachable!()
+            _ => {
+                dbg!(&bc);
+                unreachable!()
+            }
         }
     }
 
@@ -550,6 +574,8 @@ pub trait BytecodeChunk {
         let opcode = self.pc();
         self.increase_pc(1);
         match opcode {
+            0x00 => Bytecode::Nop,
+
             0x10 => Bytecode::Ldn(self.read_pool_str().1),
             0x11 => {
                 let name = self.read_pool_str();
@@ -562,6 +588,8 @@ pub trait BytecodeChunk {
             0x16 => Bytecode::Lddf(self.read_f64()),
             0x17 => Bytecode::Ldnul,
             0x18 => Bytecode::Ldhd(self.read_hint()),
+            0x19 => Bytecode::Dup,
+            0x1a => Bytecode::Pop(self.read_hint()),
 
             0x20 => Bytecode::Add,
             0x21 => Bytecode::Sub,
@@ -872,6 +900,32 @@ impl Visitor for BytecodeBuildingVisitor {
         self.builder.emit(Bytecode::Nop);
     }
 
+    fn visit_in_literal_set(&mut self, this: &mut InLiteralSet) {
+        this.lhs.accept(self);
+        let mut hit_br = Label::new();
+        for expr in this.set.iter_mut() {
+            expr.accept(self);
+            self.builder.emit_j(Condition::Equal, &mut hit_br);
+            self.builder.emit(Bytecode::Pop(1));
+        }
+
+        self.builder.emit(Bytecode::Pop(1));
+        self.builder.emit(Bytecode::Ldi(if this.not_in { 1 } else { 0 }));
+
+        let mut trunk = Label::new();
+        self.builder.emit_j(Condition::Always, &mut trunk);
+
+        self.builder.bind(&mut hit_br);
+        self.builder.emit(if this.not_in { Bytecode::Ne } else { Bytecode::Eq });
+
+        self.builder.bind(&mut trunk);
+        self.builder.emit(Bytecode::Nop);
+    }
+
+    fn visit_in_relation(&mut self, _this: &mut InRelation) {
+        todo!()
+    }
+
     fn visit_call_function(&mut self, this: &mut CallFunction) {
         for arg in this.args.iter_mut() {
             arg.accept(self);
@@ -1156,6 +1210,32 @@ mod tests {
     fn simple_expr() -> Result<()> {
         let mut suite = Suite::new();
         assert_eq!(Value::Int(1), suite.eval_ast("2 - 1")?);
+        Ok(())
+    }
+
+    #[test]
+    fn in_literal_expr() -> Result<()> {
+        let mut suite = Suite::new();
+        let id = ArenaStr::new("id", suite.arena.deref_mut());
+        suite.with_env(|env| {
+            env.with_env([
+                (id.as_str(), Value::Int(99)),
+            ])
+        });
+        assert_eq!(Value::Int(1), suite.eval_ast("id in (1, 2, 3, 4, 99)")?);
+        Ok(())
+    }
+
+    #[test]
+    fn not_in_literal_expr() -> Result<()> {
+        let mut suite = Suite::new();
+        let id = ArenaStr::new("id", suite.arena.deref_mut());
+        suite.with_env(|env| {
+            env.with_env([
+                (id.as_str(), Value::Int(99)),
+            ])
+        });
+        assert_eq!(Value::Int(0), suite.eval_ast("id not in (1, 2, 3, 4, 99)")?);
         Ok(())
     }
 

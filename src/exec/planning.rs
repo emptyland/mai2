@@ -1188,6 +1188,8 @@ impl<T> GenericAnalyzedVal<T> {
             _ => false
         }
     }
+
+    fn is_null(&self) -> bool { matches!(self, Self::Null) }
 }
 
 
@@ -1336,6 +1338,20 @@ impl PhysicalSelectionAnalyzer {
             total: 0, // TODO:
             segments,
         })
+    }
+
+    fn reduce_maybe_all_constant(&mut self, input: &[ArenaBox<dyn Expression>]) -> Result<(ArenaVec<AnalyzedVal>, bool)> {
+        let mut rv = arena_vec!(&self.arena);
+        let mut all_constant = true;
+        for it in input {
+            let mut expr = it.clone();
+            let val = self.analyzer_expr(expr.deref_mut())?;
+            if !val.is_constant() {
+                all_constant = false;
+            }
+            rv.push(val);
+        }
+        Ok((rv, all_constant))
     }
 
     fn require_i64(val: &AnalyzedVal) -> Option<i64> {
@@ -1513,6 +1529,98 @@ impl Visitor for PhysicalSelectionAnalyzer {
             }
             _ => self.ret(AnalyzedVal::need_eval(this))
         }
+    }
+
+    fn visit_in_literal_set(&mut self, this: &mut InLiteralSet) {
+        if this.not_in {
+            self.ret(AnalyzedVal::need_eval(this));
+            return;
+        }
+
+        let lhs;
+        match self.analyzer_expr(this.lhs_mut().deref_mut()) {
+            Ok(kind) => lhs = kind,
+            Err(_) => return
+        }
+        let rhs;
+        let all_constant;
+        match self.reduce_maybe_all_constant(&this.set) {
+            Err(e) => {
+                self.rs = e;
+                return;
+            }
+            Ok(rv) => {
+                rhs = rv.0;
+                all_constant = rv.1;
+            }
+        }
+        if !lhs.is_key() || !all_constant {
+            self.ret(AnalyzedVal::need_eval(this));
+            return;
+        }
+
+        let mut ranges = SelectionSet {
+            key_id: 0,
+            part_of: 0,
+            total: 0,
+            segments: arena_vec!(&self.arena),
+        };
+        let ty = match lhs {
+            AnalyzedVal::PrimaryKey => {
+                ranges.key_id = 0;
+                ranges.part_of = 0;
+                ranges.total = 1;
+                let idx = self.table.get_index_by_id(0).unwrap();
+                idx.key_parts[0].ty.clone()
+            },
+            AnalyzedVal::PartOfPrimaryKey(i) => {
+                let idx = self.table.get_index_by_id(0).unwrap();
+                ranges.key_id = 0;
+                ranges.part_of = i;
+                ranges.total = idx.key_parts.len();
+                idx.key_parts[i].ty.clone()
+            }
+            AnalyzedVal::Index(key_id) => {
+                let idx = self.table.get_index_by_id(key_id).unwrap();
+                ranges.key_id = idx.id;
+                ranges.part_of = 0;
+                ranges.total = 1;
+                idx.key_parts[0].ty.clone()
+            }
+            AnalyzedVal::PartOfIndex(key_id, i) => {
+                let idx = self.table.get_index_by_id(key_id).unwrap();
+                ranges.key_id = idx.id;
+                ranges.part_of = i;
+                ranges.total = idx.key_parts.len();
+                idx.key_parts[i].ty.clone()
+            }
+            _ => unreachable!()
+        };
+
+        if ty.is_integral() {
+            for val in &rhs {
+                match Self::require_i64(val) {
+                    Some(n) => ranges.segments.push(SelectionRange::from_point(Value::Int(n))),
+                    None => ()
+                }
+            }
+        } else if ty.is_floating() {
+            for val in &rhs {
+                match Self::require_f64(val) {
+                    Some(n) => ranges.segments.push(SelectionRange::from_point(Value::Float(n))),
+                    None => ()
+                }
+            }
+        } else if ty.is_string() {
+            for val in &rhs {
+                match Self::require_str(val) {
+                    Some(n) => ranges.segments.push(SelectionRange::from_point(Value::Str(n))),
+                    None => ()
+                }
+            }
+        }
+
+        self.ret(AnalyzedVal::Set(ArenaVec::of(ranges, &self.arena)))
     }
 
     fn visit_int_literal(&mut self, this: &mut Literal<i64>) {

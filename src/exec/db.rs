@@ -1649,7 +1649,47 @@ impl TableHandle {
         }
         return false;
     }
+
+    pub fn get_index_by_id(&self, id: u64) -> Option<IndexRefsBundle> {
+        if DB::is_primary_key(id) {
+            Some(IndexRefsBundle{
+                id: 0,
+                name: "<pk>".to_string(),
+                key_parts: self.metadata.primary_keys.iter().map(|x| {
+                    self.get_col_by_id(*x).unwrap()
+                }).collect(),
+                unique: true,
+                order_by: OrderBy::Asc,
+            })
+        } else {
+            match self.secondary_indices_by_id.get(&id) {
+                Some(index) => {
+                    let idx = &self.metadata.secondary_indices[*index];
+                    Some(IndexRefsBundle{
+                        id: idx.id,
+                        name: idx.name.clone(),
+                        key_parts: idx.key_parts.iter().map(|x| {
+                            self.get_col_by_id(*x).unwrap()
+                        }).collect(),
+                        unique: idx.unique,
+                        order_by: idx.order_by.clone(),
+                    })
+                }
+                None => None
+            }
+        }
+    }
 }
+
+#[derive(Debug, Clone)]
+pub struct IndexRefsBundle<'a> {
+    pub id: u64,
+    pub name: String,
+    pub key_parts: Vec<&'a ColumnMetadata>,
+    pub unique: bool,
+    pub order_by: OrderBy,
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableMetadata {

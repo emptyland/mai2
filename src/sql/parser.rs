@@ -735,7 +735,7 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
             let expr = self.parse_expr_with_priority(110, &mut next_op)?;
             return Ok(self.factory.new_unary_expr(op, expr).into());
         }
-        let mut expr = self.parse_simple()?;
+        let mut expr = self.parse_suffixed()?;
 
         let mut may_op = Operator::from_token(&self.peek().token);
         while may_op.is_some() && may_op.as_ref().unwrap().priority() > limit {
@@ -752,7 +752,7 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
 
     fn parse_simple(&mut self) -> Result<ArenaBox<dyn Expression>> {
         let part = self.peek();
-        match part.token {
+        match part.token.clone() {
             Token::Null => {
                 self.move_next()?;
                 Ok(self.factory.new_literal(()).into())
@@ -764,26 +764,6 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
             Token::False => {
                 self.move_next()?;
                 Ok(self.factory.new_literal(0i64).into())
-            }
-            Token::Question => {
-                self.move_next()?;
-                let placeholder = self.factory.new_placeholder(self.placeholder_order);
-                self.placeholder_order += 1;
-                Ok(placeholder.into())
-            }
-            _ => self.parse_primary()
-        }
-    }
-
-
-    fn parse_primary(&mut self) -> Result<ArenaBox<dyn Expression>> {
-        let start_pos = self.lexer.current_position();
-        match self.peek().token.clone() {
-            Token::LParent => {
-                self.move_next()?;
-                let expr = self.parse_expr()?;
-                self.match_expected(Token::RParent)?;
-                Ok(expr)
             }
             Token::IntLiteral(val) => {
                 self.move_next()?;
@@ -797,6 +777,78 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
                 self.move_next()?;
                 Ok(self.factory.new_literal(val).into())
             }
+            Token::Question => {
+                self.move_next()?;
+                let placeholder = self.factory.new_placeholder(self.placeholder_order);
+                self.placeholder_order += 1;
+                Ok(placeholder.into())
+            }
+            _ => self.parse_primary()
+        }
+    }
+
+    fn parse_suffixed(&mut self) -> Result<ArenaBox<dyn Expression>> {
+        let start_pos = self.lexer.current_position();
+
+        let expr = self.parse_simple()?;
+        let not = self.test(Token::Not)?;
+        match self.peek().token.clone() {
+            Token::Between => {
+                self.move_next()?;
+                let lower = self.parse_expr()?;
+                self.match_expected(Token::And)?;
+                let upper = self.parse_expr()?;
+                Ok(self.factory.new_between_and(expr, lower, upper).into())
+            }
+            Token::In => {
+                self.move_next()?;
+                self.match_expected(Token::LParent)?;
+                if self.peek().token == Token::Select {
+                    let rel = ArenaBox::<dyn Relation>::from(self.parse_select()?);
+                    let node = self.factory.new_in_relation(expr, rel, not);
+                    self.match_expected(Token::RParent)?;
+                    Ok(node.into())
+                } else {
+                    let mut node = self.factory.new_in_literal_set(expr, not);
+                    loop {
+                        let elem = self.parse_expr()?;
+                        node.set.push(elem);
+                        if !self.test(Token::Comma)? {
+                            break;
+                        }
+                    }
+                    self.match_expected(Token::RParent)?;
+                    Ok(node.into())
+                }
+            }
+            Token::Is => {
+                if not {
+                    return Err(self.concat_syntax_error(start_pos, "Unexpected prefix NOT".to_string()));
+                }
+                self.move_next()?;
+                let node = if self.test(Token::Not)? {
+                    self.match_expected(Token::Null)?;
+                    self.factory.new_unary_expr(Operator::IsNotNull, expr)
+                } else {
+                    self.match_expected(Token::Null)?;
+                    self.factory.new_unary_expr(Operator::IsNull, expr)
+                };
+                Ok(node.into())
+            }
+            _ => Ok(expr)
+        }
+    }
+
+    fn parse_primary(&mut self) -> Result<ArenaBox<dyn Expression>> {
+        let start_pos = self.lexer.current_position();
+        match self.peek().token.clone() {
+            Token::LParent => {
+                self.move_next()?;
+                let expr = self.parse_expr()?;
+                self.match_expected(Token::RParent)?;
+                Ok(expr)
+            }
+
             Token::Id(symbol) => {
                 self.move_next()?;
                 if self.test(Token::Dot)? {
