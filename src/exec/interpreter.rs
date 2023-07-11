@@ -10,7 +10,7 @@ use crate::sql::ast;
 use crate::sql::ast::*;
 use crate::status::Corrupting;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Bytecode {
     // 0x00
     Nop, // do nothing
@@ -59,6 +59,8 @@ pub enum Bytecode {
     Jle(isize), //
     Jgt(isize), //
     Jge(isize), //
+    Jnl(isize), // jump if null
+    Jtn(isize), // jump if not null
     Jmp(isize), // jump always
 
     // 0xa0
@@ -68,6 +70,7 @@ pub enum Bytecode {
     End,
 }
 
+#[derive(Clone)]
 pub enum Condition {
     IfTrue = 0,
     IfFalse = 1,
@@ -77,7 +80,9 @@ pub enum Condition {
     LessOrEqual = 5,
     Greater = 6,
     GreaterOrEqual = 7,
-    Always = 8,
+    IfNull = 8,
+    IfNotNull = 9,
+    Always = 10,
 }
 
 pub struct Interpreter {
@@ -140,7 +145,8 @@ impl Interpreter {
         use Bytecode::*;
         bca.reset();
         loop {
-            match bca.pick() {
+            let bc = bca.pick();
+            match bc {
                 Nop => (), // do nothing
 
                 Ldn(name) => self.stack.push(self.resolve(name.as_str())?),
@@ -183,12 +189,33 @@ impl Interpreter {
                 Jeq(dist) => if self.test(Operator::Eq) {
                     bca.increase_pc(dist);
                 }
+                Jlt(dist) => if self.test(Operator::Lt) {
+                    bca.increase_pc(dist);
+                }
+                Jle(dist) => if self.test(Operator::Le) {
+                    bca.increase_pc(dist);
+                }
+                Jgt(dist) => if self.test(Operator::Gt) {
+                    bca.increase_pc(dist);
+                }
+                Jge(dist) => if self.test(Operator::Ge) {
+                    bca.increase_pc(dist);
+                }
+                Jnl(dist) => if self.stack.back().unwrap().is_null() {
+                    bca.increase_pc(dist);
+                }
+                Jtn(dist) => if self.stack.back().unwrap().is_not_null() {
+                    bca.increase_pc(dist);
+                }
                 Jmp(dist) => bca.increase_pc(dist),
 
                 Call(callee, nargs) => self.call(callee, nargs)?,
 
                 End => break,
-                _ => unreachable!()
+                _ => {
+                    dbg!(&bc);
+                    unreachable!()
+                }
             }
         }
 
@@ -345,7 +372,9 @@ impl BytecodeBuilder {
             LessOrEqual => self.emit_byte(0xd5), //
             Greater => self.emit_byte(0xd6), //
             GreaterOrEqual => self.emit_byte(0xd7), //
-            Always => self.emit_byte(0xd8), // jump always
+            IfNull => self.emit_byte(0xd8), // jump if null
+            IfNotNull => self.emit_byte(0xd9), // jump if not null
+            Always => self.emit_byte(0xda), // jump always
         }
         self.emit_dist(dist as isize);
     }
@@ -615,7 +644,9 @@ pub trait BytecodeChunk {
             0xd5 => Bytecode::Jle(self.read_dist()),
             0xd6 => Bytecode::Jgt(self.read_dist()),
             0xd7 => Bytecode::Jge(self.read_dist()),
-            0xd8 => Bytecode::Jmp(self.read_dist()),
+            0xd8 => Bytecode::Jnl(self.read_dist()),
+            0xd9 => Bytecode::Jtn(self.read_dist()),
+            0xda => Bytecode::Jmp(self.read_dist()),
 
             0xa0 => Bytecode::Call(self.read_pool_str().1, self.read_hint()),
 
@@ -871,32 +902,70 @@ impl Visitor for BytecodeBuildingVisitor {
     }
 
     fn visit_case_when(&mut self, this: &mut CaseWhen) {
-        let mut otherwise = Label::new();
-        let mut end = Label::new();
+        //let mut otherwise = Label::new();
+        let mut hit = Label::new();
+
         if let Some(matching) = &mut this.matching {
+            matching.accept(self);
             for when in this.when_clause.iter_mut() {
-                matching.accept(self);
+                let mut next = Label::new();
                 when.expected.accept(self);
-                self.builder.emit_j(Condition::NotEqual, &mut otherwise);
+                self.builder.emit_j(Condition::NotEqual, &mut next);
+                self.builder.emit(Bytecode::Pop(1));
                 when.then.accept(self);
-                self.builder.emit_j(Condition::Always, &mut end);
+                self.builder.emit_j(Condition::Always, &mut hit);
+                self.builder.bind(&mut next);
+                self.builder.emit(Bytecode::Pop(1));
             }
         } else {
             for when in this.when_clause.iter_mut() {
-                when.expected.accept(self);
-                self.builder.emit_j(Condition::IfFalse, &mut otherwise);
+
+                let cond = match when.expected.op() {
+                    Operator::Eq => Condition::NotEqual,
+                    Operator::Ne => Condition::Equal,
+                    Operator::Lt => Condition::GreaterOrEqual,
+                    Operator::Le => Condition::Greater,
+                    Operator::Gt => Condition::LessOrEqual,
+                    Operator::Ge => Condition::Less,
+                    Operator::IsNull => Condition::IfNotNull,
+                    Operator::IsNotNull => Condition::IfNull,
+                    _ => Condition::IfFalse,
+                };
+
+                let popn;
+                if when.expected.op().is_binary() {
+                    when.expected.lhs_mut().accept(self);
+                    when.expected.rhs_mut().accept(self);
+                    popn = 2;
+                } else if when.expected.op().is_unary() {
+                    when.expected.operands_mut()[0].accept(self);
+                    popn = 1;
+                } else {
+                    when.expected.accept(self);
+                    popn = 0;
+                }
+                let mut next = Label::new();
+                self.builder.emit_j(cond, &mut next);
+                if popn > 0 {
+                    self.builder.emit(Bytecode::Pop(popn));
+                }
                 when.then.accept(self);
-                self.builder.emit_j(Condition::Always, &mut end);
+                self.builder.emit_j(Condition::Always, &mut hit);
+
+                self.builder.bind(&mut next);
+                if popn > 0 {
+                    self.builder.emit(Bytecode::Pop(popn));
+                }
             }
         }
+
         if let Some(else_clause) = &mut this.else_clause {
-            self.builder.bind(&mut otherwise);
             else_clause.accept(self);
         } else {
-            self.builder.bind(&mut otherwise);
             self.builder.emit(Bytecode::Ldnul);
         }
-        self.builder.bind(&mut end);
+
+        self.builder.bind(&mut hit);
         self.builder.emit(Bytecode::Nop);
     }
 
@@ -924,6 +993,46 @@ impl Visitor for BytecodeBuildingVisitor {
 
     fn visit_in_relation(&mut self, _this: &mut InRelation) {
         todo!()
+    }
+
+    fn visit_between_and(&mut self, this: &mut BetweenAnd) {
+        this.matched_mut().accept(self);
+
+        this.lower_mut().accept(self);
+        if this.not_between {
+            let mut hit = Label::new();
+            self.builder.emit_j(Condition::Less, &mut hit);
+            self.builder.emit(Bytecode::Pop(1));
+
+            this.upper_mut().accept(self);
+            self.builder.emit_j(Condition::GreaterOrEqual, &mut hit);
+            self.builder.emit(Bytecode::Ge);
+            let mut miss = Label::new();
+            self.builder.emit_j(Condition::Always, &mut miss);
+
+            self.builder.bind(&mut hit);
+            self.builder.emit(Bytecode::Pop(2));
+            self.builder.emit(Bytecode::Ldi(1));
+
+            self.builder.bind(&mut miss);
+            self.builder.emit(Bytecode::Nop);
+        } else {
+            let mut miss = Label::new();
+            self.builder.emit_j(Condition::Less, &mut miss);
+            self.builder.emit(Bytecode::Pop(1));
+
+            this.upper_mut().accept(self);
+            self.builder.emit_j(Condition::GreaterOrEqual, &mut miss);
+            self.builder.emit(Bytecode::Lt);
+            let mut hit = Label::new();
+            self.builder.emit_j(Condition::Always, &mut hit);
+
+            self.builder.bind(&mut miss);
+            self.builder.emit(Bytecode::Lt);
+
+            self.builder.bind(&mut hit);
+            self.builder.emit(Bytecode::Nop);
+        }
     }
 
     fn visit_call_function(&mut self, this: &mut CallFunction) {
@@ -1236,6 +1345,93 @@ mod tests {
             ])
         });
         assert_eq!(Value::Int(0), suite.eval_ast("id not in (1, 2, 3, 4, 99)")?);
+        Ok(())
+    }
+
+    #[test]
+    fn case_when_issue_0() -> Result<()> {
+        let mut suite = Suite::new();
+        let id = ArenaStr::new("id", suite.arena.deref_mut());
+        suite.with_env(|env| {
+            env.with_env([
+                (id.as_str(), Value::Int(99)),
+            ])
+        });
+
+        let val_f = ArenaStr::new("f", suite.arena.deref_mut());
+        assert_eq!(Value::Str(val_f), suite.eval_ast("case id
+        when 0 then 's'
+        when 1 then 't'
+        when 99 then 'f'
+        ")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn case_when_issue_1() -> Result<()> {
+        let mut suite = Suite::new();
+        let id = ArenaStr::new("id", suite.arena.deref_mut());
+        suite.with_env(|env| {
+            env.with_env([
+                (id.as_str(), Value::Int(100)),
+            ])
+        });
+
+        let val_f = ArenaStr::new("f", suite.arena.deref_mut());
+        assert_eq!(Value::Null, suite.eval_ast("case id
+        when 0 then 's'
+        when 1 then 't'
+        when 99 then 'f'
+        ")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn case_when_issue_2() -> Result<()> {
+        let mut suite = Suite::new();
+        let id = ArenaStr::new("id", suite.arena.deref_mut());
+        suite.with_env(|env| {
+            env.with_env([
+                (id.as_str(), Value::Int(0)),
+            ])
+        });
+        assert_eq!(Value::Int(0), suite.eval_ast("case
+        when id < 0 then -1
+        when id = 0 then 0
+        when id > 0 then 1
+        ")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn between_and_issue_0() -> Result<()> {
+        let mut suite = Suite::new();
+        let id = ArenaStr::new("id", suite.arena.deref_mut());
+        suite.with_env(|env| {
+            env.with_env([
+                (id.as_str(), Value::Int(0)),
+            ])
+        });
+
+        assert_eq!(Value::Int(1), suite.eval_ast("id between -1 and 1")?); // [-1, 1)
+        Ok(())
+    }
+
+    #[test]
+    fn between_and_issue_1() -> Result<()> {
+        let mut suite = Suite::new();
+        let id = ArenaStr::new("id", suite.arena.deref_mut());
+        suite.with_env(|env| {
+            env.with_env([
+                (id.as_str(), Value::Int(0)),
+            ])
+        });
+
+        assert_eq!(Value::Int(1), suite.eval_ast("id not between 1 and 2")?); // [-1, 1)
+
         Ok(())
     }
 

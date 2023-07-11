@@ -795,10 +795,10 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
         match self.peek().token.clone() {
             Token::Between => {
                 self.move_next()?;
-                let lower = self.parse_expr()?;
+                let lower = self.parse_simple()?;
                 self.match_expected(Token::And)?;
-                let upper = self.parse_expr()?;
-                Ok(self.factory.new_between_and(expr, lower, upper).into())
+                let upper = self.parse_simple()?;
+                Ok(self.factory.new_between_and(expr, lower, upper, not).into())
             }
             Token::In => {
                 self.move_next()?;
@@ -876,6 +876,7 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
                 }
             }
             Token::Case => {
+                self.move_next()?;
                 let matching = if self.peek().token != Token::When {
                     Some(self.parse_expr()?)
                 } else {

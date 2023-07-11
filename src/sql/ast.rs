@@ -193,7 +193,14 @@ impl Operator {
         }
     }
 
-    pub fn is_binary(&self) -> bool { !self.is_unary() }
+    pub fn is_in(&self) -> bool {
+        match self {
+            Self::In | Self::NotIn => true,
+            _ => false
+        }
+    }
+
+    pub fn is_binary(&self) -> bool { !self.is_unary() && !self.is_in() }
 
     pub fn from_token(token: &Token) -> Option<Self> {
         match token {
@@ -627,6 +634,7 @@ impl Expression for InRelation {
 }
 
 pub struct BetweenAnd {
+    pub not_between: bool,
     operands: [ArenaBox<dyn Expression>;3]
 }
 
@@ -877,7 +885,8 @@ impl Factory {
         }, self.arena.get_mut())
     }
 
-    pub fn new_in_relation(&self, lhs: ArenaBox<dyn Expression>, set: ArenaBox<dyn Relation>, not: bool) -> ArenaBox<InRelation> {
+    pub fn new_in_relation(&self, lhs: ArenaBox<dyn Expression>, set: ArenaBox<dyn Relation>,
+                           not: bool) -> ArenaBox<InRelation> {
         ArenaBox::new(InRelation {
             not_in: not,
             lhs,
@@ -885,8 +894,10 @@ impl Factory {
         }, self.arena.get_mut())
     }
 
-    pub fn new_between_and(&self, matched: ArenaBox<dyn Expression>, lower: ArenaBox<dyn Expression>, upper: ArenaBox<dyn Expression>) -> ArenaBox<BetweenAnd> {
+    pub fn new_between_and(&self, matched: ArenaBox<dyn Expression>, lower: ArenaBox<dyn Expression>,
+                           upper: ArenaBox<dyn Expression>, not: bool) -> ArenaBox<BetweenAnd> {
         ArenaBox::new(BetweenAnd {
+            not_between: not,
             operands: [matched, lower, upper],
         }, self.arena.get_mut())
     }
