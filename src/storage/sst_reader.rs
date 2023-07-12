@@ -4,7 +4,6 @@ use std::cmp::Ordering::Equal;
 use std::io::Write;
 use std::iter::Iterator;
 use std::mem::size_of_val;
-use std::ops::DerefMut;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -148,7 +147,7 @@ impl SSTReader {
     }
 
     fn new_index_iter(&self, internal_key_cmp: &InternalKeyComparator) -> io::Result<BlockIterator> {
-        let block = self.block_cache.get(self.file.borrow_mut().deref_mut(),
+        let block = self.block_cache.get(unsafe {&mut *self.file.as_ptr()} /*self.file.borrow_mut().deref_mut()*/,
                                          self.file_number,
                                          self.table_properties.index_position,
                                          self.checksum_verify)?;
@@ -157,7 +156,8 @@ impl SSTReader {
 
     fn new_block_iter(&self, internal_key_cmp: &InternalKeyComparator, handle: BlockHandle)
                       -> io::Result<BlockIterator> {
-        let block = self.block_cache.get(self.file.borrow_mut().deref_mut(),
+
+        let block = self.block_cache.get(unsafe {&mut *self.file.as_ptr()},
                                          self.file_number,
                                          handle.offset,
                                          self.checksum_verify)?;

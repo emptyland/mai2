@@ -173,10 +173,15 @@ impl Snapshot for SnapshotImpl {
     }
 }
 
+unsafe impl Send for SnapshotImpl {}
+
+unsafe impl Sync for SnapshotImpl {}
+
 impl Drop for SnapshotImpl {
     fn drop(&mut self) {
         if let Some(db) = self.owns.upgrade() {
             //log_debug!(db.logger, "release snapshot: {} at {}", self.sequence_number, self.ts);
+            let _locking = db.versions.lock().unwrap();
             db.snapshots.borrow_mut().remove_snapshot(self);
         }
     }

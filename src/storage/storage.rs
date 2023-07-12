@@ -226,7 +226,7 @@ pub trait ColumnFamily: Send + Sync {
     fn get_descriptor(&self) -> Result<ColumnFamilyDescriptor>;
 }
 
-pub trait Snapshot {
+pub trait Snapshot: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 

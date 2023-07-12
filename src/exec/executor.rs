@@ -664,7 +664,10 @@ impl Visitor for Executor {
         match db.insert_rows(&cf, &table.metadata, &tuples, &secondary_indices,
                              anonymous_row_key_value, auto_increment_value,
                              !use_anonymous_row_key) {
-            Ok(affected_rows) => self.affected_rows = affected_rows,
+            Ok(affected_rows) => {
+                db.record_incremental_rows(&table, affected_rows as isize).unwrap();
+                self.affected_rows = affected_rows;
+            },
             Err(e) => self.rs = e
         }
     }
@@ -688,7 +691,7 @@ impl Visitor for Executor {
     fn visit_delete(&mut self, this: &mut Delete) {
         debug_assert!(!this.names.is_empty());
         let db = self.db.upgrade().unwrap();
-        let mut tables_will_be_delete = arena_vec!(&self.arena);
+        let mut tables_will_be_delete = vec![];
         let tables = db.lock_tables();
         for name in &this.names {
             match tables.get(&name.to_string()) {

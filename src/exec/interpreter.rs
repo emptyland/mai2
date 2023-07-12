@@ -1005,7 +1005,7 @@ impl Visitor for BytecodeBuildingVisitor {
             self.builder.emit(Bytecode::Pop(1));
 
             this.upper_mut().accept(self);
-            self.builder.emit_j(Condition::GreaterOrEqual, &mut hit);
+            self.builder.emit_j(Condition::Greater, &mut hit);
             self.builder.emit(Bytecode::Ge);
             let mut miss = Label::new();
             self.builder.emit_j(Condition::Always, &mut miss);
@@ -1022,7 +1022,7 @@ impl Visitor for BytecodeBuildingVisitor {
             self.builder.emit(Bytecode::Pop(1));
 
             this.upper_mut().accept(self);
-            self.builder.emit_j(Condition::GreaterOrEqual, &mut miss);
+            self.builder.emit_j(Condition::Greater, &mut miss);
             self.builder.emit(Bytecode::Lt);
             let mut hit = Label::new();
             self.builder.emit_j(Condition::Always, &mut hit);

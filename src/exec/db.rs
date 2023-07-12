@@ -1,5 +1,6 @@
 use std::cell::RefMut;
 use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::RandomState;
 use std::default::Default;
 use std::io::Write;
 use std::iter;
@@ -7,7 +8,8 @@ use std::mem::{replace, size_of};
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 
 use rusty_pool::ThreadPool;
 
@@ -37,7 +39,7 @@ pub struct DB {
     snapshot: RwLock<Arc<dyn storage::Snapshot>>,
     default_column_family: Arc<dyn ColumnFamily>,
     //tables: Mutex<HashMap<String, Box>>
-    tables_handle: RwLock<HashMap<String, TableRef>>,
+    tables_handle: Arc<RwLock<HashMap<String, TableRef>>>,
 
     next_table_id: AtomicU64,
     next_index_id: AtomicU64,
@@ -89,6 +91,21 @@ impl DB {
         0x80, // split
         0x02, 0x00, 0x00, 0x00 // key id = 2
     ];
+    pub const ESTIMATE_ROWS_COUNT_KEY: &'static [u8] = &[
+        0xff, 0xff, 0xff, 0xff, // index id tag
+        0x80, // split
+        0x03, 0x00, 0x00, 0x00 // key id = 3
+    ];
+    pub const ACCUMULATIVE_INCREMENTAL_ROWS_KEY: &'static [u8] = &[
+        0xff, 0xff, 0xff, 0xff, // index id tag
+        0x80, // split
+        0x04, 0x00, 0x00, 0x00 // key id = 4
+    ];
+    pub const INDICES_CARDINALITY_KEY: &'static [u8] = &[
+        0xff, 0xff, 0xff, 0xff, // index id tag
+        0x80, // split
+        0x05, 0x00, 0x00, 0x00 // key id = 5
+    ]; // Cardinality
 
     pub fn open(dir: String, name: String) -> Result<Arc<Self>> {
         let options = Options::with()
@@ -118,7 +135,7 @@ impl DB {
                 next_conn_id: AtomicU64::new(0),
                 next_table_id: AtomicU64::new(0),
                 next_index_id: AtomicU64::new(1), // 0 = primary key
-                tables_handle: RwLock::default(),
+                tables_handle: Arc::new(RwLock::default()),
                 connections: Mutex::default(),
                 worker_pool: rusty_pool::Builder::new()
                     .core_size(num_cpus::get())
@@ -235,10 +252,11 @@ impl DB {
         let table_name = table.name.clone();
         let anonymous_row_key_counter = self.load_number(&cf, Self::ANONYMOUS_ROW_KEY_KEY, 0)?;
         let auto_increment_counter = self.load_number(&cf, Self::AUTO_INCREMENT_KEY, 0)?;
+        let estimate_rows_count = self.load_number(&cf, Self::ESTIMATE_ROWS_COUNT_KEY, 0)?;
+        let accumulative_incremental_rows = self.load_number(&cf, Self::ACCUMULATIVE_INCREMENTAL_ROWS_KEY, 0)?;
 
-        let table_handle = TableHandle::new(cf,
-                                            anonymous_row_key_counter,
-                                            auto_increment_counter,
+        let table_handle = TableHandle::new(cf, anonymous_row_key_counter, auto_increment_counter,
+                                            estimate_rows_count, accumulative_incremental_rows,
                                             table);
 
         let mut locking = self.tables_handle.write().unwrap();
@@ -330,6 +348,8 @@ impl DB {
                 let table_handle = TableHandle::new(column_family,
                                                     0,
                                                     0,
+                                                    0,
+                                                    0,
                                                     table_metadata);
                 self.locks.install(table_handle.metadata.id);
                 tables.insert(table_name, Arc::new(table_handle));
@@ -386,6 +406,22 @@ impl DB {
                 wr_opts.sync = true;
                 self.storage.insert(&wr_opts, &self.default_column_family,
                                     col_name.as_bytes(), yaml.as_bytes())
+            }
+        }
+    }
+
+    fn write_table_indices_cardinality(storage: &Arc<dyn storage::DB>,
+                                       cf: &Arc<dyn storage::ColumnFamily>,
+                                       cardinality: HashMap<u64, u64>) -> Result<()> {
+        match serde_yaml::to_string(&cardinality) {
+            Err(e) => {
+                let message = format!("Yaml serialize fail: {}", e.to_string());
+                Err(Status::corrupted(message))
+            }
+            Ok(yaml) => {
+                let mut wr_opts = WriteOptions::default();
+                wr_opts.sync = true;
+                storage.insert(&wr_opts, cf, Self::INDICES_CARDINALITY_KEY, yaml.as_bytes())
             }
         }
     }
@@ -696,12 +732,13 @@ impl DB {
     pub fn delete_rows(&self, tables: &[TableRef], mut row_producer: ArenaBox<dyn PhysicalPlanOps>, region: &ArenaMut<Arena>) -> Result<u64> {
         debug_assert!(tables.len() >= 1);
         let mut cols = ColumnsAuxResolver::new(region);
+        let mut affected_rows = ArenaVec::with_init(region, |x| { 0u64 }, tables.len());
 
         self.update_snapshot();
         row_producer.prepare()?;
         let mut zone = Arena::new_ref();
         let mut feedback = FeedbackImpl::new(true);
-        let mut affected_rows = 0;
+        //let mut affected_rows = 0;
         loop {
             zone_limit_guard!(zone, 1);
 
@@ -711,16 +748,22 @@ impl DB {
             }
             if rs.is_none() {
                 self.update_snapshot();
-                break Ok(affected_rows);
+                let mut total_affected_rows = 0;
+                for i in 0..tables.len() {
+                    total_affected_rows += affected_rows[i];
+                    self.record_incremental_rows(&tables[i], -(affected_rows[i] as isize))?;
+                }
+                break Ok(total_affected_rows);
             }
             let tuple = rs.unwrap();
             cols.attach(&tuple);
 
             let row_key = tuple.row_key();
             let arena = zone.get_mut();
-            for table in tables {
+            for i in 0..tables.len() {
+                let table = &tables[i];
                 self.delete_row_impl(table, &cols, &tuple, &arena)?;
-                affected_rows += 1;
+                affected_rows[i] += 1;
             }
         }
     }
@@ -771,6 +814,79 @@ impl DB {
 
         let _locking = lock_group.exclusive_lock_all();
         self.storage.write(&self.wr_opts, updates)
+    }
+
+    pub fn record_incremental_rows(&self, table: &TableRef, incremental_val: isize) -> Result<()> {
+        let (total, acc, gradient) = table.add_rows_count(incremental_val);
+        if gradient < 0.1 {
+            return Ok(());
+        }
+
+        let mut updates = WriteBatch::new();
+        updates.insert(&table.column_family,
+                       Self::ESTIMATE_ROWS_COUNT_KEY, &total.to_le_bytes());
+
+        if table.mark_estimate_cardinality_pending() {
+            updates.insert(&table.column_family, Self::ACCUMULATIVE_INCREMENTAL_ROWS_KEY, &0u64.to_le_bytes());
+            let table_box = table.clone();
+            let tables = self.tables_handle.clone();
+            let db = self.storage.clone();
+            let snapshot = self.get_snapshot();
+            self.worker_pool.execute(move || {
+                let name = table_box.name().clone();
+                let _ = Self::estimate_indices_cardinality_impl(db, snapshot,table_box);
+                let mut locking = tables.write().unwrap();
+                match locking.get_mut(&name) {
+                    Some(table) => {
+                        table.mark_estimate_cardinality_done();
+                    }
+                    None => ()
+                }
+            });
+        } else {
+            updates.insert(&table.column_family, Self::ACCUMULATIVE_INCREMENTAL_ROWS_KEY, &acc.to_le_bytes());
+        }
+
+        self.storage.write(&self.wr_opts, updates)?;
+        Ok(())
+    }
+
+    fn estimate_indices_cardinality_impl(db: Arc<dyn storage::DB>,
+                                         snapshot: Arc<dyn storage::Snapshot>,
+                                         table: TableRef) -> Result<()> {
+        let rd_opts = ReadOptions::with()
+            .snapshot(snapshot)
+            .build();
+
+        let mut indices = HashMap::new();
+        for idx in &table.metadata.secondary_indices {
+            indices.insert(idx.id, 0); // initialized zero value.
+
+            let mut cardinality: HyperLogLogPlus<[u8], _> =
+                HyperLogLogPlus::new(16, RandomState::new()).unwrap();
+
+            let iter_box = db.new_iterator(&rd_opts, &table.column_family)?;
+            let mut iter = iter_box.borrow_mut();
+            let key_prefix = (idx.id as u32).to_be_bytes();
+            iter.seek(&key_prefix);
+            let mut c = 0;
+            while iter.valid() && iter.key().starts_with(&key_prefix) {
+                let index = DB::decode_index_from_secondary_index(iter.key(), iter.value());
+                cardinality.insert(index);
+                iter.move_next();
+                c += 1;
+            }
+
+            if iter.status().is_not_ok() && !iter.status().is_not_found() {
+                Err(iter.status().clone())?;
+            }
+            dbg!(&c);
+            indices.insert(idx.id, cardinality.count().trunc() as u64);
+        }
+        dbg!(&indices);
+        Self::write_table_indices_cardinality(&db, &table.column_family, indices)?;
+
+        Ok(())
     }
 
     pub fn update_rows(&self, tables: &HashMap<ArenaStr, TableRef>,
@@ -987,7 +1103,6 @@ impl DB {
                                              tuple: &Tuple,
                                              origin: &Tuple,
                                              arena: &ArenaMut<Arena>) -> ArenaVec<InternalSecondaryIndexDesc<'a>> {
-
         let mut desc = arena_vec!(arena);
         if force {
             for idx in &table.metadata.secondary_indices {
@@ -1017,7 +1132,6 @@ impl DB {
                 Self::encode_full_secondary_index(tuple, table.id(), *idx, &mut item.new);
                 desc.push(item);
             }
-
         }
         desc
     }
@@ -1531,12 +1645,18 @@ pub struct TableHandle {
     // [col_id -> 2rd_idx_index]
     pub mutex: Arc<Mutex<u64>>,
     pub metadata: Arc<TableMetadata>,
+
+    estimate_rows_count: AtomicU64,
+    estimate_rows_cardinality_pending: AtomicBool,
+    accumulative_incremental_rows: AtomicU64,
 }
 
 impl TableHandle {
     fn new(column_family: Arc<dyn ColumnFamily>,
            anonymous_row_key_counter: u64,
            auto_increment_counter: u64,
+           estimate_rows_count: u64,
+           accumulative_incremental_rows: u64,
            metadata: TableMetadata) -> Self {
         Self {
             column_family,
@@ -1548,6 +1668,10 @@ impl TableHandle {
             secondary_indices_by_id: Default::default(),
             column_in_indices_by_id: Default::default(),
             mutex: Arc::new(Mutex::new(0)),
+
+            estimate_rows_count: AtomicU64::new(estimate_rows_count),
+            estimate_rows_cardinality_pending: AtomicBool::new(false),
+            accumulative_incremental_rows: AtomicU64::new(accumulative_incremental_rows),
             metadata: Arc::new(metadata),
         }.prepare()
     }
@@ -1563,6 +1687,10 @@ impl TableHandle {
             secondary_indices_by_id: Default::default(),
             column_in_indices_by_id: Default::default(),
             mutex: self.mutex.clone(),
+
+            estimate_rows_count: AtomicU64::new(self.estimate_rows_count.load(Ordering::Relaxed)),
+            estimate_rows_cardinality_pending: AtomicBool::new(self.estimate_rows_cardinality_pending.load(Ordering::Relaxed)),
+            accumulative_incremental_rows: AtomicU64::new(self.accumulative_incremental_rows.load(Ordering::Relaxed)),
             metadata: Arc::new(metadata),
         }.prepare()
     }
@@ -1652,7 +1780,7 @@ impl TableHandle {
 
     pub fn get_index_by_id(&self, id: u64) -> Option<IndexRefsBundle> {
         if DB::is_primary_key(id) {
-            Some(IndexRefsBundle{
+            Some(IndexRefsBundle {
                 id: 0,
                 name: "<pk>".to_string(),
                 key_parts: self.metadata.primary_keys.iter().map(|x| {
@@ -1665,7 +1793,7 @@ impl TableHandle {
             match self.secondary_indices_by_id.get(&id) {
                 Some(index) => {
                     let idx = &self.metadata.secondary_indices[*index];
-                    Some(IndexRefsBundle{
+                    Some(IndexRefsBundle {
                         id: idx.id,
                         name: idx.name.clone(),
                         key_parts: idx.key_parts.iter().map(|x| {
@@ -1678,6 +1806,36 @@ impl TableHandle {
                 None => None
             }
         }
+    }
+
+    pub fn add_rows_count(&self, count: isize) -> (u64, u64, f32) {
+        let incremental_val = count.abs() as u64;
+        let total = if count > 0 {
+            self.estimate_rows_count.fetch_add(incremental_val, Ordering::AcqRel) + incremental_val
+        } else {
+            self.estimate_rows_count.fetch_sub(incremental_val, Ordering::AcqRel) - incremental_val
+        };
+        let acc = self.accumulative_incremental_rows.fetch_add(incremental_val, Ordering::AcqRel) + incremental_val;
+        (total, acc, acc as f32 / total as f32)
+    }
+
+    pub fn mark_estimate_cardinality_pending(&self) -> bool {
+        let rs = self.estimate_rows_cardinality_pending.compare_exchange(false, true,
+                                                                         Ordering::Acquire,
+                                                                         Ordering::Relaxed);
+        if rs.is_ok() {
+            self.accumulative_incremental_rows.store(0, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn mark_estimate_cardinality_done(&self) {
+        let rs = self.estimate_rows_cardinality_pending.compare_exchange(true, false,
+                                                                         Ordering::Acquire,
+                                                                         Ordering::Relaxed);
+        assert!(rs.is_ok());
     }
 }
 
@@ -1793,6 +1951,8 @@ pub struct SecondaryIndexMetadata {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::hash_map::RandomState;
+    use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
     use crate::ArenaVec;
     use crate::base::Arena;
     use crate::storage::JunkFilesCleaner;
@@ -1813,6 +1973,19 @@ mod tests {
         assert_eq!("__table__1", cf.name());
         assert_eq!("a", tb.name);
         Ok(())
+    }
+
+    #[test]
+    fn hyperloglog_sanity() {
+        let mut hllp: HyperLogLogPlus<[u8], _> =
+            HyperLogLogPlus::new(16, RandomState::new()).unwrap();
+
+        hllp.insert("hello".as_bytes());
+        hllp.insert("hello".as_bytes());
+        hllp.insert("world".as_bytes());
+        hllp.insert("demo".as_bytes());
+
+        assert_eq!(3, hllp.count().trunc() as u64);
     }
 
     #[test]
@@ -2038,18 +2211,21 @@ mod tests {
         let conn = db.connect();
         let sql = " create table t1 {\n\
                 a int primary key auto_increment,\n\
-                b char(9)\n\
+                b char(9),\n\
+                c int not null\n\
+                index idx_c(c)\n\
             };\n\
             ";
         conn.execute_str(sql, &arena.get_mut())?;
 
-        let sql = "insert into table t1(a,b) values (?, ?)";
+        let sql = "insert into table t1(a, b, c) values (?, ?, ?)";
         let mut stmt = conn.prepare_str(sql, &arena.get_mut())?.first().cloned().unwrap();
 
         let jiffies = db.env.current_time_mills();
         for i in 0..N {
             stmt.bind_i64(0, i as i64);
             stmt.bind_null(1);
+            stmt.bind_i64(2, ((i + 1) * 100) as i64);
             conn.execute_prepared_statement(&mut stmt)?;
         }
         let cost = (db.env.current_time_mills() - jiffies) as f32 / 1000f32;

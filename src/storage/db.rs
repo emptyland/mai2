@@ -42,7 +42,7 @@ pub struct DBImpl {
     options: Options,
     env: Arc<dyn Env>,
     pub logger: Arc<dyn Logger>,
-    versions: Arc<Mutex<VersionSet>>,
+    pub versions: Arc<Mutex<VersionSet>>,
     table_cache: TableCache,
     default_column_family: Option<Arc<dyn ColumnFamily>>,
     redo_log: Cell<Option<WALDescriptor>>,
