@@ -266,6 +266,7 @@ impl<'a> MergingIterator<'a> {
         for i in 0..self.children.len() {
             let iter = &self.children[i];
             if iter.valid {
+                //dbg!(iter.key());
                 match smallest.as_ref() {
                     Some(prev_idx) => {
                         let prev = &self.children[*prev_idx];

@@ -841,16 +841,13 @@ impl DBImpl {
         Ok(())
     }
 
-    fn new_internal_iterator(&self, options: &ReadOptions, cfi: &Arc<ColumnFamilyImpl>, _locking: &MutexGuard<VersionSet>)
-                             -> Result<IteratorRc> {
-        let mut iters = Vec::<IteratorRc>::new();
-        iters.push(Rc::new(RefCell::new(MemoryTable::iter(cfi.mutable().clone()))));
+    fn new_internal_iterator(&self, options: &ReadOptions, get: &Get, cfi: &ColumnFamilyImpl) -> Result<IteratorRc> {
+        let mut iters: Vec<IteratorRc> = get.memory_tables.iter().map(|x| {
+            let iter: IteratorRc = Rc::new(RefCell::new(MemoryTable::iter(x.clone())));
+            iter
+        }).collect();
 
-        for table in cfi.immutable_pipeline.peek_all() {
-            iters.push(Rc::new(RefCell::new(MemoryTable::iter(table))));
-        }
-
-        from_io_result(cfi.get_levels_iters(options, &self.table_cache, &mut iters))?;
+        from_io_result(cfi.get_levels_iters(&get.version, options, &self.table_cache, &mut iters))?;
 
         // No need register cleanup:
         // Memory table's iterator can cleanup itself reference count.
@@ -1020,15 +1017,11 @@ impl DB for DBImpl {
         let get = self.prepare_for_get(options, column_family)?;
         let cfi = ColumnFamilyImpl::from(column_family);
 
-        let mutex = self.versions.clone();
-        let locking = mutex.lock().unwrap();
-        //--------------------------lock version-set------------------------------------------------
-        let internal_iter = self.new_internal_iterator(options, &cfi, &locking)?;
+        let internal_iter = self.new_internal_iterator(options, &get, &cfi)?;
         let iter = DBIterator::new(&cfi.internal_key_cmp.user_cmp,
                                    internal_iter,
                                    get.last_sequence_number);
         Ok(Arc::new(RefCell::new(iter)))
-        //--------------------------unlock version-set----------------------------------------------
     }
 
     fn get_snapshot(&self) -> Arc<dyn Snapshot> {
@@ -1459,6 +1452,59 @@ mod tests {
             assert_eq!('c', v.value()[0] as char);
             assert_eq!('c', v.value()[3] as char);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn db_iter_issue_0() -> Result<()> {
+        let junk = JunkFilesCleaner::new("tests/db11");
+        let db = open_test_db(&junk.ensure().name)?;
+        let cf = db.default_column_family();
+        let wr_opts = WriteOptions::default();
+
+        let mut n = 0u32;
+        for i in 0..10 {
+            let mut pk = vec![];
+            pk.write(&0u32.to_be_bytes()).unwrap();
+            pk.write(&n.to_be_bytes()).unwrap();
+            db.insert(&wr_opts, &cf, &pk, "ok".as_bytes())?;
+
+            let mut key = vec![];
+            key.write(&2u32.to_be_bytes()).unwrap();
+            key.write(&pk).unwrap();
+            db.insert(&wr_opts, &cf, &key, &(pk.len() as u32).to_le_bytes())?;
+
+            n += 1;
+        }
+
+        db._test_force_dump_immutable_table(&cf, true)?;
+
+        for i in 0..10 {
+            let mut pk = vec![];
+            pk.write(&0u32.to_be_bytes()).unwrap();
+            pk.write(&n.to_be_bytes()).unwrap();
+            db.insert(&wr_opts, &cf, &pk, "ok".as_bytes())?;
+
+            let mut key = vec![];
+            key.write(&2u32.to_be_bytes()).unwrap();
+            key.write(&pk).unwrap();
+            db.insert(&wr_opts, &cf, &key, &(pk.len() as u32).to_le_bytes())?;
+
+            n += 1;
+        }
+
+        let rd_opts = ReadOptions::default();
+        let iter_box = db.new_iterator(&rd_opts, &cf)?;
+        let mut iter = iter_box.borrow_mut();
+        let key_prefix = 2u32.to_be_bytes();
+        iter.seek(&key_prefix);
+
+        let mut i = 0;
+        while iter.valid() && iter.key().starts_with(&key_prefix) {
+            i += 1;
+            iter.move_next();
+        }
+        assert_eq!(i, n);
         Ok(())
     }
 

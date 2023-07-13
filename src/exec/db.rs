@@ -854,9 +854,10 @@ impl DB {
     fn estimate_indices_cardinality_impl(db: Arc<dyn storage::DB>,
                                          snapshot: Arc<dyn storage::Snapshot>,
                                          table: TableRef) -> Result<()> {
-        let rd_opts = ReadOptions::with()
-            .snapshot(snapshot)
-            .build();
+        // let rd_opts = ReadOptions::with()
+        //     .snapshot(snapshot)
+        //     .build();
+        let rd_opts = ReadOptions::default();
 
         let mut indices = HashMap::new();
         for idx in &table.metadata.secondary_indices {
@@ -876,14 +877,15 @@ impl DB {
                 iter.move_next();
                 c += 1;
             }
+            //dbg!(&iter.status());
 
             if iter.status().is_not_ok() && !iter.status().is_not_found() {
                 Err(iter.status().clone())?;
             }
-            dbg!(&c);
+            //dbg!(&c);
             indices.insert(idx.id, cardinality.count().trunc() as u64);
         }
-        dbg!(&indices);
+        //dbg!(&indices);
         Self::write_table_indices_cardinality(&db, &table.column_family, indices)?;
 
         Ok(())
@@ -2231,6 +2233,20 @@ mod tests {
         let cost = (db.env.current_time_mills() - jiffies) as f32 / 1000f32;
         println!("qps: {}", N as f32 / cost);
 
+        let rd_opts = ReadOptions::default();
+        let table = db._test_get_table_ref("t1").unwrap().clone();
+        let iter_box = db.storage.new_iterator(&rd_opts, &table.column_family)?;
+        let mut iter = iter_box.borrow_mut();
+
+        let key_prefix = 2u32.to_be_bytes();
+        iter.seek(&key_prefix);
+        assert!(iter.valid());
+        let mut i = 0;
+        while iter.valid() && iter.key().starts_with(&key_prefix) {
+            i += 1;
+            iter.move_next();
+        }
+        assert_eq!(N, i);
         Ok(())
     }
 

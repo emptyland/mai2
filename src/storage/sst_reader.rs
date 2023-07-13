@@ -330,6 +330,7 @@ impl iterator::Iterator for IteratorImpl {
         if !self.block_iter().valid() {
             self.status = Status::NotFound;
         }
+        self.block_iter_mut().seek(key);
         self.save_key_if_needed();
     }
 

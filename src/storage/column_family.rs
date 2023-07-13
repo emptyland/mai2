@@ -194,10 +194,10 @@ impl ColumnFamilyImpl {
         }))
     }
 
-    pub fn get_levels_iters(&self, options: &ReadOptions, table_cache: &TableCache,
+    pub fn get_levels_iters(&self, version: &Version, options: &ReadOptions, table_cache: &TableCache,
                             receiver: &mut Vec<IteratorRc>) -> io::Result<()> {
         for i in 0..config::MAX_LEVEL {
-            for file in self.current().level_files(i) {
+            for file in version.level_files(i) {
                 let rd = table_cache.get_reader(self, file.number)?;
                 let iter = SSTReader::iter(&rd, options, &self.internal_key_cmp);
                 receiver.push(Rc::new(RefCell::new(iter)));
