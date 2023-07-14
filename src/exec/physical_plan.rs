@@ -44,6 +44,7 @@ pub struct RowsGettingOps {
 
     storage: Option<Arc<dyn storage::DB>>,
     snapshot: Option<Arc<dyn storage::Snapshot>>,
+    iter: Option<IteratorArc>,
     cf: Option<Arc<dyn ColumnFamily>>,
 }
 
@@ -61,6 +62,7 @@ impl RowsGettingOps {
             current: 0,
             storage: Some(storage),
             snapshot: Some(snapshot),
+            iter: None,
             cf: Some(cf),
         }
     }
@@ -91,18 +93,53 @@ impl RowsGettingOps {
 
         Ok(tuple)
     }
+
+    fn next_key(&mut self, incremental: usize) -> Result<()> {
+        self.current += incremental;
+        if self.current >= self.keys.len() {
+            return Ok(());
+        }
+
+        let storage = self.storage.as_ref().unwrap();
+        let cf = self.cf.as_ref().unwrap();
+        let snapshot = self.snapshot.as_ref().unwrap();
+
+        let key = &self.keys[self.current];
+        let key_id = DB::decode_idx_id(key);
+        if !DB::is_primary_key(key_id) {
+            let mut iter = self.iter.as_ref().unwrap().borrow_mut();
+            iter.seek(&key);
+            if iter.status().is_not_ok() && !iter.status().is_not_found() {
+                Err(iter.status().clone())?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl PhysicalPlanOps for RowsGettingOps {
     fn prepare(&mut self) -> Result<ArenaBox<ColumnSet>> {
-        self.current = 0;
+        let storage = self.storage.as_ref().unwrap();
+        let cf = self.cf.as_ref().unwrap();
+        let snapshot = self.snapshot.as_ref().unwrap();
 
+        let rd_opts = ReadOptions::with()
+            .snapshot(snapshot.clone())
+            .build();
+        let iter = storage.new_iterator(&rd_opts, &cf)?;
+        iter.borrow_mut().seek_to_first();
+
+        self.current = 0;
+        self.iter = Some(iter);
+
+        self.next_key(0)?;
         Ok(self.projected_columns.clone())
     }
 
     fn finalize(&mut self) {
         self.storage = None;
         self.snapshot = None;
+        self.iter = None;
         self.cf = None;
     }
 
@@ -112,44 +149,69 @@ impl PhysicalPlanOps for RowsGettingOps {
         }
         let arena = zone.get_mut();
 
-        let storage = self.storage.as_ref().unwrap();
+        let storage = self.storage.clone().unwrap();
         let snapshot = self.snapshot.as_ref().unwrap();
-        let cf = self.cf.as_ref().unwrap();
+        let cf = self.cf.clone().unwrap();
 
-        let key = &self.keys[self.current];
-        let key_id = DB::decode_idx_id(key);
-
-        let rs;
         let rd_opts = ReadOptions::with()
             .snapshot(snapshot.clone())
             .build();
-        if !DB::is_primary_key(key_id) {
-            match storage.get_pinnable(&rd_opts, cf, key) {
-                Ok(value) =>
-                    rs = self.get_row_by_pk(storage, cf, &rd_opts, &value, &arena),
-                Err(e) => {
-                    if !e.is_not_found() {
-                        feedback.catch_error(e);
-                    }
-                    return None;
-                }
-            }
-        } else {
-            rs = self.get_row_by_pk(storage, cf, &rd_opts, &key, &arena);
-        }
 
-        let rv = match rs {
+        let mut row_key = arena_vec!(&arena);
+        let rs = loop {
+            row_key.clear();
+
+            if self.current >= self.keys.len() {
+                break Err(Status::NotFound);
+            }
+            let key = &self.keys[self.current];
+            let key_id = DB::decode_idx_id(key);
+
+            if !DB::is_primary_key(key_id) {
+                let iter_box = self.iter.clone().unwrap();
+                let mut iter = iter_box.borrow_mut();
+                if !iter.valid() {
+                    if let Err(s) = self.next_key(1) {
+                        feedback.catch_error(s.clone());
+                        break Err(s);
+                    }
+                    continue;
+                }
+
+                let pk = DB::decode_row_key_from_secondary_index(iter.key(), iter.value());
+                let rs = self.get_row_by_pk(&storage, &cf, &rd_opts, &key, &arena);
+                if rs.is_ok() && feedback.need_row_key() {
+                    row_key.write(&pk).unwrap();
+                }
+                iter.move_next();
+                break rs;
+            } else {
+                let rs = self.get_row_by_pk(&storage, &cf, &rd_opts, &key, &arena);
+                if rs.is_ok() && feedback.need_row_key() {
+                    row_key.write(&key).unwrap();
+                }
+                if let Err(s) = self.next_key(1) {
+                    feedback.catch_error(s.clone());
+                    break Err(s);
+                }
+                break rs;
+            }
+        };
+
+        match rs {
             Err(e) => {
                 if !e.is_not_found() {
                     feedback.catch_error(e);
                 }
                 None
             }
-            Ok(tuple) => Some(tuple)
-        };
-
-        self.current += 1;
-        rv
+            Ok(mut tuple) => {
+                if feedback.need_row_key() {
+                    tuple.attach_row_key(row_key);
+                }
+                Some(tuple)
+            }
+        }
     }
 
     fn children(&self) -> ArenaVec<ArenaBox<dyn PhysicalPlanOps>> {

@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-use std::mem::replace;
+use std::mem::{replace, swap};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -278,7 +278,45 @@ impl PlanMaker {
     fn make_physical_ops_by_set(&self, set: &SelectionSet, table: &TableRef, columns: &ArenaBox<ColumnSet>,
                                 limit: Option<u64>, offset: Option<u64>,
                                 receiver: &mut ArenaVec<ArenaBox<dyn PhysicalPlanOps>>) -> Result<()> {
-        for range in set.segments.iter() {
+        // let has_points = set.segments.iter().filter(|x| {x.is_point()}).count() > 0;
+        //
+        // if has_points {
+        //     for range in set.segments.iter().filter(|x| {x.is_point()}) {
+        //
+        //     }
+        // }
+        let mut points = arena_vec!(&self.arena);
+        let mut ranges = arena_vec!(&self.arena);
+        set.segments.iter().for_each(|x| {
+            if x.is_point() {
+                points.push(x);
+            } else {
+                ranges.push(x);
+            }
+        });
+
+        if !points.is_empty() {
+            let mut keys = arena_vec!(&self.arena);
+
+            for point in &points {
+                let mut key = arena_vec!(&self.arena);
+                DB::encode_idx_id(set.key_id, &mut key);
+                if DB::is_primary_key(set.key_id) {
+                    DB::encode_row_key(&point.min, &set.ty, &mut key)?;
+                } else {
+                    DB::encode_secondary_index(&point.min, &set.ty, &mut key);
+                }
+                keys.push(key);
+            }
+
+            let ops = RowsGettingOps::new(columns.clone(), keys, self.arena.clone(),
+                                          self.db.storage.clone(), self.db.get_snapshot(),
+                                          table.column_family.clone());
+            receiver.push(ArenaBox::new(ops, self.arena.get_mut()).into())
+        }
+
+
+        for range in ranges.iter() {
             let mut begin_key = ArenaVec::new(&self.arena);
             DB::encode_idx_id(set.key_id, &mut begin_key);
 
@@ -289,17 +327,12 @@ impl PlanMaker {
                 DB::encode_idx_id(set.key_id, &mut end_key);
             }
 
-            if set.key_id == 0 { // is primary key
-                let col_id = table.metadata.primary_keys[set.part_of];
-                let col = table.get_col_by_id(col_id).unwrap();
-                DB::encode_row_key(&range.min, &col.ty, &mut begin_key)?;
-                DB::encode_row_key(&range.max, &col.ty, &mut end_key)?;
+            if DB::is_primary_key(set.key_id) { // is primary key
+                DB::encode_row_key(&range.min, &set.ty, &mut begin_key)?;
+                DB::encode_row_key(&range.max, &set.ty, &mut end_key)?;
             } else {
-                let key = table.get_2rd_idx_by_id(set.key_id).unwrap();
-                let col_id = key.key_parts[set.part_of];
-                let col = table.get_col_by_id(col_id).unwrap();
-                DB::encode_secondary_index(&range.min, &col.ty, &mut begin_key);
-                DB::encode_secondary_index(&range.max, &col.ty, &mut end_key);
+                DB::encode_secondary_index(&range.min, &set.ty, &mut begin_key);
+                DB::encode_secondary_index(&range.max, &set.ty, &mut end_key);
             }
 
             let ops = RangeScanningOps::new(columns.clone(),
@@ -883,6 +916,7 @@ struct SelectionSet {
     key_id: u64,
     part_of: usize,
     total: usize,
+    ty: ColumnType,
     segments: ArenaVec<SelectionRange>,
 }
 
@@ -1012,6 +1046,8 @@ impl SelectionRange {
     fn is_inf(&self) -> bool {
         matches!(self.min, Value::NegativeInf) && matches!(self.max, Value::PositiveInf)
     }
+
+    fn is_point(&self) -> bool { self.min == self.max && self.left_close && self.right_close }
 
     // (-∞, 1) ∩ [1, +∞) => Ø
     // (-∞, 1] ∩ [1, +∞) => [1, 1]
@@ -1168,6 +1204,16 @@ impl<T> GenericAnalyzedVal<T> {
         }
     }
 
+    fn part_of_key(&self) -> Option<(u64, usize)> {
+        match self {
+            Self::PrimaryKey => Some((0, 0)),
+            Self::Index(key_id) => Some((*key_id, 0)),
+            Self::PartOfPrimaryKey(order) => Some((0, *order)),
+            Self::PartOfIndex(key_id, order) => Some((*key_id, *order)),
+            _ => None
+        }
+    }
+
     fn is_constant(&self) -> bool {
         match self {
             Self::Integral(_) | Self::Floating(_) | Self::String(_) => true,
@@ -1282,26 +1328,9 @@ impl PhysicalSelectionAnalyzer {
             self.table.get_col_by_id(col_id).unwrap()
         };
 
-        let boundary = if col.ty.is_integral() {
-            let rs = Self::require_i64(&constant);
-            if rs.is_none() {
-                return None;
-            }
-            Value::Int(rs.unwrap())
-        } else if col.ty.is_floating() {
-            let rs = Self::require_f64(&constant);
-            if rs.is_none() {
-                return None;
-            }
-            Value::Float(rs.unwrap())
-        } else if col.ty.is_string() {
-            let rs = Self::require_str(&constant);
-            if rs.is_none() {
-                return None;
-            }
-            Value::Str(rs.unwrap())
-        } else {
-            unreachable!()
+        let boundary = match Self::require_val(&constant, &col.ty) {
+            Some(val) => val,
+            None => return None
         };
 
         let segments = match op {
@@ -1336,6 +1365,7 @@ impl PhysicalSelectionAnalyzer {
             key_id,
             part_of: order.map_or(0, |x| { x }),
             total: 0, // TODO:
+            ty: col.ty.clone(),
             segments,
         })
     }
@@ -1352,6 +1382,18 @@ impl PhysicalSelectionAnalyzer {
             rv.push(val);
         }
         Ok((rv, all_constant))
+    }
+
+    fn require_val(constant: &AnalyzedVal, ty: &ColumnType) -> Option<Value> {
+        if ty.is_integral() {
+            Self::require_i64(&constant).map_or(None, |x| { Some(x.into()) })
+        } else if ty.is_floating() {
+            Self::require_f64(&constant).map_or(None, |x| { Some(x.into()) })
+        } else if ty.is_string() {
+            Self::require_str(&constant).map_or(None, |x| { Some(x.into()) })
+        } else {
+            unreachable!()
+        }
     }
 
     fn require_i64(val: &AnalyzedVal) -> Option<i64> {
@@ -1563,6 +1605,7 @@ impl Visitor for PhysicalSelectionAnalyzer {
             key_id: 0,
             part_of: 0,
             total: 0,
+            ty: ColumnType::Null,
             segments: arena_vec!(&self.arena),
         };
         let ty = match lhs {
@@ -1572,7 +1615,7 @@ impl Visitor for PhysicalSelectionAnalyzer {
                 ranges.total = 1;
                 let idx = self.table.get_index_by_id(0).unwrap();
                 idx.key_parts[0].ty.clone()
-            },
+            }
             AnalyzedVal::PartOfPrimaryKey(i) => {
                 let idx = self.table.get_index_by_id(0).unwrap();
                 ranges.key_id = 0;
@@ -1596,31 +1639,70 @@ impl Visitor for PhysicalSelectionAnalyzer {
             }
             _ => unreachable!()
         };
+        ranges.ty = ty.clone();
 
-        if ty.is_integral() {
-            for val in &rhs {
-                match Self::require_i64(val) {
-                    Some(n) => ranges.segments.push(SelectionRange::from_point(Value::Int(n))),
-                    None => ()
-                }
-            }
-        } else if ty.is_floating() {
-            for val in &rhs {
-                match Self::require_f64(val) {
-                    Some(n) => ranges.segments.push(SelectionRange::from_point(Value::Float(n))),
-                    None => ()
-                }
-            }
-        } else if ty.is_string() {
-            for val in &rhs {
-                match Self::require_str(val) {
-                    Some(n) => ranges.segments.push(SelectionRange::from_point(Value::Str(n))),
-                    None => ()
-                }
-            }
+        for val in &rhs {
+            let point = Self::require_val(val, &ty).unwrap();
+            ranges.segments.push(SelectionRange::from_point(point));
+        }
+        self.ret(AnalyzedVal::Set(ArenaVec::of(ranges, &self.arena)))
+    }
+
+    fn visit_between_and(&mut self, this: &mut BetweenAnd) {
+        let lhs;
+        match self.analyzer_expr(this.matched_mut().deref_mut()) {
+            Ok(kind) => lhs = kind,
+            Err(_) => return
         }
 
-        self.ret(AnalyzedVal::Set(ArenaVec::of(ranges, &self.arena)))
+        if !lhs.is_key() {
+            self.ret(AnalyzedVal::need_eval(this));
+            return;
+        }
+
+        let lower;
+        match self.analyzer_expr(this.lower_mut().deref_mut()) {
+            Ok(kind) => lower = kind,
+            Err(_) => return
+        }
+        let upper;
+        match self.analyzer_expr(this.upper_mut().deref_mut()) {
+            Ok(kind) => upper = kind,
+            Err(_) => return
+        }
+        if upper.is_null() || lower.is_null() {
+            self.ret(AnalyzedVal::Null);
+            return;
+        }
+        if !upper.is_constant() || !lower.is_constant() {
+            self.ret(AnalyzedVal::need_eval(this));
+            return;
+        }
+
+        let (key_id, part_of) = lhs.part_of_key().unwrap();
+        let index = self.table.get_index_by_id(key_id).unwrap();
+        let col = index.key_parts[part_of];
+        let mut upper = Self::require_val(&upper, &col.ty).unwrap();
+        let mut lower = Self::require_val(&lower, &col.ty).unwrap();
+        if lower > upper {
+            swap(&mut lower, &mut upper);
+        }
+
+        let mut sel = SelectionSet {
+            key_id,
+            part_of,
+            total: index.key_parts.len(),
+            ty: col.ty.clone(),
+            segments: arena_vec!(&self.arena),
+        };
+        if this.not_between {
+            sel.segments.push(SelectionRange::from_negative_infinity_to_max(lower, false));
+            sel.segments.push(SelectionRange::from_min_to_positive_infinity(upper, false));
+        } else {
+            sel.segments.push(SelectionRange::from_min_to_max(lower, upper, true, true));
+        }
+
+        self.ret(AnalyzedVal::Set(ArenaVec::of(sel, &self.arena)));
     }
 
     fn visit_int_literal(&mut self, this: &mut Literal<i64>) {

@@ -4,7 +4,7 @@ use std::ops::{Add, DerefMut, Mul, Sub};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::{Corrupting, Result, Status, try_eval};
+use crate::{Corrupting, Result, Status, switch, try_eval};
 use crate::base::{Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::db::ColumnType;
 use crate::exec::function::{AnyFn, ExecutionContext, new_any_fn, Signature, UDF};
@@ -88,6 +88,30 @@ impl Value {
             Self::Str(s) => Value::Str(ArenaStr::new(s.as_str(), arena.get_mut())),
             _ => self.clone()
         }
+    }
+}
+
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        Self::Int(switch!(value, 1, 0))
+    }
+}
+
+impl From<i64> for Value {
+    fn from(value: i64) -> Self {
+        Self::Int(value)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(value: f64) -> Self {
+        Self::Float(value)
+    }
+}
+
+impl From<ArenaStr> for Value {
+    fn from(value: ArenaStr) -> Self {
+        Self::Str(value)
     }
 }
 
@@ -227,6 +251,23 @@ impl Evaluator {
         }
     }
 
+    pub fn compare_vals(lhs: &Value, rhs: &Value, op: &Operator) -> Value {
+        match lhs {
+            Value::Int(_) =>
+                Self::eval_compare_number(lhs, &Self::require_number(rhs), op),
+            Value::Float(_) =>
+                Self::eval_compare_number(lhs, &Self::require_number(rhs), op),
+            Value::Str(s) => match &rhs {
+                Value::Str(b) =>
+                    Self::eval_compare_op(s, b, op),
+                _ =>
+                    Self::eval_compare_number(&Self::require_number(lhs), rhs, op),
+            }
+            Value::Null => Value::Null,
+            _ => unreachable!()
+        }
+    }
+
     pub fn eval_compare_number(lhs: &Value, rhs: &Value, op: &Operator) -> Value {
         match lhs {
             Value::Int(a) => match rhs {
@@ -248,14 +289,14 @@ impl Evaluator {
 
     pub fn eval_compare_op<T: PartialOrd>(lhs: T, rhs: T, op: &Operator) -> Value {
         match op {
-            Operator::Lt => Value::Int(if lhs < rhs { 1 } else { 0 }),
-            Operator::Le => Value::Int(if lhs <= rhs { 1 } else { 0 }),
-            Operator::Gt => Value::Int(if lhs > rhs { 1 } else { 0 }),
-            Operator::Ge => Value::Int(if lhs >= rhs { 1 } else { 0 }),
-            Operator::Eq => Value::Int(if lhs == rhs { 1 } else { 0 }),
-            Operator::Ne => Value::Int(if lhs != rhs { 1 } else { 0 }),
+            Operator::Lt => lhs < rhs,
+            Operator::Le => lhs <= rhs,
+            Operator::Gt => lhs > rhs,
+            Operator::Ge => lhs >= rhs,
+            Operator::Eq => lhs == rhs,
+            Operator::Ne => lhs != rhs,
             _ => unreachable!()
-        }
+        }.into()
     }
 }
 
@@ -316,7 +357,7 @@ impl Visitor for Evaluator {
             Operator::Not => {
                 let operand = self.evaluate_returning(this.operands_mut()[0].deref_mut());
                 match Self::require_int(&operand) {
-                    Value::Int(n) => self.ret(Value::Int(if n != 0 { 1 } else { 0 })),
+                    Value::Int(n) => self.ret((n != 0).into()),
                     _ => self.ret(operand)
                 }
             }
@@ -327,6 +368,14 @@ impl Visitor for Evaluator {
                     Value::Float(n) => self.ret(Value::Float(-n)),
                     _ => self.ret(operand)
                 }
+            }
+            Operator::IsNull => {
+                let operand = self.evaluate_returning(this.operands_mut()[0].deref_mut());
+                self.ret(operand.is_null().into());
+            }
+            Operator::IsNotNull => {
+                let operand = self.evaluate_returning(this.operands_mut()[0].deref_mut());
+                self.ret((!operand.is_null()).into());
             }
             _ => unreachable!()
         }
@@ -352,13 +401,13 @@ impl Visitor for Evaluator {
                 }
                 match lhs {
                     Value::Int(a) => match rhs {
-                        Value::Int(b) => self.ret(if b == 0 { Value::Null } else { Value::Int(a / b) }),
-                        Value::Float(b) => self.ret(Value::Float((a as f64) / b)),
+                        Value::Int(b) => self.ret(if b == 0 { Value::Null } else { (a / b).into() }),
+                        Value::Float(b) => self.ret(((a as f64) / b).into()),
                         _ => self.ret(rhs)
                     }
                     Value::Float(a) => match rhs {
-                        Value::Int(b) => self.ret(Value::Float(a / b as f64)),
-                        Value::Float(b) => self.ret(Value::Float(a / b)),
+                        Value::Int(b) => self.ret((a / b as f64).into()),
+                        Value::Float(b) => self.ret((a / b).into()),
                         _ => self.ret(rhs)
                     }
                     _ => self.ret(lhs)
@@ -367,20 +416,7 @@ impl Visitor for Evaluator {
             Operator::Lt | Operator::Le | Operator::Gt | Operator::Ge | Operator::Eq | Operator::Ne => {
                 let lhs = try_eval!(self, self.evaluate_returning(this.lhs_mut().deref_mut()));
                 let rhs = try_eval!(self, self.evaluate_returning(this.rhs_mut().deref_mut()));
-                let rv = match &lhs {
-                    Value::Int(_) =>
-                        Self::eval_compare_number(&lhs, &Self::require_number(&rhs), this.op()),
-                    Value::Float(_) =>
-                        Self::eval_compare_number(&lhs, &Self::require_number(&rhs), this.op()),
-                    Value::Str(s) => match &rhs {
-                        Value::Str(b) =>
-                            Self::eval_compare_op(s, b, this.op()),
-                        _ =>
-                            Self::eval_compare_number(&Self::require_number(&lhs), &rhs, this.op()),
-                    }
-                    Value::Null => Value::Null,
-                    _ => unreachable!()
-                };
+                let rv = Self::compare_vals(&lhs, &rhs, this.op());
                 self.ret(rv);
             }
             Operator::And => {
@@ -394,7 +430,7 @@ impl Visitor for Evaluator {
                 }
                 match lhs {
                     Value::Int(a) => match rhs {
-                        Value::Int(b) => self.ret(Value::Int(if a != 0 && b != 0 { 1 } else { 0 })),
+                        Value::Int(b) => self.ret((a != 0 && b != 0).into()),
                         _ => self.ret(rhs)
                     }
                     _ => self.ret(lhs)
@@ -405,7 +441,7 @@ impl Visitor for Evaluator {
                 let rhs = Self::require_int(&self.evaluate_returning(this.rhs_mut().deref_mut()));
                 match lhs {
                     Value::Int(a) => match rhs {
-                        Value::Int(b) => self.ret(Value::Int(if a != 0 || b != 0 { 1 } else { 0 })),
+                        Value::Int(b) => self.ret((a != 0 || b != 0).into()),
                         _ => self.ret(rhs)
                     }
                     _ => self.ret(lhs)
@@ -415,12 +451,31 @@ impl Visitor for Evaluator {
         }
     }
 
-    fn visit_in_literal_set(&mut self, _this: &mut InLiteralSet) {
-        todo!()
+    fn visit_in_literal_set(&mut self, this: &mut InLiteralSet) {
+        let lhs = self.evaluate_returning(this.lhs_mut().deref_mut());
+        for expr in this.set.iter_mut() {
+            let val = self.evaluate_returning(expr.deref_mut());
+            if Self::normalize_to_bool(&Self::compare_vals(&lhs, &val, &Operator::Eq)) {
+                return self.ret((!this.not_in).into());
+            }
+        }
+        self.ret(this.not_in.into());
     }
 
     fn visit_in_relation(&mut self, _this: &mut InRelation) {
         todo!()
+    }
+
+    fn visit_between_and(&mut self, this: &mut BetweenAnd) {
+        let matched = self.evaluate_returning(this.matched_mut().deref_mut());
+        let lower = self.evaluate_returning(this.lower_mut().deref_mut());
+
+        if Evaluator::normalize_to_bool(&Evaluator::compare_vals(&matched, &lower, &Operator::Lt)) {
+            return self.ret(this.not_between.into());
+        }
+        let upper = self.evaluate_returning(this.upper_mut().deref_mut());
+        let b = Evaluator::normalize_to_bool(&Evaluator::compare_vals(&matched, &upper, &Operator::Gt));
+        self.ret( if this.not_between {b} else {!b}.into());
     }
 
     fn visit_call_function(&mut self, this: &mut CallFunction) {
@@ -536,6 +591,7 @@ impl Visitor for TypingReducer {
             Operator::Not => self.ret(ColumnType::Int(11)),
             Operator::Minus => {
                 let ty = match self.reduce_returning(this.operands_mut()[0].deref_mut()) {
+                    ColumnType::Null => ColumnType::Null,
                     ColumnType::Float(m, n) => ColumnType::Float(m, n),
                     ColumnType::Double(m, n) => ColumnType::Double(m, n),
                     ColumnType::TinyInt(n) => ColumnType::Int(n),

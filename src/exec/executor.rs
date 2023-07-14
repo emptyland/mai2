@@ -1365,6 +1365,7 @@ impl Context for MockContent {
 pub struct TypingStubContext {
     prepared_stmt: Option<ArenaBox<PreparedStatement>>,
     cols: ArenaBox<ColumnSet>,
+    null_ty: Value,
     int_ty: Value,
     float_ty: Value,
     str_ty: Value,
@@ -1375,6 +1376,7 @@ impl TypingStubContext {
         Self {
             prepared_stmt,
             cols: cols.clone(),
+            null_ty: Value::Null,
             int_ty: Value::Int(i64::default()),
             float_ty: Value::Float(f64::default()),
             str_ty: Value::Str(ArenaStr::default()),
@@ -1383,6 +1385,7 @@ impl TypingStubContext {
 
     pub fn ty_to_stub_value(&self, ty: &ColumnType) -> &Value {
         match ty {
+            ColumnType::Null => &self.null_ty,
             ColumnType::TinyInt(_)
             | ColumnType::SmallInt(_)
             | ColumnType::Int(_)

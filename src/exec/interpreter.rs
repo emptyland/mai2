@@ -6,7 +6,6 @@ use crate::{Arena, arena_vec, ArenaBox, ArenaMut, ArenaStr, ArenaVec, corrupted_
 use crate::{Result};
 use crate::exec::evaluator::{Context, Evaluator, Value};
 use crate::map::ArenaMap;
-use crate::sql::ast;
 use crate::sql::ast::*;
 use crate::status::Corrupting;
 
@@ -284,34 +283,17 @@ impl Interpreter {
         }
     }
 
-    fn cmp(&mut self, op: ast::Operator) {
+    fn cmp(&mut self, op: Operator) {
         let rhs = self.stack.pop().unwrap();
         let lhs = self.stack.pop().unwrap();
-        let rv = self.test_vals(op, &lhs, &rhs);
+        let rv = Evaluator::compare_vals(&lhs, &rhs, &op);
         self.ret(rv);
     }
 
-    fn test(&mut self, op: ast::Operator) -> bool {
+    fn test(&mut self, op: Operator) -> bool {
         let rhs = &self.stack[self.stack.len() - 1];
         let lhs = &self.stack[self.stack.len() - 2];
-        Evaluator::normalize_to_bool(&self.test_vals(op, lhs, rhs))
-    }
-
-    fn test_vals(&self, op: ast::Operator, lhs: &Value, rhs: &Value) -> Value {
-        match lhs {
-            Value::Int(_) =>
-                Evaluator::eval_compare_number(lhs, &Evaluator::require_number(rhs), &op),
-            Value::Float(_) =>
-                Evaluator::eval_compare_number(lhs, &Evaluator::require_number(rhs), &op),
-            Value::Str(s) => match &rhs {
-                Value::Str(b) =>
-                    Evaluator::eval_compare_op(s, b, &op),
-                _ =>
-                    Evaluator::eval_compare_number(&Evaluator::require_number(lhs), rhs, &op),
-            }
-            Value::Null => Value::Null,
-            _ => unreachable!()
-        }
+        Evaluator::normalize_to_bool(&Evaluator::compare_vals(&lhs, &rhs, &op))
     }
 
     fn ret(&mut self, value: Value) { self.stack.push(value); }

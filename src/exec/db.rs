@@ -1247,6 +1247,7 @@ impl DB {
 
     pub fn encode_row_key<W: Write>(value: &Value, ty: &ColumnType, wr: &mut W) -> Result<usize> {
         let len = match ty {
+            ColumnType::Null => unreachable!(),
             ColumnType::TinyInt(_)
             | ColumnType::SmallInt(_)
             | ColumnType::Int(_)
@@ -1342,6 +1343,7 @@ impl DB {
             return (Value::Null, 1);
         }
         match ty {
+            ColumnType::Null => unreachable!(),
             ColumnType::TinyInt(_)
             | ColumnType::SmallInt(_)
             | ColumnType::Int(_)
@@ -1376,6 +1378,7 @@ impl DB {
             return;
         }
         match ty {
+            ColumnType::Null => unreachable!(),
             ColumnType::TinyInt(_)
             | ColumnType::SmallInt(_)
             | ColumnType::Int(_)
@@ -1426,6 +1429,7 @@ impl DB {
             return;
         }
         match ty {
+            ColumnType::Null => unreachable!(),
             ColumnType::TinyInt(_)
             | ColumnType::SmallInt(_)
             | ColumnType::Int(_)
@@ -1469,6 +1473,7 @@ impl DB {
 
     pub fn encode_column_value<W: Write>(value: &Value, ty: &ColumnType, wr: &mut W) {
         match ty {
+            ColumnType::Null => unreachable!(),
             ColumnType::TinyInt(_)
             | ColumnType::SmallInt(_)
             | ColumnType::Int(_)
@@ -1502,6 +1507,7 @@ impl DB {
 
     pub fn decode_column_value(ty: &ColumnType, value: &[u8], arena: &mut dyn Allocator) -> Value {
         match ty {
+            ColumnType::Null => unreachable!(),
             ColumnType::TinyInt(_)
             | ColumnType::SmallInt(_)
             | ColumnType::Int(_)
@@ -1879,6 +1885,7 @@ pub struct ColumnMetadata {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ColumnType {
+    Null,
     TinyInt(u32),
     SmallInt(u32),
     Int(u32),
