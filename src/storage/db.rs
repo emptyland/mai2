@@ -50,7 +50,6 @@ pub struct DBImpl {
     background_active: AtomicBool,
     shutting_down: AtomicBool,
     total_wal_size: AtomicU64,
-    flush_worker: Cell<Option<WorkerDescriptor>>,
     compaction_worker: Cell<Option<WorkerDescriptor>>,
     pub snapshots: RefCell<SnapshotSet>,
 }
@@ -100,7 +99,6 @@ impl DBImpl {
             default_column_family: None,
             redo_log: Cell::new(None),
             redo_log_number: Cell::new(0),
-            flush_worker: Cell::new(None),
             compaction_worker: Cell::new(None),
             snapshots: RefCell::new(SnapshotSet::new(&logger)),
         };
@@ -146,15 +144,10 @@ impl DBImpl {
 
     fn flush_redo_log(&self, sync: bool, _locking: &MutexGuard<VersionSet>) {
         if let Some(desc) = self.redo_log.take() {
-            let worker = self.flush_worker.take().unwrap();
             if sync {
                 desc.file.borrow_mut().flush().unwrap();
                 desc.file.borrow_mut().sync().unwrap();
-            } else {
-                // worker.tx.send(WorkerCommand::Work(desc.file.clone(),
-                //                                    self.versions.clone())).unwrap();
             }
-            self.flush_worker.set(Some(worker));
             self.redo_log.set(Some(desc));
         }
     }
@@ -415,12 +408,6 @@ impl DBImpl {
                 }));
                 self.redo_log_number.set(new_log_number);
             }
-        }
-
-        if let Some(worker) = self.flush_worker.take() {
-            self.flush_worker.set(Some(worker));
-        } else {
-            self.flush_worker.set(Some(Self::start_flush_worker(self.logger.clone())));
         }
         Ok(())
     }
@@ -1042,12 +1029,6 @@ unsafe impl Sync for DBImpl {}
 impl Drop for DBImpl {
     fn drop(&mut self) {
         self.shutting_down.store(true, Ordering::Release);
-
-        if let Some(worker) = self.flush_worker.take() {
-            worker.tx.send(WorkerCommand::Exit).unwrap();
-            worker.join_handle.join().unwrap();
-            drop(worker.tx);
-        };
 
         if let Some(worker) = self.compaction_worker.take() {
             worker.tx.send(WorkerCommand::Exit).unwrap();
