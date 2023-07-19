@@ -11,7 +11,7 @@ use std::ptr::{addr_of, addr_of_mut, copy_nonoverlapping, NonNull, slice_from_ra
 
 use crate::base::utils::round_up;
 
-const NORMAL_PAGE_SIZE: usize = 16 * 1024;
+const NORMAL_PAGE_SIZE: usize = 4 * 1024;
 const LARGE_PAGE_THRESHOLD_SIZE: usize = NORMAL_PAGE_SIZE / 2;
 
 pub trait Allocator {

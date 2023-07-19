@@ -332,9 +332,10 @@ impl DB {
         }
         let id = table_metadata.id;
 
+
         let column_family = self.storage.new_column_family(
             format!("{}{}", Self::DATA_COL_TABLE_PREFIX, table_metadata.id).as_str(),
-            ColumnFamilyOptions::default())?;
+            ColumnFamilyOptions::with().write_buf_size(120 * MB).build())?;
 
         let mut wr_opts = WriteOptions::default();
         wr_opts.sync = true;

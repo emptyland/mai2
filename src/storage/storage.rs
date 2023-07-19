@@ -48,6 +48,11 @@ impl ColumnFamilyOptionsBuilder {
         self
     }
 
+    pub fn write_buf_size(&mut self, len: usize) -> &mut Self {
+        self.opts.write_buf_size = len;
+        self
+    }
+
     pub fn build(&mut self) -> ColumnFamilyOptions {
         self.opts.clone()
     }
