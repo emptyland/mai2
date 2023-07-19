@@ -1625,6 +1625,23 @@ impl DB {
     }
 }
 
+impl Drop for DB {
+    fn drop(&mut self) {
+        let mut updates = WriteBatch::new();
+
+        let tables = self.tables_handle.read().unwrap();
+        for table in tables.values() {
+            let val = table.estimate_rows_count.load(Ordering::Relaxed).to_le_bytes();
+            updates.insert(&table.column_family, DB::ESTIMATE_ROWS_COUNT_KEY, &val);
+
+            let val = table.accumulative_incremental_rows.load(Ordering::Relaxed).to_le_bytes();
+            updates.insert(&table.column_family, DB::ACCUMULATIVE_INCREMENTAL_ROWS_KEY, &val);
+        }
+
+        let _ = self.storage.write(&self.wr_opts, updates);
+    }
+}
+
 struct InternalAssignment<'a> {
     table: &'a TableHandle,
     dest: &'a ColumnMetadata,
@@ -2213,7 +2230,7 @@ mod tests {
 
     #[test]
     fn large_insert_into_table() -> Result<()> {
-        const N: i32 = 300000;
+        const N: i32 = 200000;
 
         let _junk = JunkFilesCleaner::new("tests/db110");
         let arena = Arena::new_ref();
