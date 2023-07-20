@@ -63,6 +63,17 @@ impl VersionSet {
         })
     }
 
+    pub fn should_migrate_redo_logs(&self, incoming_cf_id: u32) -> bool {
+        let mut n_entries = 0;
+        let cfs = self.column_families.borrow();
+        for cfi in cfs.column_family_impls() {
+            if cfi.id() != incoming_cf_id {
+                n_entries += cfi.mutable().number_of_entries();
+            }
+        }
+        n_entries > 0
+    }
+
     pub fn recover(&mut self, desc: &HashMap<String, ColumnFamilyOptions>, file_number: u64)
                    -> io::Result<BTreeSet<u64>> {
         let manifest_file_path = files::paths::manifest_file(&self.abs_db_path, file_number);

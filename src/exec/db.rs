@@ -2230,7 +2230,7 @@ mod tests {
 
     #[test]
     fn large_insert_into_table() -> Result<()> {
-        const N: i32 = 200000;
+        const N: i32 = 300000;
 
         let _junk = JunkFilesCleaner::new("tests/db110");
         let arena = Arena::new_ref();

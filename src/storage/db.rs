@@ -381,15 +381,40 @@ impl DBImpl {
 
     //fn redo_log_number(&self) -> u64 { self.redo_log.into_inner().as_ref().unwrap().number }
 
-    fn renew_log_file(&self, locking: &mut MutexGuard<VersionSet>) -> Result<()> {
-        if let Some(redo_log) = self.redo_log.take() {
-            {
-                let mut borrow = redo_log.file.borrow_mut();
-                from_io_result(borrow.flush())?;
-                from_io_result(borrow.sync())?;
+    fn migrate_redo_file(&self, exclude_cf_id: u32, locking: &mut MutexGuard<VersionSet>) -> Result<()> {
+        self.flush_redo_log(true, locking);
+
+        let versions = locking.deref_mut();
+        let new_log_number = versions.generate_file_number();
+        let log_file_path = paths::log_file(self.abs_db_path.as_path(), new_log_number);
+        let rs = from_io_result(self.env.new_writable_file(log_file_path.as_path(), true));
+        match rs {
+            Err(_) => {
+                versions.reuse_file_number(new_log_number);
+                rs?;
             }
-            self.redo_log.set(Some(redo_log));
+            Ok(file) => {
+                self.redo_log.replace(Some(WALDescriptor {
+                    file: file.clone(),
+                    number: new_log_number,
+                    log: LogWriter::new(file, wal::DEFAULT_BLOCK_SIZE),
+                }));
+                self.redo_log_number.set(new_log_number);
+            }
         }
+        Ok(())
+    }
+
+    fn renew_log_file(&self, locking: &mut MutexGuard<VersionSet>) -> Result<()> {
+        // if let Some(redo_log) = self.redo_log.take() {
+        //     {
+        //         let mut borrow = redo_log.file.borrow_mut();
+        //         from_io_result(borrow.flush())?;
+        //         from_io_result(borrow.sync())?;
+        //     }
+        //     self.redo_log.set(Some(redo_log));
+        // }
+        self.flush_redo_log(true, locking);
 
         let versions = locking.deref_mut();
         let new_log_number = versions.generate_file_number();
@@ -467,11 +492,9 @@ impl DBImpl {
         let mut versions = mutex.lock().unwrap();
         //------------------------------lock version-set--------------------------------------------
         let last_version = versions.last_sequence_number();
-        {
-            let cfs = versions.column_families().clone();
-            for cfi in cfs.borrow().column_family_impls() {
-                versions = self.make_room_for_write(cfi, versions)?;
-            }
+        for incoming_cf_id in &updates.cfs {
+            let cfi = versions.column_families().borrow().get_column_family_by_id(*incoming_cf_id).cloned().unwrap();
+            versions = self.make_room_for_write(&cfi, versions)?;
         }
 
         let should_write_wal = updates.should_write_wal();
@@ -512,7 +535,11 @@ impl DBImpl {
                 return Ok(cv.wait(locking).unwrap());
             } else {
                 assert_eq!(0, locking.prev_log_number);
-                self.renew_log_file(&mut locking)?;
+                if locking.should_migrate_redo_logs(cfi.id()) {
+                    self.migrate_redo_file(cfi.id(), &mut locking)?;
+                } else {
+                    self.renew_log_file(&mut locking)?;
+                }
 
                 let mut patch = VersionPatch::default();
                 patch.set_redo_log_number(self.redo_log_number.get());

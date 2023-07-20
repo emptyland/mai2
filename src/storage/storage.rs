@@ -1,5 +1,6 @@
 use std::{io, iter};
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::io::Write;
 use std::mem::size_of;
@@ -241,6 +242,7 @@ pub const REDO_HEADER_SIZE: usize = size_of::<u64>() + size_of::<u32>();
 pub struct WriteBatch {
     redo: Vec<u8>,
     need_wal: u32,
+    pub cfs: HashSet<u32>,
     pub number_of_ops: usize,
 }
 
@@ -255,6 +257,7 @@ impl WriteBatch {
         buf.extend(iter::repeat(0).take(REDO_HEADER_SIZE));
         Self {
             redo: buf,
+            cfs: HashSet::default(),
             need_wal: 0,
             number_of_ops: 0,
         }
@@ -289,6 +292,7 @@ impl WriteBatch {
         self.redo.write(key).unwrap();
         (value.len() as u32).write_to(&mut self.redo);
         self.redo.write(value).unwrap();
+        self.cfs.insert(cf.id());
         self.need_wal += if cf.temporary() { 0 } else { 1 };
     }
 
@@ -297,6 +301,7 @@ impl WriteBatch {
         self.redo.push(Tag::Deletion.to_byte());
         (key.len() as u32).write_to(&mut self.redo);
         self.redo.write(key).unwrap();
+        self.cfs.insert(cf.id());
         self.need_wal += if cf.temporary() { 0 } else { 1 };
     }
 
