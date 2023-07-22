@@ -17,3 +17,4 @@ rusty_pool = { version = "*" }
 num_cpus = "1.15.0"
 lazy_static = "1.4.0"
 hyperloglogplus = "0.4.1"
+dashmap = "5.4.0"

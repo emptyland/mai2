@@ -5,10 +5,11 @@ use std::default::Default;
 use std::io::Write;
 use std::iter;
 use std::mem::{replace, size_of};
-use std::ops::DerefMut;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use dashmap::DashMap;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 
 use rusty_pool::ThreadPool;
@@ -40,6 +41,8 @@ pub struct DB {
     default_column_family: Arc<dyn ColumnFamily>,
     //tables: Mutex<HashMap<String, Box>>
     tables_handle: Arc<RwLock<HashMap<String, TableRef>>>,
+    // [table_id -> [key_id -> cardinality]]
+    approximate_indices_cardinality: Arc<DashMap<u64, HashMap<u64, u64>>>,
 
     next_table_id: AtomicU64,
     next_index_id: AtomicU64,
@@ -136,6 +139,7 @@ impl DB {
                 next_table_id: AtomicU64::new(0),
                 next_index_id: AtomicU64::new(1), // 0 = primary key
                 tables_handle: Arc::new(RwLock::default()),
+                approximate_indices_cardinality: Arc::new(DashMap::default()),
                 connections: Mutex::default(),
                 worker_pool: rusty_pool::Builder::new()
                     .core_size(num_cpus::get())
@@ -413,7 +417,7 @@ impl DB {
 
     fn write_table_indices_cardinality(storage: &Arc<dyn storage::DB>,
                                        cf: &Arc<dyn storage::ColumnFamily>,
-                                       cardinality: HashMap<u64, u64>) -> Result<()> {
+                                       cardinality: &HashMap<u64, u64>) -> Result<()> {
         match serde_yaml::to_string(&cardinality) {
             Err(e) => {
                 let message = format!("Yaml serialize fail: {}", e.to_string());
@@ -833,9 +837,14 @@ impl DB {
             let tables = self.tables_handle.clone();
             let db = self.storage.clone();
             let snapshot = self.get_snapshot();
+            let cardinality = self.approximate_indices_cardinality.clone();
             self.worker_pool.execute(move || {
                 let name = table_box.name().clone();
-                let _ = Self::estimate_indices_cardinality_impl(db, snapshot,table_box);
+                let tid = table_box.id();
+                let rs = Self::estimate_indices_cardinality_impl(db, snapshot,table_box);
+                if let Ok(indices) = rs {
+                    cardinality.insert(tid, indices);
+                }
                 let mut locking = tables.write().unwrap();
                 match locking.get_mut(&name) {
                     Some(table) => {
@@ -854,10 +863,7 @@ impl DB {
 
     fn estimate_indices_cardinality_impl(db: Arc<dyn storage::DB>,
                                          snapshot: Arc<dyn storage::Snapshot>,
-                                         table: TableRef) -> Result<()> {
-        // let rd_opts = ReadOptions::with()
-        //     .snapshot(snapshot)
-        //     .build();
+                                         table: TableRef) -> Result<HashMap<u64, u64>> {
         let rd_opts = ReadOptions::default();
 
         let mut indices = HashMap::new();
@@ -878,7 +884,6 @@ impl DB {
                 iter.move_next();
                 c += 1;
             }
-            //dbg!(&iter.status());
 
             if iter.status().is_not_ok() && !iter.status().is_not_found() {
                 Err(iter.status().clone())?;
@@ -886,10 +891,9 @@ impl DB {
             //dbg!(&c);
             indices.insert(idx.id, cardinality.count().trunc() as u64);
         }
-        //dbg!(&indices);
-        Self::write_table_indices_cardinality(&db, &table.column_family, indices)?;
+        Self::write_table_indices_cardinality(&db, &table.column_family, &indices)?;
 
-        Ok(())
+        Ok(indices)
     }
 
     pub fn update_rows(&self, tables: &HashMap<ArenaStr, TableRef>,
@@ -1596,6 +1600,14 @@ impl DB {
         slot.clone()
     }
 
+    // INDICES
+    pub fn get_indices_cardinality(&self, table_id: u64) -> HashMap<u64, u64> {
+        match self.approximate_indices_cardinality.get(&table_id) {
+            Some(indices) => indices.deref().clone(),
+            None => HashMap::default()
+        }
+    }
+
     pub fn _test_get_table_ref(&self, name: &str) -> Option<TableRef> {
         let tables = self.lock_tables();
         tables.get(&name.to_string()).cloned()
@@ -1636,6 +1648,12 @@ impl Drop for DB {
 
             let val = table.accumulative_incremental_rows.load(Ordering::Relaxed).to_le_bytes();
             updates.insert(&table.column_family, DB::ACCUMULATIVE_INCREMENTAL_ROWS_KEY, &val);
+
+            if let Some(cardinality) = self.approximate_indices_cardinality.get(&table.id()) {
+                if let Ok(yaml) = serde_yaml::to_string(cardinality.deref()) {
+                    updates.insert(&table.column_family, DB::INDICES_CARDINALITY_KEY, yaml.as_bytes());
+                }
+            }
         }
 
         let _ = self.storage.write(&self.wr_opts, updates);
@@ -2272,6 +2290,11 @@ mod tests {
             iter.move_next();
         }
         assert_eq!(N, i);
+
+        //dbg!(&db.get_indices_cardinality(1));
+        let cardinality = *db.get_indices_cardinality(1).get(&2).unwrap();
+        let min_boundary = ((N as f32) - (N as f32) * 0.1) as u64;
+        assert!(cardinality >= min_boundary && cardinality <= N as u64);
         Ok(())
     }
 
