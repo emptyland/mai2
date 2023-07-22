@@ -329,6 +329,22 @@ impl WriteBatch {
             }
         }
     }
+
+    pub fn iterate_since_raw<F>(buf: &[u8], mut callback: F) -> Result<usize>
+        where F: FnMut(u32, &[u8]) -> Result<usize> {
+        let mut decoder = Decoder::new();
+        while decoder.offset() < buf.len() {
+            let start = decoder.offset();
+            let cf_id: u32 = decoder.read_from(buf).unwrap();
+            let _tag: u8 = decoder.read_from(buf).unwrap();
+            let key_len: u32 = decoder.read_from(buf).unwrap();
+            decoder.advance(key_len as usize);
+            let stop = decoder.offset();
+
+            callback(cf_id, &buf[start..stop])?;
+        }
+        Ok(decoder.offset())
+    }
 }
 
 

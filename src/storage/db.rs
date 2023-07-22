@@ -2,7 +2,6 @@ use std::{io, thread};
 use std::cell::{Cell, RefCell};
 use std::collections::btree_set::BTreeSet;
 use std::collections::HashMap;
-use std::io::Write;
 use std::iter::Iterator;
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
@@ -149,39 +148,6 @@ impl DBImpl {
                 desc.file.borrow_mut().sync().unwrap();
             }
             self.redo_log.set(Some(desc));
-        }
-    }
-
-    fn start_flush_worker(logger: Arc<dyn Logger>) -> WorkerDescriptor {
-        let (tx, rx) = channel();
-        let join_handle = thread::Builder::new()
-            .name("flush-worker".to_string())
-            .spawn(move || {
-                log_debug!(logger, "flush worker start...");
-                let rs = catch_unwind(move || {
-                    loop {
-                        let command = rx.recv().unwrap();
-                        match command {
-                            WorkerCommand::Work(file, mutex) => {
-                                let _locking = mutex.lock().unwrap();
-                                file.borrow_mut().flush().unwrap();
-                                file.borrow_mut().sync().unwrap();
-                            }
-                            WorkerCommand::Exit => break,
-                            _ => unreachable!(),
-                        }
-                    }
-                    drop(rx);
-                });
-                if let Err(e) = rs {
-                    log_error!(logger, "flush worker panic! {:#?}", e);
-                } else {
-                    log_debug!(logger, "flush worker stop.");
-                }
-            }).unwrap();
-        WorkerDescriptor {
-            tx,
-            join_handle,
         }
     }
 
@@ -357,17 +323,10 @@ impl DBImpl {
                 break;
             }
             let mut offset = 0;
-            let sequence_number = {
-                let mut buf: [u8; 8] = [0; 8];
-                (&mut buf[..]).write(&record.as_slice()[offset..offset + 8]).unwrap();
-                u64::from_le_bytes(buf)
-            };
+            let sequence_number =
+                u64::from_le_bytes((&record.as_slice()[offset..offset + 8]).try_into().unwrap());
             offset += 8;
-            let _n_entries = {
-                let mut buf: [u8; 4] = [0; 4];
-                (&mut buf[..]).write(&record.as_slice()[offset..offset + 4]).unwrap();
-                u32::from_le_bytes(buf)
-            };
+            let _n_entries = u32::from_le_bytes((&record.as_slice()[offset..offset + 4]).try_into().unwrap());
 
             handler.reset_last_sequence_number(sequence_number);
             WriteBatch::iterate_since(WriteBatch::skip_header(record.as_slice()), &handler);
@@ -383,25 +342,50 @@ impl DBImpl {
 
     fn migrate_redo_file(&self, exclude_cf_id: u32, locking: &mut MutexGuard<VersionSet>) -> Result<()> {
         self.flush_redo_log(true, locking);
+        self.redo_log.replace(None); // close old redo log file
+        let log_file_path = paths::log_file(self.abs_db_path.as_path(), self.redo_log_number.get());
+        let original_file = from_io_result(self.env.new_sequential_file(&log_file_path))?;
 
         let versions = locking.deref_mut();
         let new_log_number = versions.generate_file_number();
         let log_file_path = paths::log_file(self.abs_db_path.as_path(), new_log_number);
         let rs = from_io_result(self.env.new_writable_file(log_file_path.as_path(), true));
-        match rs {
-            Err(_) => {
+        if rs.is_err() {
+            versions.reuse_file_number(new_log_number);
+            rs.clone()?;
+        }
+        let dest_file = rs.unwrap();
+        let mut log_writer = LogWriter::new(dest_file.clone(), wal::DEFAULT_BLOCK_SIZE);
+
+        let mut key_count = 0;
+        let mut reader = LogReader::new(original_file, true, wal::DEFAULT_BLOCK_SIZE);
+        loop {
+            let record = from_io_result(reader.read())?;
+            if record.is_empty() {
+                break;
+            }
+
+            let rs = WriteBatch::iterate_since_raw(&record, |cf_id,bundle| {
+                if cf_id != exclude_cf_id {
+                    key_count += 1;
+                    from_io_result(log_writer.append(bundle))
+                } else {
+                    Ok(0)
+                }
+            });
+            if rs.is_err() {
                 versions.reuse_file_number(new_log_number);
                 rs?;
             }
-            Ok(file) => {
-                self.redo_log.replace(Some(WALDescriptor {
-                    file: file.clone(),
-                    number: new_log_number,
-                    log: LogWriter::new(file, wal::DEFAULT_BLOCK_SIZE),
-                }));
-                self.redo_log_number.set(new_log_number);
-            }
         }
+
+        log_info!(self.logger, "Migrate keys: {key_count} to {new_log_number}.log .");
+        self.redo_log.replace(Some(WALDescriptor {
+            file: dest_file,
+            number: new_log_number,
+            log: log_writer,
+        }));
+        self.redo_log_number.set(new_log_number);
         Ok(())
     }
 
@@ -535,11 +519,12 @@ impl DBImpl {
                 return Ok(cv.wait(locking).unwrap());
             } else {
                 assert_eq!(0, locking.prev_log_number);
-                if locking.should_migrate_redo_logs(cfi.id()) {
-                    self.migrate_redo_file(cfi.id(), &mut locking)?;
-                } else {
-                    self.renew_log_file(&mut locking)?;
-                }
+                // if locking.should_migrate_redo_logs(cfi.id()) {
+                //     self.migrate_redo_file(cfi.id(), &mut locking)?;
+                // } else {
+                //     self.renew_log_file(&mut locking)?;
+                // }
+                self.renew_log_file(&mut locking)?;
 
                 let mut patch = VersionPatch::default();
                 patch.set_redo_log_number(self.redo_log_number.get());
@@ -1104,10 +1089,19 @@ impl WritingHandler {
         self.last_sequence_number = sequence_number;
     }
 
-    fn get_memory_table(&self, cf_id: u32) -> Arc<MemoryTable> {
-        let cfs = unsafe { &*self.column_families.as_ptr() };
-        let cfi = cfs.get_column_family_by_id(cf_id).unwrap().clone();
-        cfi.mutable().clone()
+    fn get_memory_table(&self, cf_id: u32) -> Option<Arc<MemoryTable>> {
+        //let cfs = unsafe { &*self.column_families.as_ptr() };
+        let cfi = if cf_id == 0 {
+            self.column_families.borrow().default_column_family()
+        } else {
+            self.column_families.borrow().get_column_family_by_id(cf_id).unwrap().clone()
+        };
+
+        if self.filter && cfi.redo_log_number() < self.redo_log_number {
+            None
+        } else {
+            Some(cfi.mutable().clone())
+        }
     }
 
     fn sequence_number(&self) -> u64 { self.last_sequence_number + self.sequence_number_count.get() }
@@ -1120,14 +1114,16 @@ impl WritingHandler {
 
 impl WriteBatchStub for WritingHandler {
     fn did_insert(&self, cf_id: u32, key: &[u8], value: &[u8]) {
-        let table = self.get_memory_table(cf_id);
-        table.insert(key, value, self.sequence_number(), Tag::Key);
+        if let Some(table) = self.get_memory_table(cf_id) {
+            table.insert(key, value, self.sequence_number(), Tag::Key);
+        }
         self.advance(key.len() + size_of::<u32>() + size_of::<u64>() + value.len());
     }
 
     fn did_delete(&self, cf_id: u32, key: &[u8]) {
-        let table = self.get_memory_table(cf_id);
-        table.insert(key, "".as_bytes(), self.sequence_number(), Tag::Deletion);
+        if let Some(table) = self.get_memory_table(cf_id) {
+            table.insert(key, &[], self.sequence_number(), Tag::Deletion);
+        }
         self.advance(key.len() + size_of::<u32>() + size_of::<u64>());
     }
 }
@@ -1141,6 +1137,7 @@ struct Get {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::iter;
 
     use crate::storage::JunkFilesCleaner;
