@@ -6,7 +6,7 @@ use std::intrinsics::copy_nonoverlapping;
 use std::io::{Read, Write};
 use std::iter::repeat;
 use std::{mem, ptr};
-use std::ops::{AddAssign, DerefMut, Index};
+use std::ops::{AddAssign, Deref, DerefMut, Index};
 use std::ptr::{addr_of, NonNull, slice_from_raw_parts_mut};
 use std::sync::{Arc, MutexGuard, Weak};
 
@@ -14,7 +14,7 @@ use crate::{arena_vec, corrupted, corrupted_err, Corrupting, Result, Status, vis
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, ArenaVec};
 use crate::exec::{from_sql_result, function};
 use crate::exec::connection::ResultSet;
-use crate::exec::db::{ColumnMetadata, ColumnType, DB, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata};
+use crate::exec::db::{ColumnMetadata, ColumnType, DB, LockingTablesMut, OrderBy, SecondaryIndexMetadata, TableHandle, TableMetadata, TableRef};
 use crate::exec::evaluator::{Context, Evaluator, expr_typing_reduce, Value};
 use crate::exec::function::{ExecutionContext, new_udf, UDF};
 use crate::exec::interpreter::{BytecodeArray, BytecodeBuildingVisitor, Interpreter};
@@ -135,6 +135,67 @@ impl Executor {
             Token::Double => Ok(ColumnType::Double(ast.len as u32, ast.len_part as u32)),
             _ => Err(Status::corrupted("Bad type token!"))
         }
+    }
+
+    fn do_add_column(&self, db: &Arc<DB>, tables: &LockingTablesMut, table: &TableRef,
+                     decl: &ArenaBox<ColumnDeclaration>, hint: &ColumnAdditionPosHint) -> Result<(TableRef, u64)> {
+        if !table.metadata.primary_keys.is_empty() && decl.primary_key {
+            corrupted_err!("Primary keys exists.")?;
+        }
+        if decl.not_null && decl.default_val.is_none() {
+            corrupted_err!("Add column need default value express.")?;
+        }
+        
+        let mut col = ColumnMetadata {
+            name: decl.name.to_string(),
+            order: 0,
+            id: table.next_col_id(),
+            ty: Self::convert_to_type(decl.type_decl.deref())?,
+            primary_key: decl.primary_key,
+            auto_increment: decl.auto_increment,
+            not_null: decl.not_null,
+            default_value: vec![],
+        };
+        if let Some(mut expr) = decl.default_val.clone() {
+            let mut bc_visitor = BytecodeBuildingVisitor::new(&self.arena);
+            bc_visitor.build(expr.deref_mut(), &mut col.default_value).unwrap();
+        }
+        let col_id = col.id;
+        let mut metadata = (*table.metadata).clone();
+        match hint {
+            ColumnAdditionPosHint::Last => {
+                col.order = metadata.columns.len();
+                metadata.columns.push(col);
+            }
+            ColumnAdditionPosHint::First => {
+                metadata.columns.insert(0, col);
+                TableHandle::reorder_cols(&mut metadata.columns);
+            }
+            ColumnAdditionPosHint::After(name) => {
+                let rs = table.index_of_col_name(&name.to_string());
+                if rs.is_none() {
+                    corrupted_err!("Column name: {name} not found in `AFTER' clause")?
+                }
+                let pos = rs.unwrap();
+                if pos < metadata.columns.len() - 1 {
+                    metadata.columns.insert(pos + 1, col);
+                } else {
+                    metadata.columns.push(col);
+                }
+                TableHandle::reorder_cols(&mut metadata.columns);
+            }
+        }
+        let new_table = Arc::new(table.update(metadata));
+        let col = new_table.get_col_by_id(col_id).unwrap();
+        let mut affected_rows = 0;
+        if !col.default_value.is_empty() {
+            let producer = PlanMaker::new(&db, db.get_snapshot(), None, &self.arena)
+                .make_full_scan_producer(table)?;
+            affected_rows = db.add_column_with_default_value(producer, &table.column_family, col_id,  &col.ty,
+                                                             &col.default_value, &self.arena)?;
+        }
+        
+        Ok((new_table, affected_rows))
     }
 
     fn build_insertion_tuples<'a>(&self,
@@ -567,6 +628,47 @@ impl Visitor for Executor {
                 // Eat error
                 self.affected_rows = 0;
                 // TODO: record warning message
+            }
+        }
+    }
+
+    fn visit_alert_table(&mut self, this: &mut AlertTable) {
+        let db = self.db.upgrade().unwrap();
+        let mut tables = db.lock_tables_mut();
+        if !tables.contains_key(&this.name.to_string()) {
+            visit_fatal!(self, "Table `{}` not found", this.name);
+        }
+        let table = tables.get(&this.name.to_string()).unwrap().clone();
+
+        let _ddl_locking = table.mutex.lock().unwrap();
+        match &this.action {
+            AlertTableAction::AddColumn(decl, hint) => {
+                match self.do_add_column(&db, &tables, &table, decl, hint) {
+                    Err(e) => {
+                        self.rs = e;
+                        return;
+                    }
+                    Ok((table, affected_rows)) => {
+                        tables.insert(table.name().clone(), table);
+                        self.affected_rows = affected_rows;
+                    }
+                }
+            }
+            AlertTableAction::ChangeColumn(name, decl) => todo!(),
+            AlertTableAction::ModifyColumn(decl) => todo!(),
+            AlertTableAction::SetDefault(name, default_val) => todo!(),
+            AlertTableAction::DropDefault(name) => todo!(),
+            AlertTableAction::DropColumn(name) => todo!(),
+            AlertTableAction::RenameTo(name) => {
+                if name == &this.name {
+                    return; // Ignore it.
+                }
+                if tables.contains_key(&name.to_string()) {
+                    visit_fatal!(self, "Rename to duplicated table name: `{name}`")
+                }
+                let mut metadata = (*table.metadata).clone();
+                metadata.name = name.to_string();
+                tables.insert(metadata.name.to_string(), Arc::new(table.update(metadata)));
             }
         }
     }

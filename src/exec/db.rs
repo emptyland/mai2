@@ -20,6 +20,7 @@ use crate::exec::connection::{Connection, FeedbackImpl};
 use crate::exec::evaluator::{Evaluator, Value};
 use crate::exec::executor::{ColumnsAuxResolver, ColumnSet, PreparedStatement, SecondaryIndexBundle, Tuple, UpstreamContext};
 use crate::exec::field::{FieldBigInt, FieldChar, FieldDouble, FieldFloat, FieldVarchar};
+use crate::exec::interpreter::{BytecodeArray, Interpreter};
 use crate::exec::locking::{LockingInstance, LockingManagement};
 use crate::exec::physical_plan::PhysicalPlanOps;
 use crate::map::ArenaMap;
@@ -634,6 +635,47 @@ impl DB {
         } else {
             Ok(affected_rows)
         }
+    }
+
+    pub fn add_column_with_default_value(&self, mut producer: ArenaBox<dyn PhysicalPlanOps>,
+                                         column_family: &Arc<dyn ColumnFamily>, col_id: u32, ty: &ColumnType,
+                                         default_val: &[u8], arena: &ArenaMut<Arena>) -> Result<u64> {
+        let cols = producer.prepare()?;
+        let mut bca = BytecodeArray::new(default_val, arena)?;
+        let mut interpreter = Interpreter::new(arena);
+
+        let mut ctx = UpstreamContext::new(None, arena);
+        ctx.add(cols.deref());
+        let env = Arc::new(ctx);
+
+        let mut affected_rows = 0;
+
+        let mut zone = Arena::new_ref();
+        loop {
+            zone_limit_guard!(zone, 1);
+            let arena = zone.get_mut();
+
+            let mut feedback = FeedbackImpl::new(true);
+            let rs = producer.next(&mut feedback, &zone);
+            if rs.is_none() {
+                break;
+            }
+
+            let tuple = rs.unwrap();
+            let val = interpreter.evaluate(&mut bca, env.clone())?;
+
+            let mut buf = ArenaVec::with_data(&arena, tuple.row_key());
+            Self::encode_col_id(col_id, &mut buf);
+            let pk_len = buf.len();
+            Self::encode_column_value(&val, ty, &mut buf);
+
+            let k = &buf.as_slice()[..pk_len];
+            let v = &buf.as_slice()[pk_len..];
+            self.storage.insert(&self.wr_opts, column_family, k, v)?;
+            affected_rows += 1;
+        }
+
+        Ok(affected_rows)
     }
 
     pub fn insert_rows(&self, column_family: &Arc<dyn ColumnFamily>,
@@ -1813,6 +1855,10 @@ impl TableHandle {
         }
     }
 
+    pub fn index_of_col_name(&self, name: &String) -> Option<usize> {
+        self.columns_by_name.get(name).copied()
+    }
+
     pub fn has_auto_increment_fields(&self) -> bool {
         for col in &self.metadata.columns {
             if col.auto_increment {
@@ -1852,6 +1898,19 @@ impl TableHandle {
         }
     }
 
+    pub fn next_col_id(&self) -> u32 {
+        let mut ids: Vec<_> = self.metadata.columns.iter().map(|x| {
+            x.id
+        }).collect();
+        ids.sort();
+        for i in 0..ids.len() {
+            if i as u32 != ids[i] {
+                return i as u32
+            }
+        }
+        ids.last().copied().unwrap() + 1
+    }
+
     pub fn add_rows_count(&self, count: isize) -> (u64, u64, f32) {
         let incremental_val = count.abs() as u64;
         let total = if count > 0 {
@@ -1880,6 +1939,12 @@ impl TableHandle {
                                                                          Ordering::Acquire,
                                                                          Ordering::Relaxed);
         assert!(rs.is_ok());
+    }
+
+    pub fn reorder_cols(cols: &mut [ColumnMetadata]) {
+        for i in 0..cols.len() {
+            cols[i].order = i;
+        }
     }
 }
 

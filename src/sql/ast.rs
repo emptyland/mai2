@@ -45,6 +45,7 @@ ast_nodes_impl![
     (DropTable, visit_drop_table),
     (CreateIndex, visit_create_index),
     (DropIndex, visit_drop_index),
+    (AlertTable, visit_alert_table),
     (InsertIntoTable, visit_insert_into_table),
     (Collection, visit_collection),
     (CommonTableExpressions, visit_common_table_expressions),
@@ -294,6 +295,27 @@ pub struct DropIndex {
     pub name: ArenaStr,
     pub primary_key: bool,
     pub table_name: ArenaStr,
+}
+
+pub struct AlertTable {
+    pub name: ArenaStr,
+    pub action: AlertTableAction,
+}
+
+pub enum AlertTableAction {
+    AddColumn(ArenaBox<ColumnDeclaration>, ColumnAdditionPosHint),
+    ChangeColumn(ArenaStr, ArenaBox<ColumnDeclaration>),
+    SetDefault(ArenaStr, ArenaBox<dyn Expression>),
+    DropDefault(ArenaStr),
+    ModifyColumn(ArenaBox<ColumnDeclaration>),
+    DropColumn(ArenaStr),
+    RenameTo(ArenaStr),
+}
+
+pub enum ColumnAdditionPosHint {
+    Last,
+    First,
+    After(ArenaStr)
 }
 
 pub struct InsertIntoTable {
@@ -722,6 +744,13 @@ impl Factory {
             name,
             primary_key,
             table_name,
+        }, self.arena.get_mut())
+    }
+
+    pub fn new_alert_table(&self, name: ArenaStr, action: AlertTableAction) -> ArenaBox<AlertTable> {
+        ArenaBox::new(AlertTable {
+            name,
+            action,
         }, self.arena.get_mut())
     }
 

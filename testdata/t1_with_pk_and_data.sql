@@ -2,7 +2,8 @@ create table t1 {
     id int primary key auto_increment,
     name varchar(255),
     a char(9),
-    b int index idx_b(b)
+    b int
+    index idx_b(b)
 };
 
 insert into table t1(name, a, b)

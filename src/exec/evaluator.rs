@@ -576,11 +576,10 @@ impl Visitor for TypingReducer {
     }
 
     fn visit_full_qualified_name(&mut self, this: &mut FullyQualifiedName) {
-        let value = self.env().resolve_fully_qualified(this.prefix.as_str(),
-                                                       this.suffix.as_str());
+        let value = self.env().resolve_fully_qualified(this.prefix.as_str(), this.suffix.as_str());
         if value.is_undefined() {
-            self.rs = Status::corrupted(format!("Unresolved symbol: {}.{}",
-                                                this.prefix.as_str(), this.suffix.as_str()));
+            self.rs = Status::corrupted(format!("Unresolved symbol: {}.{}", this.prefix.as_str(),
+                                                this.suffix.as_str()));
             return;
         }
         self.ret(Self::reduce_value_type(&value));

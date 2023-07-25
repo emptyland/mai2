@@ -82,6 +82,10 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
                         _ => Err(self.concat_syntax_error(start_pos, "Unexpected `table'".to_string()))?
                     }
                 }
+                Token::Alert => {
+                    let rv = proc(self.parse_alert_table()?.into(), self.placeholder_order);
+                    stmts.push(rv);
+                }
                 Token::Insert => {
                     let rv = proc(self.parse_insert_into_table()?.into(), self.placeholder_order);
                     stmts.push(rv);
@@ -308,6 +312,55 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
         let table_name = self.match_id()?;
 
         Ok(self.factory.new_drop_index(name, primary_key, table_name))
+    }
+
+    fn parse_alert_table(&mut self) -> Result<ArenaBox<AlertTable>> {
+        self.match_expected(Token::Alert)?;
+        self.match_expected(Token::Table)?;
+
+        let name = self.match_id()?;
+        let action = if self.test(Token::Add)? {
+            self.match_expected(Token::Column)?;
+            let col_decl = self.parse_column_decl()?;
+            let hint = if self.test(Token::First)? {
+                ColumnAdditionPosHint::First
+            } else if self.test(Token::After)? {
+                ColumnAdditionPosHint::After(self.match_id()?)
+            } else {
+                ColumnAdditionPosHint::Last
+            };
+            AlertTableAction::AddColumn(col_decl, hint)
+        } else if self.test(Token::Change)? {
+            self.match_expected(Token::Column)?;
+            AlertTableAction::ChangeColumn(self.match_id()?, self.parse_column_decl()?)
+        } else if self.test(Token::Alert)? {
+            self.match_expected(Token::Column)?;
+            let col_name = self.match_id()?;
+            let set_or_drop = self.test(Token::Set)?;
+            if !set_or_drop {
+                self.match_expected(Token::Drop)?;
+            }
+            self.match_expected(Token::Default)?;
+            if set_or_drop {
+                AlertTableAction::SetDefault(col_name, self.parse_expr()?)
+            } else {
+                AlertTableAction::DropDefault(col_name)
+            }
+        } else if self.test(Token::Modify)? {
+            self.match_expected(Token::Column)?;
+            let col_decl = self.parse_column_decl()?;
+            AlertTableAction::ModifyColumn(col_decl)
+        } else if self.test(Token::Drop)? {
+            self.match_expected(Token::Column)?;
+            AlertTableAction::DropColumn(self.match_id()?)
+        } else if self.test(Token::Rename)? {
+            self.match_expected(Token::To)?;
+            AlertTableAction::DropColumn(self.match_id()?)
+        } else {
+            Err(self.current_syntax_error("Unexpected alert table sub-clause.".to_string()))?
+        };
+
+        Ok(self.factory.new_alert_table(name, action))
     }
 
     fn parse_insert_into_table(&mut self) -> Result<ArenaBox<InsertIntoTable>> {

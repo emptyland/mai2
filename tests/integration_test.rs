@@ -358,3 +358,47 @@ fn sql_multi_update_one() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn sql_alert_add_col() -> Result<()> {
+    let suite = SqlSuite::new("tests/dbi-013")?;
+    suite.execute_file(Path::new("testdata/t1_with_pk_and_data.sql"), &suite.arena)?;
+
+    suite.execute_str("alert table t1 add column c varchar(16)", &suite.arena)?;
+
+    let table = suite.db._test_get_table_ref("t1").unwrap();
+    {
+        let rs = table.get_col_by_name(&"c".to_string());
+        assert!(rs.is_some());
+        let col = rs.unwrap();
+        assert_eq!("c", col.name);
+        assert!(!col.not_null);
+        assert_eq!(4, col.order);
+    }
+    drop(table);
+
+    suite.execute_str("alert table t1 add column ddd int after a", &suite.arena)?;
+    let table = suite.db._test_get_table_ref("t1").unwrap();
+    {
+        let rs = table.get_col_by_name(&"ddd".to_string());
+        assert!(rs.is_some());
+        let col = rs.unwrap();
+        assert_eq!("ddd", col.name);
+        assert!(!col.not_null);
+        assert_eq!(3, col.order);
+    }
+    drop(table);
+
+    assert_eq!(9, suite.execute_str("alert table t1 add column eff int not null default 0 first", &suite.arena)?);
+    let table = suite.db._test_get_table_ref("t1").unwrap();
+    {
+        let rs = table.get_col_by_name(&"eff".to_string());
+        assert!(rs.is_some());
+        let col = rs.unwrap();
+        assert_eq!("eff", col.name);
+        assert!(col.not_null);
+        assert_eq!(0, col.order);
+    }
+
+    Ok(())
+}

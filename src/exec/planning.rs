@@ -148,6 +148,15 @@ impl PlanMaker {
         }
     }
 
+    pub fn make_full_scan_producer(&mut self, table: &TableRef) -> Result<ArenaBox<dyn PhysicalPlanOps>> {
+        let mut columns = ColumnSet::new(table.name().as_str(), table.metadata.id, &self.arena);
+        for col in &table.metadata.columns {
+            columns.append_physical(col.name.as_str(), table.metadata.id, col.id, col.ty.clone());
+        }
+        let cols = ArenaBox::new(columns, self.arena.deref_mut());
+        self.make_scan_table(table, &cols, None, None)
+    }
+
     fn arena_of_ast(&self) -> &ArenaMut<Arena> {
         match &self.prepared_stmt {
             Some(stmt) => stmt.owns_arena(),
