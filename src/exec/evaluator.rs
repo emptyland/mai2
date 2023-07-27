@@ -298,6 +298,10 @@ impl Evaluator {
             _ => unreachable!()
         }.into()
     }
+
+    pub fn migrate_to(input: &Value, ty: &ColumnType, arena: &ArenaMut<Arena>) -> Value {
+        todo!()
+    }
 }
 
 

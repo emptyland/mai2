@@ -322,17 +322,11 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
         let action = if self.test(Token::Add)? {
             self.match_expected(Token::Column)?;
             let col_decl = self.parse_column_decl()?;
-            let hint = if self.test(Token::First)? {
-                ColumnAdditionPosHint::First
-            } else if self.test(Token::After)? {
-                ColumnAdditionPosHint::After(self.match_id()?)
-            } else {
-                ColumnAdditionPosHint::Last
-            };
-            AlertTableAction::AddColumn(col_decl, hint)
+            AlertTableAction::AddColumn(col_decl, self.parse_column_placement_pos_hint()?)
         } else if self.test(Token::Change)? {
             self.match_expected(Token::Column)?;
-            AlertTableAction::ChangeColumn(self.match_id()?, self.parse_column_decl()?)
+            AlertTableAction::ChangeColumn(self.match_id()?, self.parse_column_decl()?,
+                                           self.parse_column_placement_pos_hint()?)
         } else if self.test(Token::Alert)? {
             self.match_expected(Token::Column)?;
             let col_name = self.match_id()?;
@@ -348,8 +342,8 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
             }
         } else if self.test(Token::Modify)? {
             self.match_expected(Token::Column)?;
-            let col_decl = self.parse_column_decl()?;
-            AlertTableAction::ModifyColumn(col_decl)
+            AlertTableAction::ModifyColumn(self.parse_column_decl()?,
+                                           self.parse_column_placement_pos_hint()?)
         } else if self.test(Token::Drop)? {
             self.match_expected(Token::Column)?;
             AlertTableAction::DropColumn(self.match_id()?)
@@ -361,6 +355,17 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
         };
 
         Ok(self.factory.new_alert_table(name, action))
+    }
+
+    fn parse_column_placement_pos_hint(&mut self) -> Result<ColumnPlacementPosHint> {
+        let hint = if self.test(Token::First)? {
+            ColumnPlacementPosHint::First
+        } else if self.test(Token::After)? {
+            ColumnPlacementPosHint::After(self.match_id()?)
+        } else {
+            ColumnPlacementPosHint::Default
+        };
+        Ok(hint)
     }
 
     fn parse_insert_into_table(&mut self) -> Result<ArenaBox<InsertIntoTable>> {
@@ -623,7 +628,7 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
 
             if self.test(Token::Order)? {
                 self.match_expected(Token::By)?;
-                 self.parse_order_by_clause(&mut node.order_by_clause)?;
+                self.parse_order_by_clause(&mut node.order_by_clause)?;
             }
 
             if self.test(Token::Limit)? {
@@ -703,15 +708,15 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
             let expr = self.parse_expr()?;
             let assignment = Assignment {
                 lhs: FullyQualifiedName {
-                    prefix: if name.is_empty() {ArenaStr::default()} else {id.clone()},
-                    suffix: if name.is_empty() {id} else {name},
+                    prefix: if name.is_empty() { ArenaStr::default() } else { id.clone() },
+                    suffix: if name.is_empty() { id } else { name },
                 },
                 rhs: expr,
             };
             list.push(assignment);
 
             if !self.test(Token::Comma)? {
-                break Ok(())
+                break Ok(());
             }
         }
     }
@@ -760,7 +765,7 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
             let key = self.parse_expr()?;
             let mut item = OrderClause {
                 key,
-                ordering: SqlOrdering::Asc
+                ordering: SqlOrdering::Asc,
             };
             if self.test(Token::Asc)? {
                 // ignore...
@@ -769,7 +774,7 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
             }
             list.push(item);
             if !self.test(Token::Comma)? {
-                break Ok(())
+                break Ok(());
             }
         }
     }
@@ -942,8 +947,9 @@ impl<'a, R: Read + ?Sized> Parser<'a, R> {
                     self.match_expected(Token::Then)?;
                     let then = self.parse_expr()?;
 
-                    when_clause.push(WhenClause{
-                        expected, then
+                    when_clause.push(WhenClause {
+                        expected,
+                        then,
                     });
                     if self.peek().token != Token::When {
                         break;

@@ -303,17 +303,17 @@ pub struct AlertTable {
 }
 
 pub enum AlertTableAction {
-    AddColumn(ArenaBox<ColumnDeclaration>, ColumnAdditionPosHint),
-    ChangeColumn(ArenaStr, ArenaBox<ColumnDeclaration>),
+    AddColumn(ArenaBox<ColumnDeclaration>, ColumnPlacementPosHint),
+    ChangeColumn(ArenaStr, ArenaBox<ColumnDeclaration>, ColumnPlacementPosHint),
     SetDefault(ArenaStr, ArenaBox<dyn Expression>),
     DropDefault(ArenaStr),
-    ModifyColumn(ArenaBox<ColumnDeclaration>),
+    ModifyColumn(ArenaBox<ColumnDeclaration>, ColumnPlacementPosHint),
     DropColumn(ArenaStr),
     RenameTo(ArenaStr),
 }
 
-pub enum ColumnAdditionPosHint {
-    Last,
+pub enum ColumnPlacementPosHint {
+    Default,
     First,
     After(ArenaStr)
 }

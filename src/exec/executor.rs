@@ -2,7 +2,7 @@ use std::alloc::Layout;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::intrinsics::copy_nonoverlapping;
+use std::intrinsics::{copy_nonoverlapping};
 use std::io::{Read, Write};
 use std::iter::repeat;
 use std::{mem, ptr};
@@ -138,14 +138,14 @@ impl Executor {
     }
 
     fn do_add_column(&self, db: &Arc<DB>, tables: &LockingTablesMut, table: &TableRef,
-                     decl: &ArenaBox<ColumnDeclaration>, hint: &ColumnAdditionPosHint) -> Result<(TableRef, u64)> {
+                     decl: &ArenaBox<ColumnDeclaration>, hint: &ColumnPlacementPosHint) -> Result<(TableRef, u64)> {
         if !table.metadata.primary_keys.is_empty() && decl.primary_key {
             corrupted_err!("Primary keys exists.")?;
         }
         if decl.not_null && decl.default_val.is_none() {
             corrupted_err!("Add column need default value express.")?;
         }
-        
+
         let mut col = ColumnMetadata {
             name: decl.name.to_string(),
             order: 0,
@@ -163,15 +163,15 @@ impl Executor {
         let col_id = col.id;
         let mut metadata = (*table.metadata).clone();
         match hint {
-            ColumnAdditionPosHint::Last => {
+            ColumnPlacementPosHint::Default => {
                 col.order = metadata.columns.len();
                 metadata.columns.push(col);
             }
-            ColumnAdditionPosHint::First => {
+            ColumnPlacementPosHint::First => {
                 metadata.columns.insert(0, col);
                 TableHandle::reorder_cols(&mut metadata.columns);
             }
-            ColumnAdditionPosHint::After(name) => {
+            ColumnPlacementPosHint::After(name) => {
                 let rs = table.index_of_col_name(&name.to_string());
                 if rs.is_none() {
                     corrupted_err!("Column name: {name} not found in `AFTER' clause")?
@@ -191,10 +191,99 @@ impl Executor {
         if !col.default_value.is_empty() {
             let producer = PlanMaker::new(&db, db.get_snapshot(), None, &self.arena)
                 .make_full_scan_producer(table)?;
-            affected_rows = db.add_column_with_default_value(producer, &table.column_family, col_id,  &col.ty,
+            affected_rows = db.add_column_with_default_value(producer, &table.column_family, col_id, &col.ty,
                                                              &col.default_value, &self.arena)?;
         }
-        
+
+        Ok((new_table, affected_rows))
+    }
+
+    fn do_update_column(&self, db: &Arc<DB>, tables: &LockingTablesMut, table: &TableRef, name: &ArenaStr,
+                        decl: &ArenaBox<ColumnDeclaration>, hint: &ColumnPlacementPosHint) -> Result<(TableRef, u64)> {
+        let original_col = match table.get_col_by_name(&name.to_string()) {
+            Some(col) => col,
+            None => return corrupted_err!("Column: {name} not found in table: {}", table.name()),
+        };
+
+        if let Some(col) = table.get_col_by_name(&decl.name.to_string()) {
+            if col.id != original_col.id {
+                corrupted_err!("Duplicated column name: {name} in table: {}", table.name())?;
+            }
+        }
+
+        let ty = Self::convert_to_type(decl.type_decl.deref())?;
+        let should_rewrite_rows = match &original_col.ty {
+            ColumnType::TinyInt(_)
+            | ColumnType::SmallInt(_)
+            | ColumnType::Int(_)
+            | ColumnType::BigInt(_) => !ty.is_integral(),
+            ColumnType::Float(_, _) => !matches!(ty, ColumnType::Float(_, _)),
+            ColumnType::Double(_, _) => !matches!(ty, ColumnType::Double(_, _)),
+            ColumnType::Char(n) => !matches!(ty, ColumnType::Char(n)),
+            ColumnType::Varchar(_) => !matches!(ty, ColumnType::Varchar(_)),
+            _ => unreachable!()
+        };
+
+        let rewrite_index_id = if should_rewrite_rows {
+            if table.is_col_be_part_of_primary_key_by_name(&original_col.name) {
+                Some(0)
+            } else if let Some(idx) = table.get_col_be_part_of_2rd_idx_by_name(&original_col.name) {
+                Some(idx.id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let rewrite_index = rewrite_index_id.map(|x| {
+            table.get_index_by_id(x).unwrap()
+        });
+
+        let mut col = original_col.clone();
+        col.name = decl.name.to_string();
+        col.not_null = decl.not_null;
+        col.auto_increment = decl.auto_increment;
+        col.ty = ty;
+
+        if let Some(mut expr) = decl.default_val.clone() {
+            let mut builder = BytecodeBuildingVisitor::new(&self.arena);
+            builder.build(expr.deref_mut(), &mut col.default_value).unwrap();
+        }
+
+        let mut metadata = (*table.metadata).clone();
+        match hint {
+            ColumnPlacementPosHint::Default => metadata.columns[original_col.order] = col,
+            ColumnPlacementPosHint::First => {
+                metadata.columns.remove(original_col.order);
+                metadata.columns.insert(0, col);
+                TableHandle::reorder_cols(&mut metadata.columns);
+            }
+            ColumnPlacementPosHint::After(name) => {
+                let rs = table.index_of_col_name(&name.to_string());
+                if rs.is_none() {
+                    corrupted_err!("Column name: {name} not found in `AFTER' clause")?
+                }
+                let pos = rs.unwrap();
+                if pos < metadata.columns.len() - 1 {
+                    metadata.columns.insert(pos + 1, col);
+                } else {
+                    metadata.columns.push(col);
+                }
+                TableHandle::reorder_cols(&mut metadata.columns);
+            }
+        }
+        let new_table = Arc::new(table.update(metadata));
+        let col = new_table.get_col_by_id(original_col.id).unwrap();
+
+        let mut affected_rows = 0;
+        if should_rewrite_rows {
+            let producer = PlanMaker::new(db, db.get_snapshot(), None,
+                                                                    &self.arena)
+                .make_full_scan_producer(table)?;
+            affected_rows = db.rewrite_column(producer, &table.column_family, original_col, &col,
+                                              rewrite_index, &self.arena)?;
+        }
+
         Ok((new_table, affected_rows))
     }
 
@@ -641,21 +730,13 @@ impl Visitor for Executor {
         let table = tables.get(&this.name.to_string()).unwrap().clone();
 
         let _ddl_locking = table.mutex.lock().unwrap();
-        match &this.action {
-            AlertTableAction::AddColumn(decl, hint) => {
-                match self.do_add_column(&db, &tables, &table, decl, hint) {
-                    Err(e) => {
-                        self.rs = e;
-                        return;
-                    }
-                    Ok((table, affected_rows)) => {
-                        tables.insert(table.name().clone(), table);
-                        self.affected_rows = affected_rows;
-                    }
-                }
-            }
-            AlertTableAction::ChangeColumn(name, decl) => todo!(),
-            AlertTableAction::ModifyColumn(decl) => todo!(),
+        let rs = match &this.action {
+            AlertTableAction::AddColumn(decl, hint) =>
+                self.do_add_column(&db, &tables, &table, decl, hint),
+            AlertTableAction::ChangeColumn(name, decl, hint) =>
+                self.do_update_column(&db, &tables, &table, name, decl, hint),
+            AlertTableAction::ModifyColumn(decl, hint) =>
+                self.do_update_column(&db, &tables, &table, &decl.name, decl, hint),
             AlertTableAction::SetDefault(name, default_val) => todo!(),
             AlertTableAction::DropDefault(name) => todo!(),
             AlertTableAction::DropColumn(name) => todo!(),
@@ -668,7 +749,18 @@ impl Visitor for Executor {
                 }
                 let mut metadata = (*table.metadata).clone();
                 metadata.name = name.to_string();
-                tables.insert(metadata.name.to_string(), Arc::new(table.update(metadata)));
+                Ok((Arc::new(table.update(metadata)), 0))
+            }
+        };
+
+        match rs {
+            Err(e) => {
+                self.rs = e;
+                return;
+            }
+            Ok((table, affected_rows)) => {
+                tables.insert(table.name().clone(), table);
+                self.affected_rows = affected_rows;
             }
         }
     }
@@ -769,7 +861,7 @@ impl Visitor for Executor {
             Ok(affected_rows) => {
                 db.record_incremental_rows(&table, affected_rows as isize).unwrap();
                 self.affected_rows = affected_rows;
-            },
+            }
             Err(e) => self.rs = e
         }
     }

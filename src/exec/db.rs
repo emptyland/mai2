@@ -638,8 +638,11 @@ impl DB {
     }
 
     pub fn add_column_with_default_value(&self, mut producer: ArenaBox<dyn PhysicalPlanOps>,
-                                         column_family: &Arc<dyn ColumnFamily>, col_id: u32, ty: &ColumnType,
-                                         default_val: &[u8], arena: &ArenaMut<Arena>) -> Result<u64> {
+                                         column_family: &Arc<dyn ColumnFamily>,
+                                         col_id: u32,
+                                         ty: &ColumnType,
+                                         default_val: &[u8],
+                                         arena: &ArenaMut<Arena>) -> Result<u64> {
         let cols = producer.prepare()?;
         let mut bca = BytecodeArray::new(default_val, arena)?;
         let mut interpreter = Interpreter::new(arena);
@@ -651,11 +654,11 @@ impl DB {
         let mut affected_rows = 0;
 
         let mut zone = Arena::new_ref();
+        let mut feedback = FeedbackImpl::new(true);
         loop {
             zone_limit_guard!(zone, 1);
             let arena = zone.get_mut();
 
-            let mut feedback = FeedbackImpl::new(true);
             let rs = producer.next(&mut feedback, &zone);
             if rs.is_none() {
                 break;
@@ -676,6 +679,97 @@ impl DB {
         }
 
         Ok(affected_rows)
+    }
+
+    // db.rewrite_column(producer, &table.column_family, original_col, &col, rewrite_index)
+    pub fn rewrite_column(&self, mut producer: ArenaBox<dyn PhysicalPlanOps>,
+                          column_family: &Arc<dyn ColumnFamily>,
+                          original_col: &ColumnMetadata,
+                          col: &ColumnMetadata,
+                          rewrite_index: Option<IndexRefsBundle>,
+                          region: &ArenaMut<Arena>) -> Result<u64> {
+        producer.prepare()?;
+        let mut cols = ColumnsAuxResolver::new(region);
+
+        let mut buf = arena_vec!(region);
+
+        let mut zone = Arena::new_ref();
+        let mut feedback = FeedbackImpl::new(true);
+        loop {
+            zone_limit_guard!(zone, 1);
+            let arena = zone.get_mut();
+
+            let rs = producer.next(&mut feedback, &zone);
+            if rs.is_none() {
+                break;
+            }
+            let mut tuple = rs.unwrap();
+            cols.attach(&tuple);
+
+            let mut updates = WriteBatch::new();
+            if let Some(index) = &rewrite_index {
+                if DB::is_primary_key(index.id) {
+                    buf.write(tuple.row_key()).unwrap();
+                    for item in &tuple.columns().columns {
+                        Self::encode_col_id(item.id, &mut buf);
+                        updates.delete(column_family, &buf);
+                        buf.truncate(tuple.row_key().len());
+                    }
+                } else {
+                    Self::encode_index_key(&cols, &tuple, index, &mut buf);
+                    buf.write(tuple.row_key()).unwrap();
+                    updates.delete(column_family, &buf);
+                }
+                buf.clear();
+            }
+
+            let new_val = Evaluator::migrate_to(&tuple[original_col.order], &col.ty, &arena);
+            tuple.set(original_col.order, new_val); // replace to new value
+
+            if let Some(index) = &rewrite_index {
+                Self::encode_index_key(&cols, &tuple, index, &mut buf);
+                let prefix_len = buf.len();
+
+                if Self::is_primary_key(index.id) {
+                    for item in &tuple.columns().columns {
+                        Self::encode_col_id(item.id, &mut buf);
+                        let key_len = buf.len();
+                        Self::encode_column_value(&tuple[item.order], &item.ty, &mut buf);
+                        updates.insert(column_family, &buf.as_slice()[..key_len], &buf.as_slice()[key_len..]);
+                        buf.truncate(prefix_len);
+                    }
+                } else {
+                    buf.write(tuple.row_key()).unwrap();
+                    let key_len = buf.len();
+                    let pack_info = (tuple.row_key().len() as u32).to_le_bytes();
+                    buf.write(&pack_info).unwrap();
+                    updates.insert(column_family, &buf.as_slice()[..key_len], &buf.as_slice()[key_len..]);
+                }
+
+            } else {
+                buf.write(tuple.row_key()).unwrap();
+                Self::encode_col_id(col.id, &mut buf);
+                let key_len = buf.len();
+                Self::encode_column_value(&tuple[original_col.order], &col.ty, &mut buf);
+                updates.insert(column_family, &buf.as_slice()[..key_len], &buf.as_slice()[key_len..]);
+            }
+            buf.clear();
+            self.storage.write(&self.wr_opts, updates)?;
+        }
+
+        Ok(0)
+    }
+
+    pub fn encode_index_key<W: Write>(resolver: &ColumnsAuxResolver, tuple: &Tuple, index: &IndexRefsBundle, wr: &mut W) {
+        Self::encode_idx_id(index.id, wr);
+        for part in &index.key_parts {
+            let value = tuple.get(resolver.get_column_by_id(tuple.columns().tid, part.id).unwrap());
+            if DB::is_primary_key(index.id) {
+                Self::encode_row_key(value, &part.ty, wr).unwrap();
+            } else {
+                Self::encode_secondary_index(value, &part.ty, wr);
+            }
+        }
     }
 
     pub fn insert_rows(&self, column_family: &Arc<dyn ColumnFamily>,
@@ -883,7 +977,7 @@ impl DB {
             self.worker_pool.execute(move || {
                 let name = table_box.name().clone();
                 let tid = table_box.id();
-                let rs = Self::estimate_indices_cardinality_impl(db, snapshot,table_box);
+                let rs = Self::estimate_indices_cardinality_impl(db, snapshot, table_box);
                 if let Ok(indices) = rs {
                     cardinality.insert(tid, indices);
                 }
@@ -1905,7 +1999,7 @@ impl TableHandle {
         ids.sort();
         for i in 0..ids.len() {
             if i as u32 != ids[i] {
-                return i as u32
+                return i as u32;
             }
         }
         ids.last().copied().unwrap() + 1
