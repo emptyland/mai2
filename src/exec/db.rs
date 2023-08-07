@@ -14,7 +14,7 @@ use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 
 use rusty_pool::ThreadPool;
 
-use crate::{arena_vec, ArenaVec, corrupted_err, Corrupting, log_debug, Status, storage, zone_limit_guard};
+use crate::{arena_vec, ArenaVec, corrupted_err, Corrupting, log_debug, Status, storage, switch, zone_limit_guard};
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, Logger};
 use crate::exec::connection::{Connection, FeedbackImpl};
 use crate::exec::evaluator::{Evaluator, Value};
@@ -681,15 +681,15 @@ impl DB {
         Ok(affected_rows)
     }
 
-    // db.rewrite_column(producer, &table.column_family, original_col, &col, rewrite_index)
     pub fn rewrite_column(&self, mut producer: ArenaBox<dyn PhysicalPlanOps>,
                           column_family: &Arc<dyn ColumnFamily>,
                           original_col: &ColumnMetadata,
                           col: &ColumnMetadata,
-                          rewrite_index: Option<IndexRefsBundle>,
+                          rewrite_indices: Option<(IndexRefsBundle, IndexRefsBundle)>,
                           region: &ArenaMut<Arena>) -> Result<u64> {
-        producer.prepare()?;
-        let mut cols = ColumnsAuxResolver::new(region);
+        self.update_snapshot();
+        let original_cols = producer.prepare()?;
+        let mut resolver = ColumnsAuxResolver::new(region);
 
         let mut buf = arena_vec!(region);
 
@@ -704,11 +704,11 @@ impl DB {
                 break;
             }
             let mut tuple = rs.unwrap();
-            cols.attach(&tuple);
+            resolver.attach(&tuple);
 
             let mut updates = WriteBatch::new();
-            if let Some(index) = &rewrite_index {
-                if DB::is_primary_key(index.id) {
+            if let Some((origin_index, _)) = &rewrite_indices {
+                if Self::is_primary_key(origin_index.id) {
                     buf.write(tuple.row_key()).unwrap();
                     for item in &tuple.columns().columns {
                         Self::encode_col_id(item.id, &mut buf);
@@ -716,25 +716,27 @@ impl DB {
                         buf.truncate(tuple.row_key().len());
                     }
                 } else {
-                    Self::encode_index_key(&cols, &tuple, index, &mut buf);
+                    Self::encode_index_key(&resolver, &tuple, origin_index, &mut buf);
                     buf.write(tuple.row_key()).unwrap();
                     updates.delete(column_family, &buf);
                 }
                 buf.clear();
             }
 
-            let new_val = Evaluator::migrate_to(&tuple[original_col.order], &col.ty, &arena);
+            let new_val = Evaluator::migrate_to(&tuple[original_col.order], &col.ty, col.not_null, &arena);
             tuple.set(original_col.order, new_val); // replace to new value
 
-            if let Some(index) = &rewrite_index {
-                Self::encode_index_key(&cols, &tuple, index, &mut buf);
+            if let Some((original_index, index)) = &rewrite_indices {
+                Self::encode_index_key(&resolver, &tuple, index, &mut buf);
                 let prefix_len = buf.len();
 
                 if Self::is_primary_key(index.id) {
                     for item in &tuple.columns().columns {
                         Self::encode_col_id(item.id, &mut buf);
                         let key_len = buf.len();
-                        Self::encode_column_value(&tuple[item.order], &item.ty, &mut buf);
+                        Self::encode_column_value(&tuple[item.order],
+                                                  switch!(col.order == item.order, &col.ty, &item.ty),
+                                                  &mut buf);
                         updates.insert(column_family, &buf.as_slice()[..key_len], &buf.as_slice()[key_len..]);
                         buf.truncate(prefix_len);
                     }
@@ -745,7 +747,6 @@ impl DB {
                     buf.write(&pack_info).unwrap();
                     updates.insert(column_family, &buf.as_slice()[..key_len], &buf.as_slice()[key_len..]);
                 }
-
             } else {
                 buf.write(tuple.row_key()).unwrap();
                 Self::encode_col_id(col.id, &mut buf);
@@ -757,6 +758,7 @@ impl DB {
             self.storage.write(&self.wr_opts, updates)?;
         }
 
+        self.update_snapshot();
         Ok(0)
     }
 
@@ -2872,6 +2874,30 @@ mod tests {
         let rs = suite.execute_query_str("select * from t1", &suite.arena)?;
         SqlSuite::assert_rows(&data, rs)?;
         //SqlSuite::print_rows(rs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn alert_table_update_col() -> Result<()> {
+        let suite = SqlSuite::new("tests/db128")?;
+        suite.execute_file(Path::new("testdata/t1_normal_table_with_data.sql"), &suite.arena)?;
+
+
+        suite.execute_str("alert table t1 change column id uid char(9) not null", &suite.arena)?;
+
+        let data = [
+            "(\"1111\", \"hello\", \"1.1\", 0)",
+            "(\"2222\", \"aaa\", \"1.1\", 1)",
+            "(\"3333\", \"ccc\", \"1.1\", 3)",
+            "(\"4444\", \"demo\", \"1.1\", 5)",
+            "(\"5555\", \"doom\", \"1.1\", 6)",
+            "(\"6666\", \"x-ray\", \"1.1\", 9)",
+            "(\"7777\", \"ddt\", \"1.1\", 11)",
+            "(\"8888\", \"dtt\", \"1.1\", 13)",
+        ];
+        let rs = suite.execute_query_str("select * from t1", &suite.arena)?;
+        SqlSuite::assert_rows(&data, rs)?;
+
         Ok(())
     }
 }

@@ -274,6 +274,10 @@ impl Executor {
         }
         let new_table = Arc::new(table.update(metadata));
         let col = new_table.get_col_by_id(original_col.id).unwrap();
+        let rewrite_indices = rewrite_index.map(|x| {
+            let id = x.id;
+            (x, new_table.get_index_by_id(id).unwrap())
+        });
 
         let mut affected_rows = 0;
         if should_rewrite_rows {
@@ -281,7 +285,7 @@ impl Executor {
                                                                     &self.arena)
                 .make_full_scan_producer(table)?;
             affected_rows = db.rewrite_column(producer, &table.column_family, original_col, &col,
-                                              rewrite_index, &self.arena)?;
+                                              rewrite_indices, &self.arena)?;
         }
 
         Ok((new_table, affected_rows))

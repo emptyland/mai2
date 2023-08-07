@@ -358,9 +358,14 @@ impl PhysicalPlanOps for RangeScanningOps {
         let iter_box = self.iter.as_ref().cloned().unwrap();
         let mut iter = iter_box.borrow_mut();
         iter.seek(&self.range_begin);
-        if iter.status().is_corruption() {
-            return Err(iter.status());
+        if !iter.valid() {
+            return if iter.status().is_corruption() {
+                Err(iter.status())
+            } else {
+                Ok(self.projected_columns.clone())
+            };
         }
+
         let key = self.get_index_key(iter.key(), iter.value());
         if key == self.range_begin.as_slice() {
             if !self.left_close {

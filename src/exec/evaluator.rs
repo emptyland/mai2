@@ -299,8 +299,40 @@ impl Evaluator {
         }.into()
     }
 
-    pub fn migrate_to(input: &Value, ty: &ColumnType, arena: &ArenaMut<Arena>) -> Value {
-        todo!()
+    pub fn migrate_to(input: &Value, ty: &ColumnType, not_null: bool, arena: &ArenaMut<Arena>) -> Value {
+        match input {
+            Value::Int(n) => if ty.is_integral() {
+                Value::Int(*n)
+            } else if ty.is_floating() {
+                Value::Float(*n as f64)
+            } else {
+                assert!(ty.is_string());
+                Value::Str(ArenaStr::new(n.to_string().as_str(), arena.get_mut()))
+            }
+            Value::Float(f) => if ty.is_integral() {
+                Value::Int(f.trunc() as i64)
+            } else if ty.is_floating() {
+                Value::Float(*f)
+            } else {
+                assert!(ty.is_string());
+                Value::Str(ArenaStr::new(f.to_string().as_str(), arena.get_mut()))
+            }
+            Value::Str(s) => if ty.is_integral() {
+                match i64::from_str_radix(s.as_str(), 10) {
+                    Err(e) => switch!(not_null, Value::Int(0), Value::Null),
+                    Ok(n) => Value::Int(n)
+                }
+            } else if ty.is_floating() {
+                match f64::from_str(s.as_str()) {
+                    Err(e) => switch!(not_null, Value::Float(0f64), Value::Null),
+                    Ok(n) => Value::Float(n)
+                }
+            } else {
+                assert!(ty.is_string());
+                Value::Str(s.clone())
+            }
+            _ => unreachable!()
+        }
     }
 }
 
@@ -479,7 +511,7 @@ impl Visitor for Evaluator {
         }
         let upper = self.evaluate_returning(this.upper_mut().deref_mut());
         let b = Evaluator::normalize_to_bool(&Evaluator::compare_vals(&matched, &upper, &Operator::Gt));
-        self.ret( if this.not_between {b} else {!b}.into());
+        self.ret(if this.not_between { b } else { !b }.into());
     }
 
     fn visit_call_function(&mut self, this: &mut CallFunction) {
