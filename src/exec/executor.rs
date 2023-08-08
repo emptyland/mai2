@@ -236,7 +236,7 @@ impl Executor {
             None
         };
         let rewrite_index = rewrite_index_id.map(|x| {
-            table.get_index_by_id(x).unwrap()
+            table.get_index_refs_by_id(x).unwrap()
         });
 
         let mut col = original_col.clone();
@@ -276,7 +276,7 @@ impl Executor {
         let col = new_table.get_col_by_id(original_col.id).unwrap();
         let rewrite_indices = rewrite_index.map(|x| {
             let id = x.id;
-            (x, new_table.get_index_by_id(id).unwrap())
+            (x, new_table.get_index_refs_by_id(id).unwrap())
         });
 
         let mut affected_rows = 0;
@@ -287,6 +287,77 @@ impl Executor {
             affected_rows = db.rewrite_column(producer, &table.column_family, original_col, &col,
                                               rewrite_indices, &self.arena)?;
         }
+
+        Ok((new_table, affected_rows))
+    }
+
+    fn do_update_column_default_value(&self, db: &Arc<DB>, tables: &LockingTablesMut, table: &TableRef, name: &ArenaStr,
+                                      default_value: Option<ArenaBox<dyn Expression>>) -> Result<(TableRef, u64)> {
+        let rs = table.get_col_by_name(&name.to_string());
+        if rs.is_none() {
+            corrupted_err!("Column: {name} not found in table: {}", table.name())?
+        }
+
+        let mut col = rs.unwrap().clone();
+        if let Some(mut expr) = default_value {
+            let mut builder = BytecodeBuildingVisitor::new(&self.arena);
+            builder.build(expr.deref_mut(), &mut col.default_value).unwrap();
+        } else {
+            col.default_value.clear();
+        }
+
+        let mut metadata = (*table.metadata).clone();
+        let pos = col.order;
+        metadata.columns[pos] = col;
+
+        Ok((Arc::new(table.update(metadata)), 0))
+    }
+
+    fn do_drop_column(&self, db: &Arc<DB>, tables: &LockingTablesMut, table: &TableRef, name: &ArenaStr)
+        -> Result<(TableRef, u64)> {
+        let rs = table.get_col_by_name(&name.to_string());
+        if rs.is_none() {
+            corrupted_err!("Column: {name} not found in table: {}", table.name())?
+        }
+
+        let col = rs.unwrap().clone();
+        let original_index = table.get_index_refs_by_part_of_col(col.id);
+        if let Some(index) = &original_index {
+            if index.key_parts.len() > 1 && index.key_parts.last().unwrap().id != col.id {
+                corrupted_err!("Column: {name} is part of index {} in table: {}", index.name, table.name())?
+            }
+        }
+
+        let mut metadata = (*table.metadata).clone();
+        let pos = col.order;
+        metadata.columns.remove(pos);
+        if let Some(index_refs) = &original_index {
+            if DB::is_primary_key(index_refs.id) {
+                metadata.primary_keys =  metadata.primary_keys
+                    .iter()
+                    .cloned()
+                    .filter(|x|{*x != col.id}).collect();
+            } else {
+                let index = metadata.secondary_indices
+                    .iter_mut()
+                    .find(|x|{x.id == index_refs.id})
+                    .unwrap();
+                index.key_parts = index.key_parts
+                    .iter()
+                    .cloned()
+                    .filter(|x|{*x != col.id}).collect();
+            }
+        }
+        let new_table = Arc::new(table.update(metadata));
+        let index = original_index.clone().map_or_else(||{None},
+                                               |x|{new_table.get_index_refs_by_id(x.id)});
+
+        let producer = PlanMaker::new(db, db.get_snapshot(), None, &self.arena)
+            .make_full_scan_producer(table)?;
+        let mut anonymous_incr = new_table.anonymous_row_key_counter.lock().unwrap();
+        let affected_rows = db.remove_column(producer, &table.column_family, &col, &mut anonymous_incr,
+                                                  original_index, index, &self.arena)?;
+        drop(anonymous_incr);
 
         Ok((new_table, affected_rows))
     }
@@ -741,9 +812,12 @@ impl Visitor for Executor {
                 self.do_update_column(&db, &tables, &table, name, decl, hint),
             AlertTableAction::ModifyColumn(decl, hint) =>
                 self.do_update_column(&db, &tables, &table, &decl.name, decl, hint),
-            AlertTableAction::SetDefault(name, default_val) => todo!(),
-            AlertTableAction::DropDefault(name) => todo!(),
-            AlertTableAction::DropColumn(name) => todo!(),
+            AlertTableAction::SetDefault(name, default_val) =>
+                self.do_update_column_default_value(&db, &tables, &table, name, default_val.clone().into()),
+            AlertTableAction::DropDefault(name) =>
+                self.do_update_column_default_value(&db, &tables, &table, name, None),
+            AlertTableAction::DropColumn(name) =>
+                self.do_drop_column(&db, &tables, &table, name),
             AlertTableAction::RenameTo(name) => {
                 if name == &this.name {
                     return; // Ignore it.

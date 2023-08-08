@@ -5,9 +5,9 @@ use std::default::Default;
 use std::io::Write;
 use std::iter;
 use std::mem::{replace, size_of};
-use std::ops::{Deref, DerefMut};
+use std::ops::{AddAssign, Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use dashmap::DashMap;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
@@ -672,12 +672,107 @@ impl DB {
             let pk_len = buf.len();
             Self::encode_column_value(&val, ty, &mut buf);
 
-            let k = &buf.as_slice()[..pk_len];
-            let v = &buf.as_slice()[pk_len..];
+            let k = &buf[..pk_len];
+            let v = &buf[pk_len..];
             self.storage.insert(&self.wr_opts, column_family, k, v)?;
             affected_rows += 1;
         }
 
+        Ok(affected_rows)
+    }
+
+    pub fn remove_column(&self, mut producer: ArenaBox<dyn PhysicalPlanOps>,
+                         column_family: &Arc<dyn ColumnFamily>,
+                         original_col: &ColumnMetadata,
+                         anonymous_incr: &mut MutexGuard<u64>,
+                         original_index_refs: Option<IndexRefsBundle>,
+                         index_refs: Option<IndexRefsBundle>,
+                         region: &ArenaMut<Arena>) -> Result<u64> {
+        self.update_snapshot();
+        let original_cols = producer.prepare()?;
+        let mut resolver = ColumnsAuxResolver::new(region);
+
+        let mut buf = arena_vec!(region);
+
+        let mut zone = Arena::new_ref();
+        let mut feedback = FeedbackImpl::new(true);
+        let mut affected_rows = 0;
+
+        loop {
+            zone_limit_guard!(zone, 1);
+            let arena = zone.get_mut();
+
+            let rs = producer.next(&mut feedback, &zone);
+            if rs.is_none() {
+                break;
+            }
+            let tuple = rs.unwrap();
+            if original_index_refs.is_none() && index_refs.is_none() {
+                buf.write(tuple.row_key()).unwrap();
+                Self::encode_col_id(original_col.id, &mut buf);
+                self.storage.delete(&self.wr_opts, column_family, &buf)?;
+                buf.clear();
+                affected_rows += 1;
+                continue;
+            }
+
+            resolver.attach(&tuple);
+            let original_index = original_index_refs.as_ref().unwrap();
+            Self::encode_index_key(&resolver, &tuple, original_index, &mut buf);
+            let key_len = buf.len();
+
+            let mut updates = WriteBatch::new();
+
+            // delete original keys
+            if Self::is_primary_key(original_index.id) {
+                for item in &tuple.columns().columns {
+                    Self::encode_col_id(item.id, &mut buf);
+                    updates.delete(column_family, &buf);
+                    buf.truncate(key_len);
+                }
+            } else {
+                buf.write(tuple.row_key()).unwrap();
+                updates.delete(column_family, &buf);
+                buf.truncate(key_len);
+            }
+            buf.clear();
+
+            if let Some(index) = &index_refs {
+                Self::encode_index_key(&resolver, &tuple, index, &mut buf);
+                let key_len = buf.len();
+
+                if Self::is_primary_key(index.id) {
+                    Self::insert_row(column_family, &tuple, key_len, original_col.id.into(),
+                                     None, &mut buf, &mut updates);
+                } else {
+                    buf.write(tuple.row_key()).unwrap();
+                    let k2rd_len = buf.len();
+                    let pack_info = (tuple.row_key().len() as u32).to_le_bytes();
+                    buf.write(&pack_info).unwrap();
+
+                    updates.insert(column_family, &buf[..k2rd_len], &buf[k2rd_len..]);
+                }
+            } else {
+                if Self::is_primary_key(original_index.id) {
+                    anonymous_incr.add_assign(1);
+                    Self::encode_anonymous_row_key(anonymous_incr.clone(), &mut buf);
+                    let key_len = buf.len();
+
+                    Self::insert_row(column_family, &tuple, key_len, original_col.id.into(),
+                                     None, &mut buf, &mut updates);
+                } else {
+                    buf.write(tuple.row_key()).unwrap();
+                    Self::encode_col_id(original_col.id, &mut buf);
+                    updates.delete(column_family, &buf);
+                }
+            }
+
+            self.storage.write(&self.wr_opts, updates)?;
+            affected_rows += 1;
+            buf.clear();
+        }
+
+        self.update_snapshot();
         Ok(affected_rows)
     }
 
@@ -695,6 +790,7 @@ impl DB {
 
         let mut zone = Arena::new_ref();
         let mut feedback = FeedbackImpl::new(true);
+        let mut affected_rows = 0;
         loop {
             zone_limit_guard!(zone, 1);
             let arena = zone.get_mut();
@@ -731,35 +827,55 @@ impl DB {
                 let prefix_len = buf.len();
 
                 if Self::is_primary_key(index.id) {
-                    for item in &tuple.columns().columns {
-                        Self::encode_col_id(item.id, &mut buf);
-                        let key_len = buf.len();
-                        Self::encode_column_value(&tuple[item.order],
-                                                  switch!(col.order == item.order, &col.ty, &item.ty),
-                                                  &mut buf);
-                        updates.insert(column_family, &buf.as_slice()[..key_len], &buf.as_slice()[key_len..]);
-                        buf.truncate(prefix_len);
-                    }
+                    Self::insert_row(column_family, &tuple, prefix_len, None, Some(col),
+                                     &mut buf, &mut updates);
                 } else {
                     buf.write(tuple.row_key()).unwrap();
                     let key_len = buf.len();
                     let pack_info = (tuple.row_key().len() as u32).to_le_bytes();
                     buf.write(&pack_info).unwrap();
-                    updates.insert(column_family, &buf.as_slice()[..key_len], &buf.as_slice()[key_len..]);
+                    updates.insert(column_family, &buf[..key_len], &buf[key_len..]);
                 }
             } else {
                 buf.write(tuple.row_key()).unwrap();
                 Self::encode_col_id(col.id, &mut buf);
                 let key_len = buf.len();
                 Self::encode_column_value(&tuple[original_col.order], &col.ty, &mut buf);
-                updates.insert(column_family, &buf.as_slice()[..key_len], &buf.as_slice()[key_len..]);
+                updates.insert(column_family, &buf[..key_len], &buf[key_len..]);
             }
             buf.clear();
             self.storage.write(&self.wr_opts, updates)?;
+            affected_rows += 1;
         }
 
         self.update_snapshot();
-        Ok(0)
+        Ok(affected_rows)
+    }
+
+    fn insert_row(column_family: &Arc<dyn ColumnFamily>,
+                  tuple: &Tuple,
+                  prefix_len: usize,
+                  exclusive_col: Option<u32>,
+                  replacement_col: Option<&ColumnMetadata>,
+                  buf: &mut ArenaVec<u8>,
+                  updates: &mut WriteBatch) {
+        for item in &tuple.columns().columns {
+            if Some(item.id) == exclusive_col {
+                continue;
+            }
+            Self::encode_col_id(item.id, buf);
+            let pk_len = buf.len();
+
+            if let Some(col) = &replacement_col {
+                Self::encode_column_value(&tuple[item.order],
+                                          switch!(col.order == item.order, &col.ty, &item.ty), buf);
+            } else {
+                Self::encode_column_value(&tuple[item.order], &item.ty, buf);
+            }
+
+            updates.insert(column_family, &buf[..pk_len], &buf[pk_len..]);
+            buf.truncate(prefix_len);
+        }
     }
 
     pub fn encode_index_key<W: Write>(resolver: &ColumnsAuxResolver, tuple: &Tuple, index: &IndexRefsBundle, wr: &mut W) {
@@ -1157,8 +1273,8 @@ impl DB {
             let pos = cols.get_column_by_id(table.id(), x.dest.id).unwrap();
             Self::encode_column_value(&tuple[pos], &x.dest.ty, &mut buf);
 
-            let k = &buf.as_slice()[..key_len];
-            let v = &buf.as_slice()[key_len..];
+            let k = &buf[..key_len];
+            let v = &buf[key_len..];
             updates.insert(&table.column_family, k, v);
 
             buf.truncate(row_key_len);
@@ -1964,7 +2080,15 @@ impl TableHandle {
         return false;
     }
 
-    pub fn get_index_by_id(&self, id: u64) -> Option<IndexRefsBundle> {
+    pub fn get_index_refs_by_part_of_col(&self, col_id: u32) -> Option<IndexRefsBundle> {
+        if self.metadata.primary_keys.contains(&col_id) {
+            Some(0)
+        } else {
+            self.column_in_indices_by_id.get(&col_id).map(|x| { self.metadata.secondary_indices[*x].id })
+        }.map(|x| { self.get_index_refs_by_id(x).unwrap() })
+    }
+
+    pub fn get_index_refs_by_id(&self, id: u64) -> Option<IndexRefsBundle> {
         if DB::is_primary_key(id) {
             Some(IndexRefsBundle {
                 id: 0,
@@ -2882,20 +3006,29 @@ mod tests {
         let suite = SqlSuite::new("tests/db128")?;
         suite.execute_file(Path::new("testdata/t1_normal_table_with_data.sql"), &suite.arena)?;
 
-
         suite.execute_str("alert table t1 change column id uid char(9) not null", &suite.arena)?;
 
         let data = [
             "(\"1111\", \"hello\", \"1.1\", 0)",
-            "(\"2222\", \"aaa\", \"1.1\", 1)",
-            "(\"3333\", \"ccc\", \"1.1\", 3)",
-            "(\"4444\", \"demo\", \"1.1\", 5)",
-            "(\"5555\", \"doom\", \"1.1\", 6)",
-            "(\"6666\", \"x-ray\", \"1.1\", 9)",
-            "(\"7777\", \"ddt\", \"1.1\", 11)",
-            "(\"8888\", \"dtt\", \"1.1\", 13)",
+            "(\"2222\", \"aaa\", \"1.2\", 1)",
+            "(\"3333\", \"ccc\", \"1.3\", 3)",
+            "(\"4444\", \"demo\", \"2.1\", 5)",
+            "(\"5555\", \"doom\", \"2.2\", 6)",
+            "(\"6666\", \"x-ray\", \"3.1\", 9)",
+            "(\"7777\", \"ddt\", \"4.1\", 11)",
+            "(\"8888\", \"dtt\", \"4.2\", 13)",
         ];
         let rs = suite.execute_query_str("select * from t1", &suite.arena)?;
+        SqlSuite::assert_rows(&data, rs)?;
+
+        suite.execute_str("alert table t1 modify column ver float", &suite.arena)?;
+
+        let data = [
+            "(\"1111\", \"hello\", 1.100000023841858, 0)",
+            "(\"2222\", \"aaa\", 1.2000000476837158, 1)",
+            "(\"3333\", \"ccc\", 1.2999999523162842, 3)",
+        ];
+        let rs = suite.execute_query_str("select * from t1 where uid <= \'3333\'", &suite.arena)?;
         SqlSuite::assert_rows(&data, rs)?;
 
         Ok(())

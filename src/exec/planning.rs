@@ -1622,25 +1622,25 @@ impl Visitor for PhysicalSelectionAnalyzer {
                 ranges.key_id = 0;
                 ranges.part_of = 0;
                 ranges.total = 1;
-                let idx = self.table.get_index_by_id(0).unwrap();
+                let idx = self.table.get_index_refs_by_id(0).unwrap();
                 idx.key_parts[0].ty.clone()
             }
             AnalyzedVal::PartOfPrimaryKey(i) => {
-                let idx = self.table.get_index_by_id(0).unwrap();
+                let idx = self.table.get_index_refs_by_id(0).unwrap();
                 ranges.key_id = 0;
                 ranges.part_of = i;
                 ranges.total = idx.key_parts.len();
                 idx.key_parts[i].ty.clone()
             }
             AnalyzedVal::Index(key_id) => {
-                let idx = self.table.get_index_by_id(key_id).unwrap();
+                let idx = self.table.get_index_refs_by_id(key_id).unwrap();
                 ranges.key_id = idx.id;
                 ranges.part_of = 0;
                 ranges.total = 1;
                 idx.key_parts[0].ty.clone()
             }
             AnalyzedVal::PartOfIndex(key_id, i) => {
-                let idx = self.table.get_index_by_id(key_id).unwrap();
+                let idx = self.table.get_index_refs_by_id(key_id).unwrap();
                 ranges.key_id = idx.id;
                 ranges.part_of = i;
                 ranges.total = idx.key_parts.len();
@@ -1689,7 +1689,7 @@ impl Visitor for PhysicalSelectionAnalyzer {
         }
 
         let (key_id, part_of) = lhs.part_of_key().unwrap();
-        let index = self.table.get_index_by_id(key_id).unwrap();
+        let index = self.table.get_index_refs_by_id(key_id).unwrap();
         let col = index.key_parts[part_of];
         let mut upper = Self::require_val(&upper, &col.ty).unwrap();
         let mut lower = Self::require_val(&lower, &col.ty).unwrap();

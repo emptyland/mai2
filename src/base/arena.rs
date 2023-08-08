@@ -6,7 +6,7 @@ use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::mem::{align_of, size_of};
-use std::ops::{Deref, DerefMut, Index, IndexMut};
+use std::ops::{Deref, DerefMut, Index, IndexMut, Range, RangeFrom, RangeTo};
 use std::ptr::{addr_of, addr_of_mut, copy_nonoverlapping, NonNull, slice_from_raw_parts_mut, write};
 
 use crate::base::utils::round_up;
@@ -829,6 +829,30 @@ impl<T> Index<usize> for ArenaVec<T> {
 
     fn index(&self, index: usize) -> &Self::Output {
         &self.as_slice()[index]
+    }
+}
+
+impl<T> Index<Range<usize>> for ArenaVec<T> {
+    type Output = [T];
+
+    fn index(&self, index: Range<usize>) -> &Self::Output {
+        &self.as_slice()[index.start..index.end]
+    }
+}
+
+impl<T> Index<RangeFrom<usize>> for ArenaVec<T> {
+    type Output = [T];
+
+    fn index(&self, index: RangeFrom<usize>) -> &Self::Output {
+        &self.as_slice()[index.start..]
+    }
+}
+
+impl<T> Index<RangeTo<usize>> for ArenaVec<T> {
+    type Output = [T];
+
+    fn index(&self, index: RangeTo<usize>) -> &Self::Output {
+        &self.as_slice()[..index.end]
     }
 }
 
