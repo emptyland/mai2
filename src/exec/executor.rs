@@ -1221,12 +1221,32 @@ impl ColumnSet {
     }
 
     pub fn len(&self) -> usize { self.columns.len() }
+
 }
 
 impl Index<usize> for ColumnSet {
     type Output = Column;
 
     fn index(&self, index: usize) -> &Self::Output { &self.columns[index] }
+}
+
+impl Display for ColumnSet {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("|")?;
+        for col in &self.columns {
+            if !col.desc.is_empty() {
+                f.write_str(col.desc.as_str())?;
+                write!(f, ":{}", col.ty)?;
+                f.write_str("|")?;
+            } else {
+                f.write_str("-")?;
+                f.write_str(col.name.as_str())?;
+                write!(f, ":{}", col.ty)?;
+                f.write_str("-|")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]

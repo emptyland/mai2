@@ -2,6 +2,7 @@ use std::cell::RefMut;
 use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::RandomState;
 use std::default::Default;
+use std::fmt::{Display, Formatter};
 use std::io::Write;
 use std::iter;
 use std::mem::{replace, size_of};
@@ -2090,6 +2091,9 @@ impl TableHandle {
 
     pub fn get_index_refs_by_id(&self, id: u64) -> Option<IndexRefsBundle> {
         if DB::is_primary_key(id) {
+            if self.metadata.primary_keys.is_empty() {
+                return None
+            }
             Some(IndexRefsBundle {
                 id: 0,
                 name: "<pk>".to_string(),
@@ -2259,6 +2263,22 @@ impl ColumnType {
             other.is_string()
         } else {
             false
+        }
+    }
+}
+
+impl Display for ColumnType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ColumnType::Null => f.write_str("NULL"),
+            ColumnType::TinyInt(n) => write!(f, "TINYINT({n})"),
+            ColumnType::SmallInt(n) => write!(f, "SMALLINT({n})"),
+            ColumnType::Int(n) => write!(f, "INT({n})"),
+            ColumnType::BigInt(n) => write!(f, "BIGINT({n})"),
+            ColumnType::Float(_, _) => f.write_str("FLOAT"),
+            ColumnType::Double(_, _) => f.write_str("DOUBLE"),
+            ColumnType::Char(n) => write!(f, "CHAR({n})"),
+            ColumnType::Varchar(n) => write!(f, "VARCHAR({n})"),
         }
     }
 }
@@ -3009,6 +3029,7 @@ mod tests {
         suite.execute_str("alert table t1 change column id uid char(9) not null", &suite.arena)?;
 
         let data = [
+            "|-uid:CHAR(9)-|-name:VARCHAR(255)-|-ver:VARCHAR(255)-|-nn:INT(11)-|",
             "(\"1111\", \"hello\", \"1.1\", 0)",
             "(\"2222\", \"aaa\", \"1.2\", 1)",
             "(\"3333\", \"ccc\", \"1.3\", 3)",
@@ -3019,18 +3040,58 @@ mod tests {
             "(\"8888\", \"dtt\", \"4.2\", 13)",
         ];
         let rs = suite.execute_query_str("select * from t1", &suite.arena)?;
-        SqlSuite::assert_rows(&data, rs)?;
+        SqlSuite::assert_rows_detail(&data, rs)?;
 
         suite.execute_str("alert table t1 modify column ver float", &suite.arena)?;
 
         let data = [
+            "|-uid:CHAR(9)-|-name:VARCHAR(255)-|-ver:FLOAT-|-nn:INT(11)-|",
             "(\"1111\", \"hello\", 1.100000023841858, 0)",
             "(\"2222\", \"aaa\", 1.2000000476837158, 1)",
             "(\"3333\", \"ccc\", 1.2999999523162842, 3)",
         ];
         let rs = suite.execute_query_str("select * from t1 where uid <= \'3333\'", &suite.arena)?;
-        SqlSuite::assert_rows(&data, rs)?;
+        SqlSuite::assert_rows_detail(&data, rs)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn alert_table_drop_col() -> Result<()> {
+        let suite = SqlSuite::new("tests/db129")?;
+        suite.execute_file(Path::new("testdata/t1_normal_table_with_data.sql"), &suite.arena)?;
+
+        suite.execute_str("alert table t1 drop column nn", &suite.arena)?;
+
+        let data = [
+            "|-id:INT(11)-|-name:VARCHAR(255)-|-ver:VARCHAR(255)-|",
+            "(1111, \"hello\", \"1.1\")",
+            "(2222, \"aaa\", \"1.2\")",
+            "(3333, \"ccc\", \"1.3\")",
+            "(4444, \"demo\", \"2.1\")",
+            "(5555, \"doom\", \"2.2\")",
+            "(6666, \"x-ray\", \"3.1\")",
+            "(7777, \"ddt\", \"4.1\")",
+            "(8888, \"dtt\", \"4.2\")",
+        ];
+        let rs = suite.execute_query_str("select * from t1", &suite.arena)?;
+        SqlSuite::assert_rows_detail(&data, rs)?;
+
+        suite.execute_str("alert table t1 drop column id", &suite.arena)?;
+
+        let data = [
+            "|-name:VARCHAR(255)-|-ver:VARCHAR(255)-|",
+            "(\"hello\", \"1.1\")",
+            "(\"aaa\", \"1.2\")",
+            "(\"ccc\", \"1.3\")",
+            "(\"demo\", \"2.1\")",
+            "(\"doom\", \"2.2\")",
+            "(\"x-ray\", \"3.1\")",
+            "(\"ddt\", \"4.1\")",
+            "(\"dtt\", \"4.2\")",
+        ];
+        let rs = suite.execute_query_str("select * from t1", &suite.arena)?;
+        SqlSuite::assert_rows_detail(&data, rs)?;
         Ok(())
     }
 }

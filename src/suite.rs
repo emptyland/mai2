@@ -55,6 +55,12 @@ pub mod testing {
             parse_sql_expr_from_content(sql, &self.arena)
         }
 
+        pub fn assert_rows_detail(data: &[&str], rs: ResultSet) -> Result<()> {
+            assert!(data.len() > 0);
+            assert_eq!(data[0], rs.columns().to_string());
+            Self::assert_rows(&data[1..], rs)
+        }
+
         pub fn assert_rows(data: &[&str], mut rs: ResultSet) -> Result<()> {
             let mut i = 0;
             while rs.next() {
@@ -69,9 +75,18 @@ pub mod testing {
             }
         }
 
+        pub fn print_rows_detail(rs: ResultSet) -> Result<()> {
+            Self::print_cols(rs.columns());
+            Self::print_rows(rs)
+        }
+
+        pub fn print_cols(cols: &ColumnSet) {
+            println!("\"{}\",", cols)
+        }
+
         pub fn print_rows(mut rs: ResultSet) -> Result<()> {
             while rs.next() {
-                println!("{}", rs.current()?.to_string());
+                println!("\"{}\",", rs.current()?.to_string().replace('\"', "\\\""));
             }
             if rs.status.is_ok() {
                 Ok(())
