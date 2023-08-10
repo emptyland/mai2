@@ -3,7 +3,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::base::Logger;
 use crate::storage::{Iterator, IteratorRc, MergingIterator};
 use crate::storage::cache::TableCache;
 use crate::storage::column_family::ColumnFamilyImpl;
@@ -17,7 +16,7 @@ use crate::storage::version::{FileMetadata, Version, VersionPatch};
 pub struct Compaction {
     abs_db_path: PathBuf,
     internal_key_cmp: InternalKeyComparator,
-    logger: Arc<dyn Logger>,
+    logger: Arc<slog::Logger>,
     cfi: Arc<ColumnFamilyImpl>,
     memory_tables: Vec<Arc<MemoryTable>>,
     pub target_level: usize,
@@ -49,7 +48,7 @@ pub struct Compact {
 impl Compaction {
     pub fn new(abs_db_path: &Path,
                internal_key_cmp: &InternalKeyComparator,
-               logger: &Arc<dyn Logger>,
+               logger: &Arc<slog::Logger>,
                cfi: &Arc<ColumnFamilyImpl>,
                input_version: &Arc<Version>,
                target_level: usize,

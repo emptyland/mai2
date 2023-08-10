@@ -9,8 +9,8 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::{Corrupting, Result, Status};
-use crate::base::{Decoder, Logger, VarintDecode, VarintEncode, WriterLogger};
+use crate::{Corrupting, new_default_logger, Result, Status};
+use crate::base::{Decoder, VarintDecode, VarintEncode};
 use crate::storage::{BitwiseComparator, Comparator};
 use crate::storage::{Env, EnvImpl};
 use crate::storage::cache::Block;
@@ -124,7 +124,7 @@ impl OptionsBuilder {
 pub struct Options {
     pub core: ColumnFamilyOptions,
     pub env: Arc<dyn Env>,
-    pub logger: Arc<dyn Logger>,
+    pub logger: Arc<slog::Logger>,
     pub create_if_missing: bool,
     pub create_missing_column_families: bool,
     pub error_if_exists: bool,
@@ -151,7 +151,7 @@ impl Default for Options {
         Self {
             core: ColumnFamilyOptions::default(),
             env: EnvImpl::new(),
-            logger: Arc::new(WriterLogger::new(io::stderr())),
+            logger: Arc::new(new_default_logger()),
             create_if_missing: false,
             create_missing_column_families: false,
             error_if_exists: true,

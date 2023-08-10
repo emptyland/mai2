@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
+use slog::{debug, info};
 
-use crate::{corrupted_err, log_debug, log_error, log_info};
-use crate::base::Logger;
+use crate::{corrupted_err};
 use crate::Result;
 use crate::storage::{config, files, wal};
 use crate::storage::{Env, WritableFile};
@@ -40,7 +40,7 @@ pub struct DBImpl {
     this: Option<Weak<DBImpl>>,
     options: Options,
     env: Arc<dyn Env>,
-    pub logger: Arc<dyn Logger>,
+    pub logger: Arc<slog::Logger>,
     pub versions: Arc<Mutex<VersionSet>>,
     table_cache: TableCache,
     default_column_family: Option<Arc<dyn ColumnFamily>>,
@@ -127,12 +127,12 @@ impl DBImpl {
         db.default_column_family = Some(ColumnFamilyHandle::new(&cfi, &versions));
 
         if cfg!(test) {
-            log_debug!(logger, "----------");
+            debug!(logger, "----------");
             let borrowed_cfs = column_families.borrow();
             for cfi in borrowed_cfs.column_family_impls() {
-                log_debug!(logger, "cf[{}][{}]", cfi.id(), cfi.name());
+                debug!(logger, "cf[{}][{}]", cfi.id(), cfi.name());
             }
-            log_debug!(logger, "----------");
+            debug!(logger, "----------");
         }
 
         Ok((Arc::new_cyclic(|this| {
@@ -303,7 +303,7 @@ impl DBImpl {
         let total_wal_size = from_io_result(self.get_total_redo_log_size())?;
         self.total_wal_size.store(total_wal_size, Ordering::Release);
 
-        log_debug!(self.logger, "recover ok.\ntotal_wal_size={total_wal_size}\nredo_log_number={}",
+        debug!(self.logger, "recover ok.\ntotal_wal_size={total_wal_size}\nredo_log_number={}",
             versions.redo_log_number);
         Ok(())
         //------------------------------unlock version-set------------------------------------------
@@ -379,7 +379,7 @@ impl DBImpl {
             }
         }
 
-        log_info!(self.logger, "Migrate keys: {key_count} to {new_log_number}.log .");
+        debug!(self.logger, "Migrate keys: {key_count} to {new_log_number}.log .");
         self.redo_log.replace(Some(WALDescriptor {
             file: dest_file,
             number: new_log_number,
@@ -563,7 +563,7 @@ impl DBImpl {
         }
     }
 
-    fn start_compacting_worker(&self, logger: Arc<dyn Logger>) -> WorkerDescriptor {
+    fn start_compacting_worker(&self, logger: Arc<slog::Logger>) -> WorkerDescriptor {
         let (tx, rx) = channel();
         let join_handle = thread::Builder::new()
             .name("compact-worker".to_string())
@@ -572,7 +572,7 @@ impl DBImpl {
                     Self::do_compacting_work(rx);
                 });
                 if let Err(e) = rs {
-                    log_error!(logger, "compacting worker panic! {:#?}", e);
+                    debug!(logger, "compacting worker panic! {:#?}", e);
                 }
             }).unwrap();
         WorkerDescriptor {
@@ -713,7 +713,7 @@ impl DBImpl {
 
         compact.patch.create_file_by_file_metadata(cfi.id(), compaction.target_level as i32,
                                                    Arc::new(file));
-        log_info!(self.logger, "compact level-{} file: {}.sst ok, cost: {} mills",
+        debug!(self.logger, "compact level-{} file: {}.sst ok, cost: {} mills",
             compaction.target_level,
             compaction.target_file_number,
             self.env.current_time_mills() - jiffies);
@@ -793,7 +793,7 @@ impl DBImpl {
             ctime: self.env.current_time_mills(),
         };
         patch.create_file_by_file_metadata(cfi.id(), 0, Arc::new(metadata));
-        log_info!(self.logger, "write level-0 file ok, cost: {} mills",
+        info!(self.logger, "write level-0 file ok, cost: {} mills",
             self.env.current_time_mills() - jiffies);
         Ok(file_number)
     }
@@ -835,7 +835,7 @@ impl DBImpl {
 
         for (_, path) in cleanup {
             self.env.delete_file(&path, true)?;
-            log_info!(self.logger, "delete obsolete file: {}", path.to_str().unwrap());
+            info!(self.logger, "delete obsolete file: {}", path.to_str().unwrap());
         }
         Ok(())
     }
@@ -1052,7 +1052,7 @@ impl Drop for DBImpl {
         let mut locking = self.versions.lock().unwrap();
         let cfs = locking.column_families().borrow().temporary_column_families();
         if !cfs.is_empty() {
-            log_debug!(self.logger, "temporary column families: {} will be cleanup.", cfs.len());
+            debug!(self.logger, "temporary column families: {} will be cleanup.", cfs.len());
         }
         for cfi in cfs {
             debug_assert!(cfi.options().temporary);

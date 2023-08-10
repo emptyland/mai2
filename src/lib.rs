@@ -4,6 +4,10 @@ extern crate lazy_static;
 extern crate serde;
 extern crate serde_yaml;
 
+extern crate slog;
+extern crate slog_term;
+extern crate slog_async;
+
 pub use crate::base::*;
 pub use crate::status::*;
 

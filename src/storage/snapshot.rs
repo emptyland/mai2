@@ -3,18 +3,18 @@ use std::any::Any;
 use std::ptr;
 use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
-use crate::{log_warn, Logger};
+use slog::warn;
 use crate::storage::db::DBImpl;
 
 use crate::storage::Snapshot;
 
 pub struct SnapshotSet {
-    logger: Arc<dyn Logger>,
+    logger: Arc<slog::Logger>,
     snapshots: NonNull<SnapshotShadow>,
 }
 
 impl SnapshotSet {
-    pub fn new(logger: &Arc<dyn Logger>) -> SnapshotSet {
+    pub fn new(logger: &Arc<slog::Logger>) -> SnapshotSet {
         Self {
             logger: logger.clone(),
             snapshots: unsafe { SnapshotShadow::dummy() },
@@ -64,7 +64,7 @@ impl SnapshotSet {
 impl Drop for SnapshotSet {
     fn drop(&mut self) {
         if !self.snapshots().is_empty() {
-            log_warn!(self.logger, "snapshot not released: {}", self.snapshots().len());
+            warn!(self.logger, "snapshot not released: {}", self.snapshots().len());
         }
         while !self.snapshots().is_empty() {
             let x = self.snapshots_mut().head_mut();

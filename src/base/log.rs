@@ -1,116 +1,35 @@
-use std::cell::RefCell;
-use std::io::Write;
-use std::sync::Mutex;
+use chrono::Local;
+use slog::{Drain, o};
 
-pub trait Logger: Sync + Send {
-    fn append(&self, level: LoggingLevel, file: &str, line: u32, message: &str);
+pub const DEFAULT_LOGGING_TIME_FMT: &str = "%F %T:%S%.6f";
+
+pub fn new_default_logger() -> slog::Logger {
+    let decorator = slog_term::TermDecorator::new().build();
+    let drain = slog_term::FullFormat::new(decorator)
+        .use_file_location()
+        .use_custom_timestamp(|wr|{
+            let now = Local::now();
+            write!(wr, "{}", now.format(DEFAULT_LOGGING_TIME_FMT))
+        })
+        .build()
+        .fuse();
+    let drain = slog_async::Async::new(drain).build().fuse();
+
+    slog::Logger::root(drain, o!())
 }
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum LoggingLevel {
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-impl LoggingLevel {
-    pub fn to_string(&self) -> String {
-        match self {
-            LoggingLevel::Debug => "DEBUG",
-            LoggingLevel::Info => "INFO",
-            LoggingLevel::Warn => "WARN",
-            LoggingLevel::Error => "Error",
-        }.to_string()
-    }
-}
-
-#[macro_export]
-macro_rules! log_append {
-    ($logger:expr, $level:expr, $($arg:tt)+) => {
-        $logger.append($level, file!(), line!(), format!($($arg)+).as_str())
-    };
-}
-
-#[macro_export]
-macro_rules! log_info {
-    ($logger:expr, $($arg:tt)+) => {
-        $crate::log_append!($logger, $crate::base::LoggingLevel::Info, $($arg)+)
-    }
-}
-
-#[macro_export]
-macro_rules! log_warn {
-    ($logger:expr, $($arg:tt)+) => {
-        $crate::log_append!($logger, $crate::base::LoggingLevel::Warn, $($arg)+)
-    }
-}
-
-#[macro_export]
-macro_rules! log_error {
-    ($logger:expr, $($arg:tt)+) => {
-        $crate::log_append!($logger, $crate::base::LoggingLevel::Error, $($arg)+)
-    }
-}
-
-#[macro_export]
-macro_rules! log_debug {
-    ($logger:expr, $($arg:tt)+) => {
-        if cfg!(test) {
-            $crate::log_append!($logger, $crate::base::LoggingLevel::Debug, $($arg)+)
-        }
-    }
-}
-
-pub struct BlackHoleLogger;
-
-impl Logger for BlackHoleLogger {
-    fn append(&self, _level: LoggingLevel, _file: &str, _line: u32, _message: &str) {}
-}
-
-pub struct WriterLogger {
-    writer: Mutex<Box<RefCell<dyn Write>>>,
-}
-
-impl WriterLogger {
-    pub fn new<T>(owns: T) -> Self
-        where T: Write + 'static {
-        Self { writer: Mutex::new(Box::new(RefCell::new(owns))) }
-    }
-}
-
-unsafe impl Sync for WriterLogger {}
-
-unsafe impl Send for WriterLogger {}
-
-impl Logger for WriterLogger {
-    fn append(&self, level: LoggingLevel, file: &str, line: u32, message: &str) {
-        let write = self.writer.lock().unwrap();
-        write!(write.borrow_mut(), "[{}:{}] {} {}\n", file, line, level.to_string(), message).unwrap();
-        write.borrow_mut().flush().unwrap();
-    }
-}
-
 
 #[cfg(test)]
 mod tests {
-    use std::io;
     use std::sync::Arc;
+    use slog::{debug, info};
 
     use super::*;
 
     #[test]
-    fn black_hole_log() {
-        let log = Arc::new(BlackHoleLogger {});
-        log_info!(log, "{}", 1);
-    }
+    fn std_logging() {
 
-    #[test]
-    fn writer_log() {
-        let log = WriterLogger::new(io::stderr());
-        log_warn!(log, "{} = {}", 2, 3);
-        if cfg!(test) {
-            log_info!(log, "{}", 111);
-        }
+        let log = Arc::new(new_default_logger());
+        info!(log, "ok={}", 1);
+        debug!(log, "err={}", "fail");
     }
 }

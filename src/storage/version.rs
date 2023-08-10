@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
 use num_enum::TryFromPrimitive;
+use slog::warn;
 
 use patch::CFCreation;
 use patch::FileCreation;
 
-use crate::{log_warn, Result};
-use crate::base::{Decoder, Logger, VarintDecode, VarintEncode};
+use crate::Result;
+use crate::base::{Decoder, VarintDecode, VarintEncode};
 use crate::storage::{config, files, wal};
 use crate::storage::{Env, WritableFile};
 use crate::storage::{ColumnFamilyOptions, Options, PinnableValue, ReadOptions};
@@ -26,7 +27,7 @@ use crate::storage::wal::{LogReader, LogWriter};
 
 pub struct VersionSet {
     env: Arc<dyn Env>,
-    pub logger: Arc<dyn Logger>,
+    pub logger: Arc<slog::Logger>,
 
     abs_db_path: PathBuf,
     block_size: u64,
@@ -119,8 +120,7 @@ impl VersionSet {
                                                    patch.cf_creation.name.clone(),
                                                    opts.clone());
                 if temporary {
-                    log_warn!(self.logger, "Temporary column family: {} not dropped yet!",
-                        patch.cf_creation.name);
+                    warn!(self.logger, "Temporary column family: {} not dropped yet!", patch.cf_creation.name);
                 }
             }
 

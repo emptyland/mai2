@@ -14,9 +14,10 @@ use dashmap::DashMap;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 
 use rusty_pool::ThreadPool;
+use slog::debug;
 
-use crate::{arena_vec, ArenaVec, corrupted_err, Corrupting, log_debug, Status, storage, switch, zone_limit_guard};
-use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr, Logger};
+use crate::{arena_vec, ArenaVec, corrupted_err, Corrupting, Status, storage, switch, zone_limit_guard};
+use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr};
 use crate::exec::connection::{Connection, FeedbackImpl};
 use crate::exec::evaluator::{Evaluator, Value};
 use crate::exec::executor::{ColumnsAuxResolver, ColumnSet, PreparedStatement, SecondaryIndexBundle, Tuple, UpstreamContext};
@@ -35,7 +36,7 @@ pub struct DB {
     this: Weak<DB>,
     env: Arc<dyn Env>,
     abs_db_path: PathBuf,
-    logger: Arc<dyn Logger>,
+    logger: Arc<slog::Logger>,
     pub storage: Arc<dyn storage::DB>,
     pub rd_opts: ReadOptions,
     wr_opts: WriteOptions,
@@ -213,7 +214,7 @@ impl DB {
             }
             Ok(pin_val) => {
                 let yaml = pin_val.to_utf8_string();
-                log_debug!(self.logger, "tables: {}", yaml);
+                debug!(self.logger, "tables: {}", yaml);
                 tables_name_to_id = serde_yaml::from_str(yaml.as_str()).unwrap();
             }
         }
@@ -246,11 +247,11 @@ impl DB {
         let next_id = self.load_number(&self.default_column_family,
                                        Self::META_COL_NEXT_TABLE_ID, 0)?;
         self.next_table_id.store(next_id, Ordering::Relaxed);
-        log_debug!(self.logger, "next table id: {}", &next_id);
+        debug!(self.logger, "next table id: {}", &next_id);
         let next_id = self.load_number(&self.default_column_family,
                                        Self::META_COL_NEXT_INDEX_ID, 1)?;
         self.next_index_id.store(next_id, Ordering::Relaxed);
-        log_debug!(self.logger, "next index id: {}", &next_id);
+        debug!(self.logger, "next index id: {}", &next_id);
         Ok(())
     }
 
