@@ -2,7 +2,7 @@ use std::cell::RefMut;
 use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::RandomState;
 use std::default::Default;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::io::Write;
 use std::iter;
 use std::mem::{replace, size_of};
@@ -14,7 +14,7 @@ use dashmap::DashMap;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 
 use rusty_pool::ThreadPool;
-use slog::debug;
+use slog::{debug};
 
 use crate::{arena_vec, ArenaVec, corrupted_err, Corrupting, Status, storage, switch, zone_limit_guard};
 use crate::base::{Allocator, Arena, ArenaBox, ArenaMut, ArenaStr};
@@ -36,7 +36,7 @@ pub struct DB {
     this: Weak<DB>,
     env: Arc<dyn Env>,
     abs_db_path: PathBuf,
-    logger: Arc<slog::Logger>,
+    pub logger: Arc<slog::Logger>,
     pub storage: Arc<dyn storage::DB>,
     pub rd_opts: ReadOptions,
     wr_opts: WriteOptions,
@@ -1092,12 +1092,13 @@ impl DB {
             let table_box = table.clone();
             let tables = self.tables_handle.clone();
             let db = self.storage.clone();
+            let logger = self.logger.clone();
             let snapshot = self.get_snapshot();
             let cardinality = self.approximate_indices_cardinality.clone();
             self.worker_pool.execute(move || {
                 let name = table_box.name().clone();
                 let tid = table_box.id();
-                let rs = Self::estimate_indices_cardinality_impl(db, snapshot, table_box);
+                let rs = Self::estimate_indices_cardinality_impl(db, snapshot, table_box, logger);
                 if let Ok(indices) = rs {
                     cardinality.insert(tid, indices);
                 }
@@ -1119,9 +1120,10 @@ impl DB {
 
     fn estimate_indices_cardinality_impl(db: Arc<dyn storage::DB>,
                                          snapshot: Arc<dyn storage::Snapshot>,
-                                         table: TableRef) -> Result<HashMap<u64, u64>> {
+                                         table: TableRef, logger: Arc<slog::Logger>) -> Result<HashMap<u64, u64>> {
         let rd_opts = ReadOptions::default();
 
+        let mut scanning_rows = 0;
         let mut indices = HashMap::new();
         for idx in &table.metadata.secondary_indices {
             indices.insert(idx.id, 0); // initialized zero value.
@@ -1133,20 +1135,23 @@ impl DB {
             let mut iter = iter_box.borrow_mut();
             let key_prefix = (idx.id as u32).to_be_bytes();
             iter.seek(&key_prefix);
-            let mut c = 0;
+
             while iter.valid() && iter.key().starts_with(&key_prefix) {
                 let index = DB::decode_index_from_secondary_index(iter.key(), iter.value());
                 cardinality.insert(index);
                 iter.move_next();
-                c += 1;
+                scanning_rows += 1;
             }
 
             if iter.status().is_not_ok() && !iter.status().is_not_found() {
                 Err(iter.status().clone())?;
             }
-            //dbg!(&c);
             indices.insert(idx.id, cardinality.count().trunc() as u64);
         }
+
+        debug!(logger, "[{}] Estimate indices cardinality fin, scanning_rows: {}, result: {:?}",
+               table.name(),
+               scanning_rows, indices);
         Self::write_table_indices_cardinality(&db, &table.column_family, &indices)?;
 
         Ok(indices)

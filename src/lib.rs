@@ -8,6 +8,8 @@ extern crate slog;
 extern crate slog_term;
 extern crate slog_async;
 
+extern crate tokio;
+
 pub use crate::base::*;
 pub use crate::status::*;
 
@@ -20,6 +22,7 @@ pub mod status;
 mod base;
 mod sql;
 mod mysql;
+mod serve;
 
 pub type Result<T> = std::result::Result<T, Status>;
 

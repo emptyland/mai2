@@ -4,8 +4,10 @@ use slog::{Drain, o};
 pub const DEFAULT_LOGGING_TIME_FMT: &str = "%F %T:%S%.6f";
 
 pub fn new_default_logger() -> slog::Logger {
-    let decorator = slog_term::TermDecorator::new().build();
+    let decorator = slog_term::PlainSyncDecorator::new(std::io::stdout());
+
     let drain = slog_term::FullFormat::new(decorator)
+        .use_original_order()
         .use_file_location()
         .use_custom_timestamp(|wr|{
             let now = Local::now();
@@ -13,7 +15,12 @@ pub fn new_default_logger() -> slog::Logger {
         })
         .build()
         .fuse();
-    let drain = slog_async::Async::new(drain).build().fuse();
+
+    let drain = slog_async::Async::new(drain)
+        .thread_name("logging".to_string())
+        .build()
+        .fuse();
+
 
     slog::Logger::root(drain, o!())
 }
